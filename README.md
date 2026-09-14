@@ -24,6 +24,7 @@ The email thread is the audit log, and cutting Instinct off means the gatekeeper
 | 03 | [research/03-prompt-injection-and-fraud-defense.md](research/03-prompt-injection-and-fraud-defense.md) | How to make it injection- and fraud-resistant, and how to keep it that way |
 | 04 | [research/04-data-connectors-and-credentials.md](research/04-data-connectors-and-credentials.md) | How to connect to Gmail, Calendar, LinkedIn and WhatsApp; where secrets live; the kill switch; the gatekeeper's own inbox |
 | 05 | [research/05-deployment-protocol-and-observability.md](research/05-deployment-protocol-and-observability.md) | Hosting, the email protocol, human approvals, audit logs, cost, latency |
+| 06 | [research/06-browser-automation-cost.md](research/06-browser-automation-cost.md) | *(Parked)* LinkedIn and other sites without an API: cheap, safe browser automation vs. computer use |
 
 Reports 01-05 were written by parallel research agents (Claude Sonnet) and then cross-checked by
 an orchestrator (Claude Opus). The key claims were spot-checked against their primary sources on
@@ -132,6 +133,14 @@ Inbound email ─► [0] Mail gate: secret sub-address, sender allowlist, DKIM/D
 | Composio breach (May 21, 2026: ~5,241 API keys + ~5,001 GitHub OAuth tokens) | ✅ Confirmed (Material Security write-up) |
 
 ---
+
+## Decided
+
+- **2026-09-14 — Personal, single-user use only.** (Google OAuth app stays unverified,
+  "In production".)
+- **2026-09-14 — MVP scope is Google only** (Gmail, Calendar, and optionally Drive/Contacts)
+  plus the gatekeeper's dedicated inbox. LinkedIn and other sites without an API are parked;
+  see [06](research/06-browser-automation-cost.md).
 
 ## Decisions I need to make before building
 
