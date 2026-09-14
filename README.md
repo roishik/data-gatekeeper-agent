@@ -1,7 +1,9 @@
 # data-gatekeeper-agent
 
-> **Status: research phase. No code yet.** This repo holds the research and the open
-> decisions to review before any build.
+> **Status: walking skeleton.** The research below drove the design; `app/` now has a
+> working (but not yet deployed) MVP — inbound AgentMail webhook → auth/policy →
+> `gmail.search` → reply, with a hash-chained audit log. See `docs/RUNBOOK.md` for how to
+> run it and the tests, and the "walking skeleton" build report for what's still unverified.
 
 A self-hosted agent that is the **only** thing holding my credentials (Gmail, LinkedIn, ...).
 My consumer AI assistant (Instinct) never gets direct access. Instead it **emails** the

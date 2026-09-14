@@ -7,3 +7,23 @@
 secrets/
 __pycache__/
 .venv/
+
+# Google OAuth artifacts -- scripts/google_auth.py writes the refresh
+# token to ~/.config/data-gatekeeper/token.json (outside the repo) on
+# purpose, but a client_secret.json downloaded from Google Cloud
+# Console is often saved into the repo root by habit. Never commit it,
+# or any other credential file, if it ends up here anyway.
+client_secret*.json
+token.json
+*.token.json
+
+# Local dev audit log / state (AUDIT_LOG_BACKEND=jsonl's default path)
+# -- contains real request metadata once you run the service for real.
+data/audit_log.jsonl
+data/*.jsonl
+
+# pytest / packaging noise
+.pytest_cache/
+*.egg-info/
+build/
+dist/
