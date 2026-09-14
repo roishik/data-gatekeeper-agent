@@ -86,6 +86,7 @@ async def agentmail_webhook(request: Request) -> Response:
     return Response(status_code=outcome.http_status, content=outcome.reason)
 
 
-@app.get("/healthz")
-async def healthz() -> dict[str, str]:
+# Not /healthz: Cloud Run's front end reserves that path and answers 404 itself.
+@app.get("/health")
+async def health() -> dict[str, str]:
     return {"status": "ok"}
