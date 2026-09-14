@@ -49,7 +49,7 @@ _FIELD_ORDER = [
     "layer0_verdict", "layer1_verdict",
     "parsed_request_id", "parsed_verb", "parsed_source",
     "policy_status", "policy_error_code",
-    "result_count", "gmail_message_ids", "reply_message_id",
+    "result_count", "gmail_message_ids", "calendar_event_ids", "reply_message_id",
     "llm_input_tokens", "llm_output_tokens",
 ]
 
@@ -67,6 +67,10 @@ class AuditRecord:
     policy_error_code: str | None = None
     result_count: int = 0
     gmail_message_ids: tuple[str, ...] = field(default_factory=tuple)
+    # Event ids only, never a summary/title -- see app/calendar_executor.py
+    # and app/pipeline.py's data-minimization comment for gmail_message_ids,
+    # which applies identically here.
+    calendar_event_ids: tuple[str, ...] = field(default_factory=tuple)
     reply_message_id: str | None = None
     llm_input_tokens: int | None = None
     llm_output_tokens: int | None = None

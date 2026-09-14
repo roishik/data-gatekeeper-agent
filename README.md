@@ -1,9 +1,11 @@
 # data-gatekeeper-agent
 
-> **Status: walking skeleton.** The research below drove the design; `app/` now has a
-> working (but not yet deployed) MVP — inbound AgentMail webhook → auth/policy →
-> `gmail.search` → reply, with a hash-chained audit log. See `docs/RUNBOOK.md` for how to
-> run it and the tests, and the "walking skeleton" build report for what's still unverified.
+> **Status: walking skeleton, two verbs.** The research below drove the design; `app/` now
+> has a working (but not yet deployed) MVP — inbound AgentMail webhook → auth/policy →
+> `gmail.search` or `calendar.list_events` → reply, with a hash-chained audit log.
+> `calendar.list_events` resolves relative day language ("tomorrow") to a `day_offset`/`days`
+> pair the LLM picks and Python turns into a timezone-aware window — see
+> `app/calendar_window.py`. See `docs/RUNBOOK.md` for how to run it and the tests.
 
 A self-hosted agent that is the **only** thing holding my credentials (Gmail, LinkedIn, ...).
 My consumer AI assistant (Instinct) never gets direct access. Instead it **emails** the

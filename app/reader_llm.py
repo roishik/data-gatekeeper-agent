@@ -46,9 +46,17 @@ class LLMExtraction(BaseModel):
 
     verb: VerbLiteral
     request_id: str | None = None
+    # gmail.search fields.
     query: str | None = None
     max_results: int | None = None
     newer_than_days: int | None = None
+    # calendar.list_events fields. Deliberately small bounded integers,
+    # never a date/timestamp string -- see app/calendar_window.py's
+    # docstring for why the model is never asked to do date arithmetic.
+    # `max_results` above is shared between both verbs (policy.py applies
+    # a different valid range per verb; this schema only bounds the type).
+    day_offset: int | None = None
+    days: int | None = None
 
 
 class ReaderLLM(Protocol):
@@ -69,7 +77,19 @@ _SYSTEM_PROMPT = (
     "If the email does not clearly and unambiguously ask for exactly one "
     "of those actions, set verb to 'unsupported' and leave the other "
     "fields empty. Never invent a request_id -- copy one only if the "
-    "email text plainly states one."
+    "email text plainly states one.\n\n"
+    "For verb='calendar.list_events', you NEVER compute or write out an "
+    "actual date or timestamp -- you only pick two small integers, "
+    "day_offset and days, relative to today. Map relative day language "
+    "like this: 'today' -> day_offset=0; 'tomorrow' -> day_offset=1; "
+    "'the day after tomorrow' -> day_offset=2; 'this week' or 'the next 7 "
+    "days' -> day_offset=0, days=7; 'next week' -> day_offset=7, days=7. "
+    "If the email doesn't say, day_offset defaults to 0 and days to 1 -- "
+    "simply omit both fields rather than guessing a specific date. Never "
+    "put a calendar date, weekday name, or duration string in any field; "
+    "if the requested range genuinely needs a specific date you cannot "
+    "express as a small day_offset/days pair, set verb to "
+    "'unsupported' instead."
 )
 
 

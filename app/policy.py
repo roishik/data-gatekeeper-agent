@@ -40,12 +40,11 @@ class Verb(str, Enum):
     UNSUPPORTED = "unsupported"
 
 
-# The only verb with a real executor in this MVP (research/00 brief,
-# "Suggested next phases" step 3: walking skeleton == ONE read-only verb).
-IMPLEMENTED_VERBS = frozenset({Verb.GMAIL_SEARCH})
-NOT_IMPLEMENTED_VERBS = frozenset(
-    {Verb.CALENDAR_LIST_EVENTS, Verb.DRIVE_SEARCH, Verb.CONTACTS_SEARCH}
-)
+# The verbs with a real executor in this MVP (research/00 brief,
+# "Suggested next phases" step 3 started the walking skeleton with ONE
+# read-only verb; calendar.list_events is the second).
+IMPLEMENTED_VERBS = frozenset({Verb.GMAIL_SEARCH, Verb.CALENDAR_LIST_EVENTS})
+NOT_IMPLEMENTED_VERBS = frozenset({Verb.DRIVE_SEARCH, Verb.CONTACTS_SEARCH})
 
 QUERY_MAX_CHARS = 200
 MAX_RESULTS_DEFAULT = 5
@@ -53,6 +52,22 @@ MAX_RESULTS_MIN = 1
 MAX_RESULTS_MAX = 10
 NEWER_THAN_DAYS_MIN = 1
 NEWER_THAN_DAYS_MAX = 365
+
+# calendar.list_events bounds. Deliberately three small bounded integers
+# and NOTHING date-shaped -- see app/calendar_window.py's docstring for
+# why: the reader LLM (Layer 2) never has to parse, produce, or reason
+# about an actual date or timezone, only pick a small integer, which is
+# the "low-capacity output type" principle (research/03 section 2.4)
+# applied to a brand-new verb rather than just gmail.search's.
+CAL_DAY_OFFSET_DEFAULT = 0  # 0 = today
+CAL_DAY_OFFSET_MIN = 0
+CAL_DAY_OFFSET_MAX = 13
+CAL_DAYS_DEFAULT = 1
+CAL_DAYS_MIN = 1
+CAL_DAYS_MAX = 7
+CAL_MAX_RESULTS_DEFAULT = 10
+CAL_MAX_RESULTS_MIN = 1
+CAL_MAX_RESULTS_MAX = 25
 
 
 @dataclass(frozen=True)
@@ -63,12 +78,23 @@ class GmailSearchParams:
 
 
 @dataclass(frozen=True)
+class CalendarListEventsParams:
+    day_offset: int = CAL_DAY_OFFSET_DEFAULT
+    days: int = CAL_DAYS_DEFAULT
+    max_results: int = CAL_MAX_RESULTS_DEFAULT
+
+
+@dataclass(frozen=True)
 class PolicyDecision:
     status: str  # "allowed" | "denied" | "not_implemented" | "unsupported"
     verb: Verb
     error_code: str | None = None
     reason: str | None = None
-    params: GmailSearchParams | None = None  # set only when status == "allowed"
+    # set only when status == "allowed"; exactly one shape per verb, per
+    # the same allowlisted-field-extraction principle as GmailSearchParams
+    # (see module docstring point 2) -- CalendarListEventsParams has no
+    # field a "to"/"recipients"/date-string injection could land in either.
+    params: GmailSearchParams | CalendarListEventsParams | None = None
 
 
 def _contains_sensitive_term(query: str) -> str | None:
@@ -112,6 +138,9 @@ def evaluate_policy(verb_raw: str, params: dict[str, Any]) -> PolicyDecision:
 
     if verb == Verb.GMAIL_SEARCH:
         return _evaluate_gmail_search(params)
+
+    if verb == Verb.CALENDAR_LIST_EVENTS:
+        return _evaluate_calendar_list_events(params)
 
     # Unreachable given the enum is exhaustively handled above, but
     # deny-by-default means even an unreachable branch denies rather
@@ -168,4 +197,41 @@ def _evaluate_gmail_search(params: dict[str, Any]) -> PolicyDecision:
         status="allowed",
         verb=verb,
         params=GmailSearchParams(query=query, max_results=max_results, newer_than_days=newer_than_days),
+    )
+
+
+def _evaluate_calendar_list_events(params: dict[str, Any]) -> PolicyDecision:
+    verb = Verb.CALENDAR_LIST_EVENTS
+
+    day_offset = params.get("day_offset", CAL_DAY_OFFSET_DEFAULT)
+    if not isinstance(day_offset, int) or isinstance(day_offset, bool):
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'day_offset' must be an integer")
+    if not (CAL_DAY_OFFSET_MIN <= day_offset <= CAL_DAY_OFFSET_MAX):
+        return PolicyDecision(
+            status="denied", verb=verb, error_code="invalid_params",
+            reason=f"'day_offset' must be between {CAL_DAY_OFFSET_MIN} and {CAL_DAY_OFFSET_MAX}",
+        )
+
+    days = params.get("days", CAL_DAYS_DEFAULT)
+    if not isinstance(days, int) or isinstance(days, bool):
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'days' must be an integer")
+    if not (CAL_DAYS_MIN <= days <= CAL_DAYS_MAX):
+        return PolicyDecision(
+            status="denied", verb=verb, error_code="invalid_params",
+            reason=f"'days' must be between {CAL_DAYS_MIN} and {CAL_DAYS_MAX}",
+        )
+
+    max_results = params.get("max_results", CAL_MAX_RESULTS_DEFAULT)
+    if not isinstance(max_results, int) or isinstance(max_results, bool):
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'max_results' must be an integer")
+    if not (CAL_MAX_RESULTS_MIN <= max_results <= CAL_MAX_RESULTS_MAX):
+        return PolicyDecision(
+            status="denied", verb=verb, error_code="invalid_params",
+            reason=f"'max_results' must be between {CAL_MAX_RESULTS_MIN} and {CAL_MAX_RESULTS_MAX}",
+        )
+
+    return PolicyDecision(
+        status="allowed",
+        verb=verb,
+        params=CalendarListEventsParams(day_offset=day_offset, days=days, max_results=max_results),
     )

@@ -91,6 +91,10 @@ def _parse_via_llm(email_text: str, agentmail_message_id: str, reader_llm: Reade
         params["max_results"] = extraction.max_results
     if extraction.newer_than_days is not None:
         params["newer_than_days"] = extraction.newer_than_days
+    if extraction.day_offset is not None:
+        params["day_offset"] = extraction.day_offset
+    if extraction.days is not None:
+        params["days"] = extraction.days
 
     request_id = (
         extraction.request_id.strip()

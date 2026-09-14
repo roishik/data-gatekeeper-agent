@@ -22,6 +22,13 @@ in, the app still **imports** and the **test suite still runs**
 credentials) — only actually starting the server and hitting the real
 webhook route needs real values.
 
+Two implemented verbs as of this build: `gmail.search` and
+`calendar.list_events`. `calendar.list_events` resolves relative day
+language ("today"/"tomorrow"/"this week") to a `day_offset`/`days` pair
+purely in Python, in the timezone set by `OWNER_TIMEZONE` (default
+`Asia/Jerusalem`) — see `app/calendar_window.py`. `drive.search` and
+`contacts.search` still return `not_implemented`.
+
 **A note on the AgentMail key's name.** This project's code always reads
 `AGENTMAIL_API_KEY` (see `app/config.py`) — not `agent_mail_api_key`,
 `AGENT_MAIL_API_KEY`, or any other spelling. If your own `.env` already

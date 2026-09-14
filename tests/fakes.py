@@ -10,6 +10,7 @@ half of that contract.
 from __future__ import annotations
 
 from app.agentmail_client import ReplyResult
+from app.calendar_executor import CalendarEvent
 from app.gmail_executor import GmailResult
 from app.reader_llm import LLMExtraction
 
@@ -45,6 +46,21 @@ class FakeGmailClient:
 
     def search(self, query: str, max_results: int, newer_than_days: int | None) -> list[GmailResult]:
         self.calls.append({"query": query, "max_results": max_results, "newer_than_days": newer_than_days})
+        return self.results[:max_results]
+
+
+class FakeCalendarClient:
+    """Mirrors FakeGmailClient: returns a fixed list of CalendarEvent
+    regardless of the requested window, and records every call so tests
+    can assert on the resolved time_min/time_max/max_results instead of
+    branching fake behavior on them."""
+
+    def __init__(self, results: list[CalendarEvent] | None = None):
+        self.results = results if results is not None else []
+        self.calls: list[dict] = []
+
+    def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]:
+        self.calls.append({"time_min": time_min, "time_max": time_max, "max_results": max_results})
         return self.results[:max_results]
 
 

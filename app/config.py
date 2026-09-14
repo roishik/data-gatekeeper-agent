@@ -110,6 +110,13 @@ SENSITIVE_QUERY_TERMS = _env_list(
     "bank account,credit card,routing number,account number,wire transfer",
 )
 
+# ── Calendar window resolution (Layer 3/4/5, calendar.list_events) ─────────
+# IANA timezone name. Used by app/calendar_window.py to turn day_offset/
+# days into a concrete midnight-to-midnight window and to format event
+# times for the reply -- never by the LLM, which only ever sees/produces
+# the small bounded integers (see policy.py's CAL_* constants).
+OWNER_TIMEZONE = _env("OWNER_TIMEZONE", "Asia/Jerusalem")
+
 # ── Google (Layer 4, executor) ──────────────────────────────────────────────
 GOOGLE_CLIENT_ID = _env("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = _env("GOOGLE_CLIENT_SECRET")

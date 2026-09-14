@@ -18,10 +18,12 @@ from typing import Any, Callable
 
 from app.agentmail_client import AgentMailClient
 from app.audit_log import AuditLog, AuditRecord
-from app.config import AGENTMAIL_INBOX_ID, MAX_REQUESTS_PER_DAY, OWNER_EMAIL
+from app.calendar_executor import CalendarClient, CalendarEvent
+from app.calendar_window import resolve_window
+from app.config import AGENTMAIL_INBOX_ID, MAX_REQUESTS_PER_DAY, OWNER_EMAIL, OWNER_TIMEZONE
 from app.gmail_executor import GmailClient, GmailResult
 from app.ingress import check_event, parsed_sender_address, verify_signature
-from app.policy import PolicyDecision, evaluate_policy
+from app.policy import CalendarListEventsParams, GmailSearchParams, PolicyDecision, evaluate_policy
 from app.reader_llm import ReaderLLM
 from app.reply_guard import render_reply, send_reply
 from app.request_parser import ParsedRequest, parse_request
@@ -84,6 +86,7 @@ def handle_webhook(
     state_store,
     reader_llm: ReaderLLM,
     gmail_client_factory: Callable[[], GmailClient],
+    calendar_client_factory: Callable[[], CalendarClient],
     agentmail_client: AgentMailClient,
     audit_log: AuditLog,
     payload: dict[str, Any] | None = None,
@@ -94,9 +97,11 @@ def handle_webhook(
     for signature verification -- the two must be consistent in real
     use, which app/main.py guarantees by parsing `body` itself.
 
-    `gmail_client_factory` is a zero-arg callable rather than a client
-    instance so a (possibly credentialed) Gmail client is constructed
-    only on the one request path that actually reaches Layer 4."""
+    `gmail_client_factory`/`calendar_client_factory` are zero-arg
+    callables rather than client instances so a (possibly credentialed)
+    client is constructed only on the one request path that actually
+    reaches Layer 4 for that verb -- a gmail.search request never
+    touches Calendar credentials and vice versa."""
     sig_verdict = verify_signature(body, svix_id, svix_timestamp, svix_signature)
 
     # Best-effort extraction of a message id / sender for the audit log
@@ -161,20 +166,30 @@ def handle_webhook(
     # ── Layer 3: policy ──────────────────────────────────────────────────
     decision = evaluate_policy(parsed.verb, parsed.params)
 
-    # ── Layer 4: executor (only for an allowed gmail.search) ────────────
+    # ── Layer 4: executor (only for an allowed gmail.search or
+    # calendar.list_events -- exactly one verb runs per request) ───────
     gmail_results: list[GmailResult] | None = None
-    if decision.status == "allowed" and decision.verb.value == "gmail.search" and decision.params is not None:
+    calendar_results: list[CalendarEvent] | None = None
+    if decision.status == "allowed" and isinstance(decision.params, GmailSearchParams):
         gmail_client = gmail_client_factory()
         gmail_results = gmail_client.search(
             query=decision.params.query,
             max_results=decision.params.max_results,
             newer_than_days=decision.params.newer_than_days,
         )
+    elif decision.status == "allowed" and isinstance(decision.params, CalendarListEventsParams):
+        window = resolve_window(decision.params.day_offset, decision.params.days, OWNER_TIMEZONE)
+        calendar_client = calendar_client_factory()
+        calendar_results = calendar_client.list_events(
+            time_min=window.time_min, time_max=window.time_max, max_results=decision.params.max_results
+        )
 
     reply_status, error_code = _status_for_decision(decision)
 
     # ── Layer 5: reply ───────────────────────────────────────────────────
-    reply_result = _reply(agentmail_client, message_id, sender_address, parsed, reply_status, error_code, gmail_results)
+    reply_result = _reply(
+        agentmail_client, message_id, sender_address, parsed, reply_status, error_code, gmail_results, calendar_results
+    )
 
     _log_audit(
         audit_log,
@@ -185,6 +200,7 @@ def handle_webhook(
         parsed=parsed,
         decision=decision,
         gmail_results=gmail_results,
+        calendar_results=calendar_results,
         reply_message_id=reply_result.message_id if reply_result else None,
         llm_usage=llm_usage,
     )
@@ -209,8 +225,9 @@ def _reply(
     status: str,
     error_code: str | None,
     gmail_results: list[GmailResult] | None = None,
+    calendar_results: list[CalendarEvent] | None = None,
 ):
-    body = render_reply(parsed, status, error_code, gmail_results)
+    body = render_reply(parsed, status, error_code, gmail_results, calendar_results)
     return send_reply(
         agentmail_client,
         inbox_id=AGENTMAIL_INBOX_ID or "",
@@ -231,6 +248,7 @@ def _log_audit(
     parsed: ParsedRequest | None = None,
     decision: PolicyDecision | None = None,
     gmail_results: list[GmailResult] | None = None,
+    calendar_results: list[CalendarEvent] | None = None,
     reply_message_id: str | None = None,
     llm_usage: dict[str, int] | None = None,
 ) -> None:
@@ -245,8 +263,9 @@ def _log_audit(
             parsed_source=parsed.source if parsed else None,
             policy_status=decision.status if decision else None,
             policy_error_code=decision.error_code if decision else None,
-            result_count=len(gmail_results) if gmail_results else 0,
+            result_count=(len(gmail_results) if gmail_results else 0) + (len(calendar_results) if calendar_results else 0),
             gmail_message_ids=tuple(r.message_id for r in gmail_results) if gmail_results else (),
+            calendar_event_ids=tuple(e.event_id for e in calendar_results) if calendar_results else (),
             reply_message_id=reply_message_id,
             llm_input_tokens=(llm_usage or {}).get("input_tokens"),
             llm_output_tokens=(llm_usage or {}).get("output_tokens"),

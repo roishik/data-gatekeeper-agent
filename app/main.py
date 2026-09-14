@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request, Response
 
 from app.agentmail_client import HttpAgentMailClient
 from app.audit_log import AuditLog, JSONLAuditLog, SheetsAuditLog
+from app.calendar_executor import GoogleCalendarClient
 from app.config import (
     AUDIT_LOG_BACKEND,
     AUDIT_LOG_PATH,
@@ -73,6 +74,7 @@ async def agentmail_webhook(request: Request) -> Response:
         state_store=_state_store,
         reader_llm=AnthropicReaderLLM(),
         gmail_client_factory=GoogleGmailClient,
+        calendar_client_factory=GoogleCalendarClient,
         agentmail_client=HttpAgentMailClient(),
         audit_log=_audit_log,
     )

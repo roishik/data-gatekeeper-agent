@@ -12,12 +12,17 @@ layer:
      never from a Reply-To header or from anything inside the email body
      or a Gmail result. An injected instruction anywhere upstream has no
      field to write a different recipient into.
-  2. Gmail result text (subject, snippet) is redacted for OTP-like
-     codes, URLs, and email-verification phrasing BEFORE it can appear
-     in a reply -- the last line of defense against a poisoned Gmail
-     snippet trying to phish or exfiltrate via the reply itself, even
-     though Layer 3 already refused any *query* that would knowingly
-     search for such content.
+  2. Gmail result text (subject, snippet, sender) and Calendar result
+     text (event summary) are redacted for OTP-like codes, URLs, and
+     email-verification phrasing BEFORE they can appear in a reply --
+     the last line of defense against a poisoned Gmail snippet OR a
+     poisoned calendar event title trying to phish or exfiltrate via the
+     reply itself, even though Layer 3 already refused any gmail.search
+     *query* that would knowingly search for such content (there is no
+     equivalent query to refuse for calendar.list_events -- an attacker
+     who can create an event on the owner's calendar controls its title
+     directly, which is exactly why this redaction pass matters there
+     too).
   3. Plain text only, size-capped, no attachments, no rendered links --
      closing the exact auto-fetch exfiltration channel research/03
      section 1.5 (EchoLeak) used.
@@ -33,7 +38,9 @@ import re
 import yaml
 
 from app.agentmail_client import AgentMailClient, ReplyResult
-from app.config import REPLY_MAX_CHARS
+from app.calendar_executor import CalendarEvent
+from app.calendar_window import format_event_time
+from app.config import OWNER_TIMEZONE, REPLY_MAX_CHARS
 from app.gmail_executor import GmailResult
 from app.request_parser import ParsedRequest
 
@@ -65,16 +72,33 @@ def render_reply(
     status: str,
     error_code: str | None,
     gmail_results: list[GmailResult] | None = None,
+    calendar_results: list[CalendarEvent] | None = None,
     clarification_question: str | None = None,
 ) -> str:
     """Builds the full reply body. Deliberately takes no recipient
-    argument at all -- see module docstring point 1."""
-    results = gmail_results or []
+    argument at all -- see module docstring point 1. Exactly one of
+    `gmail_results`/`calendar_results` is populated per call in
+    practice (app/pipeline.py only ever executes one verb per request),
+    but both are accepted independently rather than a single ambiguous
+    "results" blob, so a caller can't accidentally hand a Gmail result
+    to the calendar formatter or vice versa."""
+    result_count = len(gmail_results or []) + len(calendar_results or [])
     prose_lines: list[str] = []
 
     if error_code == "rate_limited":
         prose_lines.append("You've hit today's request limit for this inbox. Please try again tomorrow.")
+    elif status == "completed" and parsed_request.verb == "calendar.list_events":
+        if calendar_results:
+            prose_lines.append(f"Found {len(calendar_results)} event(s):")
+            for e in calendar_results:
+                title = redact(e.summary) or "(no title)"
+                when = format_event_time(e.start, e.all_day, OWNER_TIMEZONE)
+                attendees = f", {e.attendee_count} attendee(s)" if e.attendee_count else ""
+                prose_lines.append(f"- {title} — {when}{attendees}")
+        else:
+            prose_lines.append("No events found.")
     elif status == "completed":
+        results = gmail_results or []
         if results:
             prose_lines.append(f"Found {len(results)} matching email(s):")
             for r in results:
@@ -106,7 +130,7 @@ def render_reply(
         "request_id": parsed_request.request_id,
         "status": status,
         "error_code": error_code,
-        "result_count": len(results),
+        "result_count": result_count,
     }
     yaml_block = yaml.safe_dump(block, sort_keys=False, default_flow_style=False).strip()
     body = f"{prose}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"

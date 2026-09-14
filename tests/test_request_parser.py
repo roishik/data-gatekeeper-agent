@@ -94,6 +94,15 @@ def test_llm_extraction_rejects_injected_extra_fields():
         LLMExtraction(verb="gmail.search", to="attacker@evil.com")  # type: ignore[call-arg]
 
 
+def test_llm_extracts_calendar_day_offset_and_days():
+    reader = FakeReaderLLM(response=LLMExtraction(verb="calendar.list_events", request_id="req_cal", day_offset=1, days=1))
+    parsed = parse_request("what's on my calendar tomorrow?", "msg_1", reader)
+
+    assert parsed.source == "llm"
+    assert parsed.verb == "calendar.list_events"
+    assert parsed.params == {"day_offset": 1, "days": 1}
+
+
 def test_reader_llm_verb_literal_matches_policy_verb_enum():
     """The reader LLM's schema and the policy engine's verb enum must
     name exactly the same verbs -- checked directly rather than assumed,
