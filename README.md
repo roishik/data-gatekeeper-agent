@@ -149,11 +149,12 @@ Inbound email ─► [0] Mail gate: secret sub-address, sender allowlist, DKIM/D
 - **2026-09-14 — Storage: my own Google Drive** (a log sheet created by the app, with a hash
   chain). The BCC'd email thread in my personal inbox is the second copy, which the
   gatekeeper can't rewrite.
-- **Hosting: pending** (see [07](research/07-free-hosting-options.md)). The orchestrator
-  recommends Google Cloud Run (Python, always-free tier, webhook-capable, Secret Manager, same
-  GCP project as the OAuth client). The alternative is Cloudflare Workers (TypeScript-native).
-  AgentCore and Vertex Agent Engine aren't free and are overkill for one user. Apps Script can't
-  verify webhook signatures and gives weak isolation.
+- **2026-09-14 — Hosting: Google Cloud Run** (Python, always-free tier, receives AgentMail's
+  webhook with Svix signature verification, secrets in Secret Manager, same GCP project as the
+  OAuth client). Rejected: Cloudflare Workers (TypeScript-native), AgentCore / Vertex Agent
+  Engine (not free, overkill), Apps Script (can't verify webhook signatures, weak isolation),
+  Oracle Always Free (idle reclamation, 2026 policy cuts). See
+  [07](research/07-free-hosting-options.md).
 
 ## Decisions I need to make before building
 
