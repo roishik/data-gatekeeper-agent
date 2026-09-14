@@ -25,6 +25,7 @@ The email thread is the audit log, and cutting Instinct off means the gatekeeper
 | 04 | [research/04-data-connectors-and-credentials.md](research/04-data-connectors-and-credentials.md) | How to connect to Gmail, Calendar, LinkedIn and WhatsApp; where secrets live; the kill switch; the gatekeeper's own inbox |
 | 05 | [research/05-deployment-protocol-and-observability.md](research/05-deployment-protocol-and-observability.md) | Hosting, the email protocol, human approvals, audit logs, cost, latency |
 | 06 | [research/06-browser-automation-cost.md](research/06-browser-automation-cost.md) | *(Parked)* LinkedIn and other sites without an API: cheap, safe browser automation vs. computer use |
+| 07 | [research/07-free-hosting-options.md](research/07-free-hosting-options.md) | Free or near-free always-on hosting (AgentCore, Vertex Agent Engine, Apps Script, Cloud Run, Workers, Oracle, ...) and logging to Drive |
 
 Reports 01-05 were written by parallel research agents (Claude Sonnet) and then cross-checked by
 an orchestrator (Claude Opus). The key claims were spot-checked against their primary sources on
@@ -141,6 +142,18 @@ Inbound email ─► [0] Mail gate: secret sub-address, sender allowlist, DKIM/D
 - **2026-09-14 — MVP scope is Google only** (Gmail, Calendar, and optionally Drive/Contacts)
   plus the gatekeeper's dedicated inbox. LinkedIn and other sites without an API are parked;
   see [06](research/06-browser-automation-cost.md).
+- **2026-09-14 — Inbox: AgentMail** (free tier: 3 inboxes, 3,000 emails/mo, 100/day; verified).
+- **2026-09-14 — Google access: read-only** (`gmail.readonly`, `calendar.readonly`,
+  `drive.readonly`, `contacts.readonly`), plus `drive.file` so the gatekeeper can write its own
+  log sheet (it only reaches files the app itself creates).
+- **2026-09-14 — Storage: my own Google Drive** (a log sheet created by the app, with a hash
+  chain). The BCC'd email thread in my personal inbox is the second copy, which the
+  gatekeeper can't rewrite.
+- **Hosting: pending** (see [07](research/07-free-hosting-options.md)). The orchestrator
+  recommends Google Cloud Run (Python, always-free tier, webhook-capable, Secret Manager, same
+  GCP project as the OAuth client). The alternative is Cloudflare Workers (TypeScript-native).
+  AgentCore and Vertex Agent Engine aren't free and are overkill for one user. Apps Script can't
+  verify webhook signatures and gives weak isolation.
 
 ## Decisions I need to make before building
 
