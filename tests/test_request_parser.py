@@ -76,7 +76,8 @@ def test_llm_returning_none_becomes_unsupported():
     assert parsed.source == "llm"
     assert parsed.verb == "unsupported"
     assert parsed.params == {}
-    assert parsed.request_id == "unresolved-msg_42"
+    assert parsed.request_id.startswith("req-") and len(parsed.request_id) == 16
+    assert parse_request("do something ambiguous", "msg_42", FakeReaderLLM(response=None)).request_id == parsed.request_id
 
 
 def test_llm_unsupported_verb_passes_through_as_unsupported():

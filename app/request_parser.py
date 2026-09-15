@@ -78,8 +78,17 @@ def _parse_fenced_block(email_text: str) -> ParsedRequest | None:
     return ParsedRequest(request_id=request_id.strip(), verb=verb.strip(), params=params, source="block")
 
 
+def fallback_request_id_for(agentmail_message_id: str) -> str:
+    """A short, stable id for requests that didn't state one. Derived from the
+    AgentMail message id so a redelivered message still dedupes, but readable
+    in the reply (raw Message-IDs look like `<CAHy...@mail.gmail.com>`)."""
+    import hashlib
+
+    return "req-" + hashlib.sha256(agentmail_message_id.encode()).hexdigest()[:12]
+
+
 def _parse_via_llm(email_text: str, agentmail_message_id: str, reader_llm: ReaderLLM) -> ParsedRequest:
-    fallback_request_id = f"unresolved-{agentmail_message_id}"
+    fallback_request_id = fallback_request_id_for(agentmail_message_id)
     extraction = reader_llm.extract(email_text)
     if extraction is None:
         return ParsedRequest(request_id=fallback_request_id, verb="unsupported", params={}, source="llm")

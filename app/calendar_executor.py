@@ -33,8 +33,11 @@ build report's "could not verify" section.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
+from app.config import OWNER_TIMEZONE
 from app.google_auth_helper import build_google_credentials
 
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -66,32 +69,76 @@ class GoogleCalendarClient:
 
     def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]:
         service = self._service()
-        resp = (
-            service.events()
-            .list(
-                calendarId="primary",
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                orderBy="startTime",
-                maxResults=max_results,
-            )
-            .execute()
-        )
 
         results: list[CalendarEvent] = []
-        for event in resp.get("items", []):
-            start = event.get("start", {}) or {}
-            end = event.get("end", {}) or {}
-            all_day = "date" in start
-            results.append(
-                CalendarEvent(
-                    event_id=event.get("id", ""),
-                    summary=event.get("summary", "") or "",
-                    start=start.get("date") or start.get("dateTime") or "",
-                    end=end.get("date") or end.get("dateTime") or "",
-                    all_day=all_day,
-                    attendee_count=len(event.get("attendees", []) or []),
+        seen: set[str] = set()
+        for calendar_id in _visible_calendar_ids(service):
+            resp = (
+                service.events()
+                .list(
+                    calendarId=calendar_id,
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=max_results,
                 )
+                .execute()
             )
-        return results
+            for event in resp.get("items", []):
+                # The same meeting can sit on several calendars (e.g. an invite that
+                # also lands on a shared family calendar); iCalUID + start identifies
+                # one occurrence across all of them.
+                start = event.get("start", {}) or {}
+                end = event.get("end", {}) or {}
+                start_value = start.get("date") or start.get("dateTime") or ""
+                key = f"{event.get('iCalUID') or event.get('id', '')}|{start_value}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(
+                    CalendarEvent(
+                        event_id=event.get("id", ""),
+                        summary=event.get("summary", "") or "",
+                        start=start_value,
+                        end=end.get("date") or end.get("dateTime") or "",
+                        all_day="date" in start,
+                        attendee_count=len(event.get("attendees", []) or []),
+                    )
+                )
+
+        results.sort(key=_start_sort_key)
+        return results[:max_results]
+
+
+def _visible_calendar_ids(service) -> list[str]:
+    """The calendars the owner has switched on in the Google Calendar UI
+    (`selected`), plus primary. That matches "what I see on my calendar"
+    rather than only the primary one, which misses shared calendars such
+    as a family calendar someone else created."""
+    ids: list[str] = []
+    page_token = None
+    while True:
+        resp = service.calendarList().list(pageToken=page_token).execute()
+        for cal in resp.get("items", []):
+            if cal.get("selected") or cal.get("primary"):
+                ids.append(cal["id"])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return ids or ["primary"]
+
+
+def _start_sort_key(event: CalendarEvent) -> tuple[datetime, int]:
+    """Chronological across calendars by real instant. Calendars report
+    different offsets (a shared calendar may return `...T14:00:00Z` for a
+    17:00 Israel-time event), so the date prefix of the raw string can't be
+    trusted. All-day events start at local midnight in the owner's timezone
+    and sort before timed events at the same instant."""
+    try:
+        if event.all_day:
+            start = datetime.fromisoformat(event.start).replace(tzinfo=ZoneInfo(OWNER_TIMEZONE))
+            return (start.astimezone(timezone.utc), 0)
+        return (datetime.fromisoformat(event.start).astimezone(timezone.utc), 1)
+    except ValueError:
+        return (datetime.max.replace(tzinfo=timezone.utc), 1)
