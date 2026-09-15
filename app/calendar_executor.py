@@ -140,8 +140,11 @@ class GoogleCalendarClient:
         # discipline as the audit log (app/audit_log.py). This is the
         # difference between "no events" and "an event was dropped
         # somewhere" being diagnosable after the fact, without logging
-        # any calendar content.
-        logger.debug(
+        # any calendar content. INFO, not DEBUG: app/main.py's
+        # logging.basicConfig runs at INFO, so a DEBUG line here would
+        # silently never reach Cloud Run's logs at all (caught by an e2e
+        # test against the deployed service -- see the build notes).
+        logger.info(
             "calendar.list_events raw_per_calendar=%s deduped=%d dropped_out_of_window=%d returned=%d",
             raw_counts, deduped_count, out_of_window_count, len(final),
         )
