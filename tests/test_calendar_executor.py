@@ -47,13 +47,26 @@ class _Service:
         return self._events
 
 
-def _timed(event_id, summary, start, uid=None):
-    return {
+def _timed(event_id, summary, start, uid=None, location=None):
+    event = {
         "id": event_id,
         "iCalUID": uid or f"{event_id}@google.com",
         "summary": summary,
         "start": {"dateTime": start},
         "end": {"dateTime": start},
+    }
+    if location is not None:
+        event["location"] = location
+    return event
+
+
+def _all_day(event_id, summary, start_date, end_date, uid=None):
+    return {
+        "id": event_id,
+        "iCalUID": uid or f"{event_id}@google.com",
+        "summary": summary,
+        "start": {"date": start_date},
+        "end": {"date": end_date},
     }
 
 
@@ -110,3 +123,54 @@ def test_falls_back_to_primary_when_calendar_list_is_empty():
     events = _client(service).list_events("t0", "t1", max_results=5)
     assert [e.summary for e in events] == ["Solo"]
     assert service._events.requested == ["primary"]
+
+
+def test_location_is_read_from_the_raw_event():
+    service = _Service(
+        {None: {"items": []}},
+        {"primary": [_timed("p", "Onsite", "2026-09-16T09:00:00+03:00", location="34 Herzl St")]},
+    )
+    events = _client(service).list_events("t0", "t1", max_results=5)
+    assert events[0].location == "34 Herzl St"
+
+
+def test_event_with_no_location_key_has_empty_location():
+    service = _Service({None: {"items": []}}, {"primary": [_timed("p", "Call", "2026-09-16T09:00:00+03:00")]})
+    events = _client(service).list_events("t0", "t1", max_results=5)
+    assert events[0].location == ""
+
+
+def test_all_day_event_ending_before_the_window_start_is_dropped():
+    """Regression test: a live run showed an all-day event from the day
+    before the requested window still coming back from `events.list`
+    (Google's own timeMin/timeMax check for a bare `date` doesn't line up
+    with the owner's local midnight the way a `dateTime` bound does).
+    `time_min`/`time_max` here are exactly what app/calendar_window.py
+    would produce for "today onward" starting 2026-09-15 in
+    Asia/Jerusalem (the OWNER_TIMEZONE default) -- an all-day event that
+    ended on 2026-09-14 must not appear even if the fake service (like a
+    real, quirky one) returns it anyway."""
+    service = _Service(
+        {None: {"items": []}},
+        {
+            "primary": [
+                _all_day("leak", "Stale all-day event", "2026-09-14", "2026-09-15"),
+                _all_day("keep", "Today's all-day event", "2026-09-15", "2026-09-16"),
+            ]
+        },
+    )
+    events = _client(service).list_events(
+        time_min="2026-09-15T00:00:00+03:00", time_max="2026-09-22T00:00:00+03:00", max_results=10
+    )
+    assert [e.summary for e in events] == ["Today's all-day event"]
+
+
+def test_timed_event_outside_the_window_is_dropped():
+    service = _Service(
+        {None: {"items": []}},
+        {"primary": [_timed("before", "Too early", "2026-09-14T23:00:00+03:00")]},
+    )
+    events = _client(service).list_events(
+        time_min="2026-09-15T00:00:00+03:00", time_max="2026-09-16T00:00:00+03:00", max_results=10
+    )
+    assert events == []

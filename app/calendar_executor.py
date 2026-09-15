@@ -5,11 +5,14 @@ Calendar.
 Executes calendar.list_events via `events.list(calendarId="primary",
 singleEvents=True, orderBy="startTime", timeMin=..., timeMax=...)`.
 Returns only: an event id (for the audit log only -- never shown in a
-reply), summary, start, end, an all-day flag, and the attendee COUNT --
-never attendee emails, description, location, conference links
-(hangoutLink/conferenceData), or attachments. That restriction is
-enforced by only ever reading five keys off each raw event dict below,
-never by trusting a caller not to look further (the same discipline as
+reply), summary, start, end, an all-day flag, location, and the attendee
+COUNT -- never attendee emails, description, conference links
+(hangoutLink/conferenceData), or attachments. Location and summary are
+free text an attacker with calendar-write access controls directly, so
+both go through app/reply_guard.py's redaction pass before ever reaching
+a reply, same as a Gmail snippet. That restriction is enforced by only
+ever reading six keys off each raw event dict below, never by trusting a
+caller not to look further (the same discipline as
 app/gmail_executor.py's `_METADATA_HEADERS` allowlist).
 
 Scope: calendar.readonly only, same refresh-token credential plumbing as
@@ -29,9 +32,23 @@ confirmed against Google's current Calendar API v3 reference (fetched
 during this build, raw HTML/embedded-JSON, not just an AI-summarized
 pass). NOT exercised against a live Calendar API call. See the final
 build report's "could not verify" section.
+
+That last point mattered in practice: a live run showed an all-day event
+from the day before the window start still coming back from
+`events.list`. A `date`-only boundary has no timezone of its own, so
+Google's own timeMin/timeMax filtering for all-day events doesn't
+reliably line up with the owner's local midnight the way a `dateTime`
+boundary does -- e.g. a `timeMin` of local midnight in a positive UTC
+offset is *earlier*, in UTC, than that same instant, so an all-day event
+that (in the owner's timezone) already ended can still satisfy Google's
+own end-time check. `_overlaps_window` below re-checks every result
+against the requested window using the owner's timezone for all-day
+dates (the same interpretation `_start_sort_key` already uses for
+sorting), rather than trusting the API to have applied it.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
@@ -42,6 +59,8 @@ from app.google_auth_helper import build_google_credentials
 
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 
+logger = logging.getLogger("gatekeeper.calendar_executor")
+
 
 @dataclass(frozen=True)
 class CalendarEvent:
@@ -51,6 +70,7 @@ class CalendarEvent:
     end: str
     all_day: bool
     attendee_count: int
+    location: str = ""
 
 
 class CalendarClient(Protocol):
@@ -72,6 +92,7 @@ class GoogleCalendarClient:
 
         results: list[CalendarEvent] = []
         seen: set[str] = set()
+        raw_counts: dict[str, int] = {}
         for calendar_id in _visible_calendar_ids(service):
             resp = (
                 service.events()
@@ -85,7 +106,9 @@ class GoogleCalendarClient:
                 )
                 .execute()
             )
-            for event in resp.get("items", []):
+            items = resp.get("items", [])
+            raw_counts[calendar_id] = len(items)
+            for event in items:
                 # The same meeting can sit on several calendars (e.g. an invite that
                 # also lands on a shared family calendar); iCalUID + start identifies
                 # one occurrence across all of them.
@@ -104,11 +127,25 @@ class GoogleCalendarClient:
                         end=end.get("date") or end.get("dateTime") or "",
                         all_day="date" in start,
                         attendee_count=len(event.get("attendees", []) or []),
+                        location=event.get("location", "") or "",
                     )
                 )
 
+        deduped_count = len(results)
+        results = [e for e in results if _overlaps_window(e, time_min, time_max)]
+        out_of_window_count = deduped_count - len(results)
         results.sort(key=_start_sort_key)
-        return results[:max_results]
+        final = results[:max_results]
+        # Counts only, never a summary/location/id -- same minimization
+        # discipline as the audit log (app/audit_log.py). This is the
+        # difference between "no events" and "an event was dropped
+        # somewhere" being diagnosable after the fact, without logging
+        # any calendar content.
+        logger.debug(
+            "calendar.list_events raw_per_calendar=%s deduped=%d dropped_out_of_window=%d returned=%d",
+            raw_counts, deduped_count, out_of_window_count, len(final),
+        )
+        return final
 
 
 def _visible_calendar_ids(service) -> list[str]:
@@ -127,6 +164,34 @@ def _visible_calendar_ids(service) -> list[str]:
         if not page_token:
             break
     return ids or ["primary"]
+
+
+def _instant(value: str, all_day: bool) -> datetime:
+    """An event's start or end value as a timezone-aware instant. All-day
+    `date` values have no offset of their own, so (matching
+    `_start_sort_key`) they're interpreted at local midnight in the
+    owner's timezone rather than left to whatever Google's own
+    timeMin/timeMax comparison assumed."""
+    dt = datetime.fromisoformat(value)
+    if all_day:
+        return dt.replace(tzinfo=ZoneInfo(OWNER_TIMEZONE))
+    return dt
+
+
+def _overlaps_window(event: CalendarEvent, time_min: str, time_max: str) -> bool:
+    """Re-checks a result against the requested window rather than
+    trusting `events.list` to have applied it correctly for an all-day
+    event (see the module docstring). Same exclusive-bounds semantics as
+    the API call itself: the event's end must be after the window start,
+    and its start before the window end. Never drops an event over a
+    parse failure -- silently hiding a real event is worse than showing
+    one with a malformed timestamp."""
+    try:
+        return _instant(event.end, event.all_day) > datetime.fromisoformat(time_min) and _instant(
+            event.start, event.all_day
+        ) < datetime.fromisoformat(time_max)
+    except ValueError:
+        return True
 
 
 def _start_sort_key(event: CalendarEvent) -> tuple[datetime, int]:

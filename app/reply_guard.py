@@ -13,16 +13,16 @@ layer:
      or a Gmail result. An injected instruction anywhere upstream has no
      field to write a different recipient into.
   2. Gmail result text (subject, snippet, sender) and Calendar result
-     text (event summary) are redacted for OTP-like codes, URLs, and
-     email-verification phrasing BEFORE they can appear in a reply --
-     the last line of defense against a poisoned Gmail snippet OR a
-     poisoned calendar event title trying to phish or exfiltrate via the
-     reply itself, even though Layer 3 already refused any gmail.search
-     *query* that would knowingly search for such content (there is no
-     equivalent query to refuse for calendar.list_events -- an attacker
-     who can create an event on the owner's calendar controls its title
-     directly, which is exactly why this redaction pass matters there
-     too).
+     text (event summary, location) are redacted for OTP-like codes,
+     URLs, and email-verification phrasing BEFORE they can appear in a
+     reply -- the last line of defense against a poisoned Gmail snippet
+     OR a poisoned calendar event title/location trying to phish or
+     exfiltrate via the reply itself, even though Layer 3 already
+     refused any gmail.search *query* that would knowingly search for
+     such content (there is no equivalent query to refuse for
+     calendar.list_events -- an attacker who can create an event on the
+     owner's calendar controls its title and location directly, which is
+     exactly why this redaction pass matters there too).
   3. Plain text only, size-capped, no attachments, no rendered links --
      closing the exact auto-fetch exfiltration channel research/03
      section 1.5 (EchoLeak) used.
@@ -39,7 +39,7 @@ import yaml
 
 from app.agentmail_client import AgentMailClient, ReplyResult
 from app.calendar_executor import CalendarEvent
-from app.calendar_window import format_event_time
+from app.calendar_window import format_event_range
 from app.config import OWNER_TIMEZONE, REPLY_MAX_CHARS
 from app.gmail_executor import GmailResult
 from app.request_parser import ParsedRequest
@@ -92,9 +92,10 @@ def render_reply(
             prose_lines.append(f"Found {len(calendar_results)} event(s):")
             for e in calendar_results:
                 title = redact(e.summary) or "(no title)"
-                when = format_event_time(e.start, e.all_day, OWNER_TIMEZONE)
+                when = format_event_range(e.start, e.end, e.all_day, OWNER_TIMEZONE)
+                location = f", at {redact(e.location)}" if e.location else ""
                 attendees = f", {e.attendee_count} attendee(s)" if e.attendee_count else ""
-                prose_lines.append(f"- {title} — {when}{attendees}")
+                prose_lines.append(f"- {title} — {when}{location}{attendees}")
         else:
             prose_lines.append("No events found.")
     elif status == "completed":

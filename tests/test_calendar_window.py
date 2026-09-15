@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.calendar_window import format_event_time, resolve_window
+from app.calendar_window import format_event_range, format_event_time, resolve_window
 
 
 def test_today_window_is_local_midnight_to_midnight():
@@ -72,3 +72,29 @@ def test_format_event_time_malformed_value_is_returned_verbatim_not_crashed():
     # a parseable ISO datetime -- must not raise, must show the raw value.
     malformed = "2026-13-45T99:99:99"
     assert format_event_time(malformed, all_day=False, timezone_name="Asia/Jerusalem") == malformed
+
+
+def test_format_event_range_same_day_shows_start_and_end_time():
+    result = format_event_range(
+        "2026-09-15T09:00:00+03:00", "2026-09-15T09:30:00+03:00", all_day=False, timezone_name="Asia/Jerusalem"
+    )
+    assert result == "Tue Sep 15, 09:00–09:30"
+
+
+def test_format_event_range_crossing_midnight_shows_full_end_datetime():
+    result = format_event_range(
+        "2026-09-15T23:00:00+03:00", "2026-09-16T01:00:00+03:00", all_day=False, timezone_name="Asia/Jerusalem"
+    )
+    assert result == "Tue Sep 15, 23:00–Wed Sep 16, 01:00"
+
+
+def test_format_event_range_all_day_ignores_end():
+    result = format_event_range("2026-09-15", "2026-09-16", all_day=True, timezone_name="Asia/Jerusalem")
+    assert result == "2026-09-15 (all day)"
+
+
+def test_format_event_range_malformed_end_falls_back_to_start_only():
+    result = format_event_range(
+        "2026-09-15T09:00:00+03:00", "not-a-date", all_day=False, timezone_name="Asia/Jerusalem"
+    )
+    assert result == "Tue Sep 15, 09:00"

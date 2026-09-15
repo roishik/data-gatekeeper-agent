@@ -70,3 +70,29 @@ def format_event_time(iso_value: str, all_day: bool, timezone_name: str) -> str:
     if dt.tzinfo is not None:
         dt = dt.astimezone(ZoneInfo(timezone_name))
     return dt.strftime("%a %b %d, %H:%M")
+
+
+def format_event_range(start: str, end: str, all_day: bool, timezone_name: str) -> str:
+    """Renders a start/end pair for the reply -- the single-value
+    `format_event_time` above only ever showed the start, which left a
+    reply unable to say when a meeting ends. All-day events still
+    collapse to one "(all day)" marker (there's no time-of-day to range
+    over); a timed event's end is shown as just a time when it falls on
+    the same local day as the start, since repeating the date adds
+    nothing.
+    """
+    start_str = format_event_time(start, all_day, timezone_name)
+    if all_day or "T" not in start or "T" not in end:
+        return start_str
+    try:
+        start_dt = datetime.fromisoformat(start)
+        end_dt = datetime.fromisoformat(end)
+    except ValueError:
+        return start_str
+    if start_dt.tzinfo is not None:
+        start_dt = start_dt.astimezone(ZoneInfo(timezone_name))
+    if end_dt.tzinfo is not None:
+        end_dt = end_dt.astimezone(ZoneInfo(timezone_name))
+    if start_dt.date() == end_dt.date():
+        return f"{start_str}–{end_dt.strftime('%H:%M')}"
+    return f"{start_str}–{format_event_time(end, all_day, timezone_name)}"

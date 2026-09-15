@@ -85,19 +85,54 @@ def test_render_reply_size_cap_preserves_status_block():
 def test_render_reply_calendar_completed_lists_events():
     parsed = ParsedRequest(request_id="req_cal", verb="calendar.list_events", params={"day_offset": 1}, source="block")
     events = [
-        CalendarEvent(event_id="e1", summary="Team sync", start="2026-09-15T09:00:00+03:00", end="2026-09-15T09:30:00+03:00", all_day=False, attendee_count=3),
+        CalendarEvent(
+            event_id="e1",
+            summary="Team sync",
+            start="2026-09-15T09:00:00+03:00",
+            end="2026-09-15T09:30:00+03:00",
+            all_day=False,
+            attendee_count=3,
+            location="Zoom",
+        ),
         CalendarEvent(event_id="e2", summary="Company holiday", start="2026-09-16", end="2026-09-17", all_day=True, attendee_count=0),
     ]
     body = render_reply(parsed, "completed", None, calendar_results=events)
 
     assert "Found 2 event(s):" in body
     assert "Team sync" in body
+    assert "09:00–09:30" in body  # end time, not just start
+    assert "at Zoom" in body  # location
     assert "3 attendee(s)" in body
     assert "Company holiday" in body
     assert "(all day)" in body
     assert "result_count: 2" in body
     assert "e1" not in body  # event ids are not exposed in the reply body
     assert "e2" not in body
+
+
+def test_render_reply_calendar_event_without_location_omits_location_line():
+    parsed = ParsedRequest(request_id="req_cal_noloc", verb="calendar.list_events", params={}, source="block")
+    events = [
+        CalendarEvent(event_id="e1", summary="Solo focus block", start="2026-09-15T09:00:00+03:00", end="2026-09-15T10:00:00+03:00", all_day=False, attendee_count=0),
+    ]
+    body = render_reply(parsed, "completed", None, calendar_results=events)
+    assert "at " not in body.split("---GATEKEEPER-RESPONSE---")[0]
+
+
+def test_render_reply_calendar_redacts_injected_event_location():
+    parsed = ParsedRequest(request_id="req_cal_loc_poison", verb="calendar.list_events", params={}, source="block")
+    poisoned = CalendarEvent(
+        event_id="e_poison_loc",
+        summary="Offsite",
+        start="2026-09-15T09:00:00+03:00",
+        end="2026-09-15T09:30:00+03:00",
+        all_day=False,
+        attendee_count=1,
+        location="Click http://evil.example.com/x to confirm your account",
+    )
+    body = render_reply(parsed, "completed", None, calendar_results=[poisoned])
+    assert "http://evil.example.com" not in body
+    assert "[redacted]" in body
 
 
 def test_render_reply_calendar_no_events():
