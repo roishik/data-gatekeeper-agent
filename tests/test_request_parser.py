@@ -89,10 +89,12 @@ def test_llm_unsupported_verb_passes_through_as_unsupported():
 def test_llm_extraction_rejects_injected_extra_fields():
     """Structural proof of the quarantine boundary: LLMExtraction's
     extra="forbid" means even constructing an instance with an
-    attacker-shaped extra field (e.g. an injected 'to'/'recipients')
-    raises, rather than silently accepting and carrying it forward."""
+    attacker-shaped extra field (e.g. an injected 'cc'/'recipients' --
+    'to' is deliberately NOT used here since it's a legitimate
+    gmail.create_draft field now) raises, rather than silently accepting
+    and carrying it forward."""
     with pytest.raises(ValidationError):
-        LLMExtraction(verb="gmail.search", to="attacker@evil.com")  # type: ignore[call-arg]
+        LLMExtraction(verb="gmail.search", recipients="attacker@evil.com")  # type: ignore[call-arg]
 
 
 def test_llm_extracts_calendar_day_offset_and_days():
@@ -102,6 +104,48 @@ def test_llm_extracts_calendar_day_offset_and_days():
     assert parsed.source == "llm"
     assert parsed.verb == "calendar.list_events"
     assert parsed.params == {"day_offset": 1, "days": 1}
+
+
+def test_llm_extracts_gmail_create_draft_fields():
+    reader = FakeReaderLLM(
+        response=LLMExtraction(verb="gmail.create_draft", request_id="req_d", to="a@b.com", subject="Hi", body="Hello")
+    )
+    parsed = parse_request("please draft an email to a@b.com", "msg_1", reader)
+
+    assert parsed.verb == "gmail.create_draft"
+    assert parsed.params == {"to": "a@b.com", "subject": "Hi", "body": "Hello"}
+
+
+def test_llm_extracts_calendar_create_event_fields_including_attendees():
+    reader = FakeReaderLLM(
+        response=LLMExtraction(
+            verb="calendar.create_event", request_id="req_ce", title="Coffee", day_offset=1,
+            start_time="14:00", duration_minutes=30, attendees=["a@b.com", "c@d.com"],
+        )
+    )
+    parsed = parse_request("set up coffee tomorrow at 2pm with a@b.com and c@d.com", "msg_1", reader)
+
+    assert parsed.verb == "calendar.create_event"
+    assert parsed.params == {
+        "title": "Coffee", "day_offset": 1, "start_time": "14:00",
+        "duration_minutes": 30, "attendees": ["a@b.com", "c@d.com"],
+    }
+
+
+def test_llm_extracts_calendar_update_event_event_id():
+    reader = FakeReaderLLM(response=LLMExtraction(verb="calendar.update_event", request_id="req_ue", event_id="ev1", title="New"))
+    parsed = parse_request("rename event ev1 to New", "msg_1", reader)
+
+    assert parsed.verb == "calendar.update_event"
+    assert parsed.params == {"event_id": "ev1", "title": "New"}
+
+
+def test_llm_extracts_drive_create_file_fields():
+    reader = FakeReaderLLM(response=LLMExtraction(verb="drive.create_file", request_id="req_df", name="notes.txt", content="hi"))
+    parsed = parse_request("create a drive file called notes.txt with content hi", "msg_1", reader)
+
+    assert parsed.verb == "drive.create_file"
+    assert parsed.params == {"name": "notes.txt", "content": "hi"}
 
 
 def test_reader_llm_verb_literal_matches_policy_verb_enum():

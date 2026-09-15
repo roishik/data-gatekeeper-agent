@@ -25,6 +25,7 @@ working: there is no field to put it in.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -34,16 +35,34 @@ from app.config import SENSITIVE_QUERY_TERMS
 
 class Verb(str, Enum):
     GMAIL_SEARCH = "gmail.search"
+    GMAIL_CREATE_DRAFT = "gmail.create_draft"
     CALENDAR_LIST_EVENTS = "calendar.list_events"
+    CALENDAR_CREATE_EVENT = "calendar.create_event"
+    CALENDAR_UPDATE_EVENT = "calendar.update_event"
+    CALENDAR_DELETE_EVENT = "calendar.delete_event"
     DRIVE_SEARCH = "drive.search"
+    DRIVE_CREATE_FILE = "drive.create_file"
     CONTACTS_SEARCH = "contacts.search"
     UNSUPPORTED = "unsupported"
 
 
-# The verbs with a real executor in this MVP (research/00 brief,
-# "Suggested next phases" step 3 started the walking skeleton with ONE
-# read-only verb; calendar.list_events is the second).
-IMPLEMENTED_VERBS = frozenset({Verb.GMAIL_SEARCH, Verb.CALENDAR_LIST_EVENTS})
+# The verbs with a real executor (research/00 brief, "Suggested next
+# phases" step 3 started the walking skeleton with ONE read-only verb;
+# every write verb below was added once the owner explicitly decided --
+# see CLAUDE.md -- to give the gatekeeper write access: gmail.create_draft
+# only ever creates a Gmail DRAFT, never sends (the owner reviews and
+# sends it themselves in Gmail -- that manual step is the approval), and
+# the calendar/drive write verbs run fully autonomously by the owner's
+# explicit choice, with no recipient/attendee allowlist gating them.
+IMPLEMENTED_VERBS = frozenset({
+    Verb.GMAIL_SEARCH,
+    Verb.GMAIL_CREATE_DRAFT,
+    Verb.CALENDAR_LIST_EVENTS,
+    Verb.CALENDAR_CREATE_EVENT,
+    Verb.CALENDAR_UPDATE_EVENT,
+    Verb.CALENDAR_DELETE_EVENT,
+    Verb.DRIVE_CREATE_FILE,
+})
 NOT_IMPLEMENTED_VERBS = frozenset({Verb.DRIVE_SEARCH, Verb.CONTACTS_SEARCH})
 
 QUERY_MAX_CHARS = 200
@@ -69,6 +88,42 @@ CAL_MAX_RESULTS_DEFAULT = 10
 CAL_MAX_RESULTS_MIN = 1
 CAL_MAX_RESULTS_MAX = 25
 
+# gmail.create_draft bounds. Deliberately no allowlist on `to` -- the
+# owner's explicit choice (CLAUDE.md) is that this verb only ever creates
+# a Gmail DRAFT (never sends), so the owner reviewing and manually
+# sending it in Gmail is the approval step for an arbitrary recipient.
+# Still validated as *shaped like* an email address -- deny-by-default
+# never means "accept anything".
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+DRAFT_TO_MAX_CHARS = 254  # RFC 5321 max mailbox length
+DRAFT_SUBJECT_MAX_CHARS = 200
+DRAFT_BODY_MAX_CHARS = 5000
+
+# calendar.create_event / update_event bounds. day_offset/start_time are
+# the same "small bounded token, never a real date/timestamp" trick as
+# CAL_DAY_OFFSET_* above (app/calendar_window.py does the arithmetic) --
+# widened to a year out since a created event can reasonably be far in
+# the future, unlike a "what's on my calendar" read window. Also no
+# attendee allowlist, by the same explicit owner choice as gmail
+# drafts -- but calendar writes run WITHOUT the manual-review step a
+# draft gets, since Calendar sends real invites immediately (see
+# CLAUDE.md). attendees are still validated as email-shaped and bounded
+# in count.
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+EVENT_TITLE_MAX_CHARS = 200
+EVENT_DAY_OFFSET_MIN = 0
+EVENT_DAY_OFFSET_MAX = 365
+EVENT_DURATION_MIN_MINUTES = 5
+EVENT_DURATION_MAX_MINUTES = 480  # 8 hours
+EVENT_ATTENDEES_MAX = 10
+EVENT_ID_MAX_CHARS = 512  # Google event ids are short in practice; this only bounds pathological input
+
+# drive.create_file bounds. Always written into one fixed, app-owned
+# folder (GOOGLE_DRIVE_FOLDER_ID, resolved in app/drive_executor.py) --
+# there is no `folder` field here for a request to redirect into.
+DRIVE_NAME_MAX_CHARS = 200
+DRIVE_CONTENT_MAX_CHARS = 20000
+
 
 @dataclass(frozen=True)
 class GmailSearchParams:
@@ -78,10 +133,47 @@ class GmailSearchParams:
 
 
 @dataclass(frozen=True)
+class GmailCreateDraftParams:
+    to: str
+    subject: str
+    body: str
+
+
+@dataclass(frozen=True)
 class CalendarListEventsParams:
     day_offset: int = CAL_DAY_OFFSET_DEFAULT
     days: int = CAL_DAYS_DEFAULT
     max_results: int = CAL_MAX_RESULTS_DEFAULT
+
+
+@dataclass(frozen=True)
+class CalendarCreateEventParams:
+    title: str
+    day_offset: int
+    start_time: str  # "HH:MM", owner's local time
+    duration_minutes: int
+    attendees: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CalendarUpdateEventParams:
+    event_id: str
+    title: str | None = None
+    day_offset: int | None = None
+    start_time: str | None = None
+    duration_minutes: int | None = None
+    attendees: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class CalendarDeleteEventParams:
+    event_id: str
+
+
+@dataclass(frozen=True)
+class DriveCreateFileParams:
+    name: str
+    content: str
 
 
 @dataclass(frozen=True)
@@ -94,7 +186,16 @@ class PolicyDecision:
     # the same allowlisted-field-extraction principle as GmailSearchParams
     # (see module docstring point 2) -- CalendarListEventsParams has no
     # field a "to"/"recipients"/date-string injection could land in either.
-    params: GmailSearchParams | CalendarListEventsParams | None = None
+    params: (
+        GmailSearchParams
+        | GmailCreateDraftParams
+        | CalendarListEventsParams
+        | CalendarCreateEventParams
+        | CalendarUpdateEventParams
+        | CalendarDeleteEventParams
+        | DriveCreateFileParams
+        | None
+    ) = None
 
 
 def _contains_sensitive_term(query: str) -> str | None:
@@ -139,8 +240,23 @@ def evaluate_policy(verb_raw: str, params: dict[str, Any]) -> PolicyDecision:
     if verb == Verb.GMAIL_SEARCH:
         return _evaluate_gmail_search(params)
 
+    if verb == Verb.GMAIL_CREATE_DRAFT:
+        return _evaluate_gmail_create_draft(params)
+
     if verb == Verb.CALENDAR_LIST_EVENTS:
         return _evaluate_calendar_list_events(params)
+
+    if verb == Verb.CALENDAR_CREATE_EVENT:
+        return _evaluate_calendar_create_event(params)
+
+    if verb == Verb.CALENDAR_UPDATE_EVENT:
+        return _evaluate_calendar_update_event(params)
+
+    if verb == Verb.CALENDAR_DELETE_EVENT:
+        return _evaluate_calendar_delete_event(params)
+
+    if verb == Verb.DRIVE_CREATE_FILE:
+        return _evaluate_drive_create_file(params)
 
     # Unreachable given the enum is exhaustively handled above, but
     # deny-by-default means even an unreachable branch denies rather
@@ -200,6 +316,37 @@ def _evaluate_gmail_search(params: dict[str, Any]) -> PolicyDecision:
     )
 
 
+def _evaluate_gmail_create_draft(params: dict[str, Any]) -> PolicyDecision:
+    verb = Verb.GMAIL_CREATE_DRAFT
+
+    to = params.get("to")
+    if not isinstance(to, str) or not to.strip():
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'to' is required and must be a non-empty string")
+    to = to.strip()
+    if len(to) > DRAFT_TO_MAX_CHARS or not _EMAIL_RE.match(to):
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'to' must be a valid email address")
+
+    subject = params.get("subject")
+    if not isinstance(subject, str) or not subject.strip():
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'subject' is required and must be a non-empty string")
+    if len(subject) > DRAFT_SUBJECT_MAX_CHARS:
+        return PolicyDecision(
+            status="denied", verb=verb, error_code="invalid_params",
+            reason=f"'subject' exceeds {DRAFT_SUBJECT_MAX_CHARS} characters",
+        )
+
+    body = params.get("body")
+    if not isinstance(body, str) or not body.strip():
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'body' is required and must be a non-empty string")
+    if len(body) > DRAFT_BODY_MAX_CHARS:
+        return PolicyDecision(
+            status="denied", verb=verb, error_code="invalid_params",
+            reason=f"'body' exceeds {DRAFT_BODY_MAX_CHARS} characters",
+        )
+
+    return PolicyDecision(status="allowed", verb=verb, params=GmailCreateDraftParams(to=to, subject=subject, body=body))
+
+
 def _evaluate_calendar_list_events(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_LIST_EVENTS
 
@@ -235,3 +382,163 @@ def _evaluate_calendar_list_events(params: dict[str, Any]) -> PolicyDecision:
         verb=verb,
         params=CalendarListEventsParams(day_offset=day_offset, days=days, max_results=max_results),
     )
+
+
+# ── Shared field validators for calendar.create_event/update_event ─────────
+# Each returns (value, error_reason); error_reason is None iff value is
+# usable. Factored out because create_event (all fields required) and
+# update_event (all fields optional, but validated the same way when
+# present) would otherwise duplicate every bound check twice.
+
+
+def _validate_title(value: Any) -> tuple[str | None, str | None]:
+    if not isinstance(value, str) or not value.strip():
+        return None, "'title' is required and must be a non-empty string"
+    if len(value) > EVENT_TITLE_MAX_CHARS:
+        return None, f"'title' exceeds {EVENT_TITLE_MAX_CHARS} characters"
+    return value.strip(), None
+
+
+def _validate_day_offset(value: Any) -> tuple[int | None, str | None]:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None, "'day_offset' must be an integer"
+    if not (EVENT_DAY_OFFSET_MIN <= value <= EVENT_DAY_OFFSET_MAX):
+        return None, f"'day_offset' must be between {EVENT_DAY_OFFSET_MIN} and {EVENT_DAY_OFFSET_MAX}"
+    return value, None
+
+
+def _validate_start_time(value: Any) -> tuple[str | None, str | None]:
+    if not isinstance(value, str) or not _TIME_RE.match(value):
+        return None, "'start_time' must be an 'HH:MM' string"
+    return value, None
+
+
+def _validate_duration(value: Any) -> tuple[int | None, str | None]:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None, "'duration_minutes' must be an integer"
+    if not (EVENT_DURATION_MIN_MINUTES <= value <= EVENT_DURATION_MAX_MINUTES):
+        return None, f"'duration_minutes' must be between {EVENT_DURATION_MIN_MINUTES} and {EVENT_DURATION_MAX_MINUTES}"
+    return value, None
+
+
+def _validate_attendees(value: Any) -> tuple[tuple[str, ...] | None, str | None]:
+    if not isinstance(value, list):
+        return None, "'attendees' must be a list of email addresses"
+    if len(value) > EVENT_ATTENDEES_MAX:
+        return None, f"'attendees' exceeds {EVENT_ATTENDEES_MAX} entries"
+    cleaned: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str) or not _EMAIL_RE.match(entry.strip()):
+            return None, f"'attendees' contains a value that is not a valid email address: {entry!r}"
+        cleaned.append(entry.strip())
+    return tuple(cleaned), None
+
+
+def _validate_event_id(value: Any) -> tuple[str | None, str | None]:
+    if not isinstance(value, str) or not value.strip():
+        return None, "'event_id' is required and must be a non-empty string"
+    if len(value) > EVENT_ID_MAX_CHARS:
+        return None, f"'event_id' exceeds {EVENT_ID_MAX_CHARS} characters"
+    return value.strip(), None
+
+
+def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
+    verb = Verb.CALENDAR_CREATE_EVENT
+
+    title, err = _validate_title(params.get("title"))
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
+    day_offset, err = _validate_day_offset(params.get("day_offset"))
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
+    start_time, err = _validate_start_time(params.get("start_time"))
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
+    duration_minutes, err = _validate_duration(params.get("duration_minutes"))
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
+    attendees_raw = params.get("attendees", [])
+    attendees, err = _validate_attendees(attendees_raw)
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
+    # Each validator's (value, err) contract guarantees value is not None
+    # here -- every branch above already returned on a non-None err.
+    assert title is not None and day_offset is not None and start_time is not None and duration_minutes is not None
+
+    return PolicyDecision(
+        status="allowed",
+        verb=verb,
+        params=CalendarCreateEventParams(
+            title=title, day_offset=day_offset, start_time=start_time,
+            duration_minutes=duration_minutes, attendees=attendees or (),
+        ),
+    )
+
+
+def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
+    verb = Verb.CALENDAR_UPDATE_EVENT
+
+    event_id, err = _validate_event_id(params.get("event_id"))
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
+    updates: dict[str, Any] = {}
+    for field_name, validator in (
+        ("title", _validate_title),
+        ("day_offset", _validate_day_offset),
+        ("start_time", _validate_start_time),
+        ("duration_minutes", _validate_duration),
+        ("attendees", _validate_attendees),
+    ):
+        if field_name not in params:
+            continue
+        value, err = validator(params[field_name])
+        if err:
+            return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+        updates[field_name] = value
+
+    if not updates:
+        return PolicyDecision(
+            status="denied", verb=verb, error_code="invalid_params",
+            reason="at least one of title/day_offset/start_time/duration_minutes/attendees must be given",
+        )
+
+    assert event_id is not None
+    return PolicyDecision(status="allowed", verb=verb, params=CalendarUpdateEventParams(event_id=event_id, **updates))
+
+
+def _evaluate_calendar_delete_event(params: dict[str, Any]) -> PolicyDecision:
+    verb = Verb.CALENDAR_DELETE_EVENT
+
+    event_id, err = _validate_event_id(params.get("event_id"))
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
+    assert event_id is not None
+    return PolicyDecision(status="allowed", verb=verb, params=CalendarDeleteEventParams(event_id=event_id))
+
+
+def _evaluate_drive_create_file(params: dict[str, Any]) -> PolicyDecision:
+    verb = Verb.DRIVE_CREATE_FILE
+
+    name = params.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'name' is required and must be a non-empty string")
+    if len(name) > DRIVE_NAME_MAX_CHARS:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=f"'name' exceeds {DRIVE_NAME_MAX_CHARS} characters")
+
+    content = params.get("content")
+    if not isinstance(content, str):
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'content' is required and must be a string")
+    if len(content) > DRIVE_CONTENT_MAX_CHARS:
+        return PolicyDecision(
+            status="denied", verb=verb, error_code="invalid_params",
+            reason=f"'content' exceeds {DRIVE_CONTENT_MAX_CHARS} characters",
+        )
+
+    return PolicyDecision(status="allowed", verb=verb, params=DriveCreateFileParams(name=name.strip(), content=content))

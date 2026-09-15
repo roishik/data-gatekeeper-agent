@@ -21,12 +21,24 @@ Create Credentials > OAuth client ID > Desktop app). It is NOT the same
 as the refresh token this script produces, and is not needed again after
 this script runs once.
 
-Scopes requested: gmail.readonly, calendar.readonly, drive.readonly,
-contacts.readonly, drive.file. The MVP executor (app/gmail_executor.py)
-only uses gmail.readonly today; the others are requested now so a single
+Scopes requested: gmail.readonly, gmail.compose, calendar.readonly,
+calendar.events, drive.readonly, contacts.readonly, drive.file.
+gmail.compose and calendar.events are the write scopes added once the
+owner explicitly decided to give the gatekeeper write access (see
+CLAUDE.md): gmail.compose backs gmail.create_draft (app/gmail_executor.py
+never calls a send endpoint with it -- see that module's docstring), and
+calendar.events backs calendar.create_event/update_event/delete_event
+(app/calendar_executor.py). The rest are requested now so a single
 consent grant covers the rest of the README's MVP scope (calendar/drive/
-contacts read, plus drive.file for the Sheets-backed audit log and state
-store) without a second round of "please re-consent" later.
+contacts read, plus drive.file for the Sheets-backed audit log, state
+store, and drive.create_file) without a second round of "please
+re-consent" later.
+
+Re-running this script against an account that already granted the
+OLDER, narrower scope set (before gmail.compose/calendar.events existed)
+requires re-consent -- Google will show the new scopes on the consent
+screen; see the "did not return a refresh_token" note below if it
+doesn't prompt.
 
 The resulting token is written to ~/.config/data-gatekeeper/token.json
 with owner-only (0600) permissions -- NEVER inside this repo, and NEVER
@@ -46,7 +58,9 @@ from pathlib import Path
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/contacts.readonly",
     "https://www.googleapis.com/auth/drive.file",

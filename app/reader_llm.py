@@ -37,7 +37,16 @@ logger = logging.getLogger("gatekeeper.reader_llm")
 # this module has no business knowing about policy decisions, only about
 # the shape of extraction.
 VerbLiteral = Literal[
-    "gmail.search", "calendar.list_events", "drive.search", "contacts.search", "unsupported"
+    "gmail.search",
+    "gmail.create_draft",
+    "calendar.list_events",
+    "calendar.create_event",
+    "calendar.update_event",
+    "calendar.delete_event",
+    "drive.search",
+    "drive.create_file",
+    "contacts.search",
+    "unsupported",
 ]
 
 
@@ -50,13 +59,34 @@ class LLMExtraction(BaseModel):
     query: str | None = None
     max_results: int | None = None
     newer_than_days: int | None = None
-    # calendar.list_events fields. Deliberately small bounded integers,
-    # never a date/timestamp string -- see app/calendar_window.py's
-    # docstring for why the model is never asked to do date arithmetic.
-    # `max_results` above is shared between both verbs (policy.py applies
-    # a different valid range per verb; this schema only bounds the type).
+    # calendar.list_events / calendar.create_event / calendar.update_event
+    # fields. Deliberately small bounded integers, never a date/timestamp
+    # string -- see app/calendar_window.py's docstring for why the model
+    # is never asked to do date arithmetic. `max_results`/`day_offset`
+    # above are shared across verbs (policy.py applies a different valid
+    # range per verb; this schema only bounds the type).
     day_offset: int | None = None
     days: int | None = None
+    # gmail.create_draft fields. The model may compose `subject`/`body`
+    # from what the request literally asks for -- it must never invent
+    # claims, links, or content the request didn't ask for (see the
+    # system prompt below). This verb only ever creates a Gmail DRAFT;
+    # the owner reviews and sends it themselves.
+    to: str | None = None
+    subject: str | None = None
+    body: str | None = None
+    # calendar.create_event / update_event fields.
+    title: str | None = None
+    start_time: str | None = None  # "HH:MM", owner's local time -- never a full date/timestamp
+    duration_minutes: int | None = None
+    attendees: list[str] | None = None
+    # calendar.update_event / delete_event field -- must be copied
+    # verbatim from what the email states (e.g. an event id the
+    # gatekeeper itself returned in an earlier reply); never invented.
+    event_id: str | None = None
+    # drive.create_file fields.
+    name: str | None = None
+    content: str | None = None
 
 
 class ReaderLLM(Protocol):
@@ -78,18 +108,41 @@ _SYSTEM_PROMPT = (
     "of those actions, set verb to 'unsupported' and leave the other "
     "fields empty. Never invent a request_id -- copy one only if the "
     "email text plainly states one.\n\n"
-    "For verb='calendar.list_events', you NEVER compute or write out an "
-    "actual date or timestamp -- you only pick two small integers, "
-    "day_offset and days, relative to today. Map relative day language "
-    "like this: 'today' -> day_offset=0; 'tomorrow' -> day_offset=1; "
-    "'the day after tomorrow' -> day_offset=2; 'this week' or 'the next 7 "
-    "days' -> day_offset=0, days=7; 'next week' -> day_offset=7, days=7. "
-    "If the email doesn't say, day_offset defaults to 0 and days to 1 -- "
-    "simply omit both fields rather than guessing a specific date. Never "
-    "put a calendar date, weekday name, or duration string in any field; "
-    "if the requested range genuinely needs a specific date you cannot "
-    "express as a small day_offset/days pair, set verb to "
-    "'unsupported' instead."
+    "For verb='calendar.list_events'/'calendar.create_event'/"
+    "'calendar.update_event', you NEVER compute or write out an actual "
+    "date or timestamp -- you only pick a small integer, day_offset, "
+    "relative to today (plus 'days' for list_events only). Map relative "
+    "day language like this: 'today' -> day_offset=0; 'tomorrow' -> "
+    "day_offset=1; 'the day after tomorrow' -> day_offset=2; 'this week' "
+    "or 'the next 7 days' -> day_offset=0, days=7; 'next week' -> "
+    "day_offset=7, days=7. For list_events, if the email doesn't say, "
+    "day_offset defaults to 0 and days to 1 -- simply omit both fields "
+    "rather than guessing. Never put a calendar date, weekday name, or "
+    "duration string in any field; if the requested range or event date "
+    "genuinely needs a specific date you cannot express as a small "
+    "day_offset, set verb to 'unsupported' instead.\n\n"
+    "For verb='calendar.create_event', also extract: title (a short "
+    "label for the event, taken from what the email says -- never "
+    "invented), start_time as an 'HH:MM' 24-hour string in the owner's "
+    "local time, duration_minutes as an integer, and attendees as a list "
+    "of the exact email addresses the request names (never add an "
+    "attendee the email didn't name, never omit one it did). If the "
+    "email doesn't give a clear title, start_time, or duration, set verb "
+    "to 'unsupported' rather than guessing.\n\n"
+    "For verb='calendar.update_event'/'calendar.delete_event', event_id "
+    "must be copied verbatim from an event id literally present in the "
+    "email text (e.g. one the gatekeeper itself returned in an earlier "
+    "reply the email is quoting) -- never invent or guess one. For "
+    "update_event, only include the fields (title/day_offset/start_time/"
+    "duration_minutes/attendees) the email actually asks to change.\n\n"
+    "For verb='gmail.create_draft', extract to (the exact recipient "
+    "email address the request names), subject, and body. Compose "
+    "subject/body only from what the email explicitly asks the draft to "
+    "say -- never add claims, links, prices, or commitments the request "
+    "didn't state. This verb only ever creates a Gmail DRAFT; it never "
+    "sends anything.\n\n"
+    "For verb='drive.create_file', extract name and content only from "
+    "what the email explicitly asks the file to contain."
 )
 
 

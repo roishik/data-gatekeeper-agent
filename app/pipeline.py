@@ -21,9 +21,20 @@ from app.audit_log import AuditLog, AuditRecord
 from app.calendar_executor import CalendarClient, CalendarEvent
 from app.calendar_window import resolve_window
 from app.config import AGENTMAIL_INBOX_ID, MAX_REQUESTS_PER_DAY, OWNER_EMAIL, OWNER_TIMEZONE
-from app.gmail_executor import GmailClient, GmailResult
+from app.drive_executor import DriveClient, DriveFileResult
+from app.gmail_executor import DraftResult, GmailClient, GmailResult
 from app.ingress import check_event, parsed_sender_address, verify_signature
-from app.policy import CalendarListEventsParams, GmailSearchParams, PolicyDecision, evaluate_policy
+from app.policy import (
+    CalendarCreateEventParams,
+    CalendarDeleteEventParams,
+    CalendarListEventsParams,
+    CalendarUpdateEventParams,
+    DriveCreateFileParams,
+    GmailCreateDraftParams,
+    GmailSearchParams,
+    PolicyDecision,
+    evaluate_policy,
+)
 from app.reader_llm import ReaderLLM
 from app.reply_guard import render_reply, send_reply
 from app.request_parser import ParsedRequest, parse_request
@@ -87,6 +98,7 @@ def handle_webhook(
     reader_llm: ReaderLLM,
     gmail_client_factory: Callable[[], GmailClient],
     calendar_client_factory: Callable[[], CalendarClient],
+    drive_client_factory: Callable[[], DriveClient],
     agentmail_client: AgentMailClient,
     audit_log: AuditLog,
     payload: dict[str, Any] | None = None,
@@ -97,11 +109,11 @@ def handle_webhook(
     for signature verification -- the two must be consistent in real
     use, which app/main.py guarantees by parsing `body` itself.
 
-    `gmail_client_factory`/`calendar_client_factory` are zero-arg
-    callables rather than client instances so a (possibly credentialed)
-    client is constructed only on the one request path that actually
-    reaches Layer 4 for that verb -- a gmail.search request never
-    touches Calendar credentials and vice versa."""
+    `gmail_client_factory`/`calendar_client_factory`/`drive_client_factory`
+    are zero-arg callables rather than client instances so a (possibly
+    credentialed) client is constructed only on the one request path that
+    actually reaches Layer 4 for that verb -- a gmail.search request
+    never touches Calendar or Drive credentials, and vice versa."""
     sig_verdict = verify_signature(body, svix_id, svix_timestamp, svix_signature)
 
     # Best-effort extraction of a message id / sender for the audit log
@@ -166,10 +178,15 @@ def handle_webhook(
     # ── Layer 3: policy ──────────────────────────────────────────────────
     decision = evaluate_policy(parsed.verb, parsed.params)
 
-    # ── Layer 4: executor (only for an allowed gmail.search or
-    # calendar.list_events -- exactly one verb runs per request) ───────
+    # ── Layer 4: executor (only for an allowed verb -- exactly one
+    # verb, read or write, runs per request) ────────────────────────────
     gmail_results: list[GmailResult] | None = None
     calendar_results: list[CalendarEvent] | None = None
+    draft_result: DraftResult | None = None
+    created_event: CalendarEvent | None = None
+    updated_event: CalendarEvent | None = None
+    deleted_event_id: str | None = None
+    drive_file_result: DriveFileResult | None = None
     if decision.status == "allowed" and isinstance(decision.params, GmailSearchParams):
         gmail_client = gmail_client_factory()
         gmail_results = gmail_client.search(
@@ -177,18 +194,51 @@ def handle_webhook(
             max_results=decision.params.max_results,
             newer_than_days=decision.params.newer_than_days,
         )
+    elif decision.status == "allowed" and isinstance(decision.params, GmailCreateDraftParams):
+        gmail_client = gmail_client_factory()
+        draft_result = gmail_client.create_draft(
+            to=decision.params.to, subject=decision.params.subject, body=decision.params.body
+        )
     elif decision.status == "allowed" and isinstance(decision.params, CalendarListEventsParams):
         window = resolve_window(decision.params.day_offset, decision.params.days, OWNER_TIMEZONE)
         calendar_client = calendar_client_factory()
         calendar_results = calendar_client.list_events(
             time_min=window.time_min, time_max=window.time_max, max_results=decision.params.max_results
         )
+    elif decision.status == "allowed" and isinstance(decision.params, CalendarCreateEventParams):
+        calendar_client = calendar_client_factory()
+        created_event = calendar_client.create_event(
+            title=decision.params.title,
+            day_offset=decision.params.day_offset,
+            start_time=decision.params.start_time,
+            duration_minutes=decision.params.duration_minutes,
+            attendees=decision.params.attendees,
+        )
+    elif decision.status == "allowed" and isinstance(decision.params, CalendarUpdateEventParams):
+        calendar_client = calendar_client_factory()
+        updated_event = calendar_client.update_event(
+            event_id=decision.params.event_id,
+            title=decision.params.title,
+            day_offset=decision.params.day_offset,
+            start_time=decision.params.start_time,
+            duration_minutes=decision.params.duration_minutes,
+            attendees=decision.params.attendees,
+        )
+    elif decision.status == "allowed" and isinstance(decision.params, CalendarDeleteEventParams):
+        calendar_client = calendar_client_factory()
+        calendar_client.delete_event(event_id=decision.params.event_id)
+        deleted_event_id = decision.params.event_id
+    elif decision.status == "allowed" and isinstance(decision.params, DriveCreateFileParams):
+        drive_client = drive_client_factory()
+        drive_file_result = drive_client.create_file(name=decision.params.name, content=decision.params.content)
 
     reply_status, error_code = _status_for_decision(decision)
 
     # ── Layer 5: reply ───────────────────────────────────────────────────
     reply_result = _reply(
-        agentmail_client, message_id, sender_address, parsed, reply_status, error_code, gmail_results, calendar_results
+        agentmail_client, message_id, sender_address, parsed, reply_status, error_code, gmail_results, calendar_results,
+        draft_result=draft_result, created_event=created_event, updated_event=updated_event,
+        deleted_event_id=deleted_event_id, drive_file_result=drive_file_result,
     )
 
     _log_audit(
@@ -200,6 +250,11 @@ def handle_webhook(
         parsed=parsed,
         decision=decision,
         gmail_results=gmail_results,
+        draft_result=draft_result,
+        created_event=created_event,
+        updated_event=updated_event,
+        deleted_event_id=deleted_event_id,
+        drive_file_result=drive_file_result,
         calendar_results=calendar_results,
         reply_message_id=reply_result.message_id if reply_result else None,
         llm_usage=llm_usage,
@@ -226,8 +281,18 @@ def _reply(
     error_code: str | None,
     gmail_results: list[GmailResult] | None = None,
     calendar_results: list[CalendarEvent] | None = None,
+    *,
+    draft_result: DraftResult | None = None,
+    created_event: CalendarEvent | None = None,
+    updated_event: CalendarEvent | None = None,
+    deleted_event_id: str | None = None,
+    drive_file_result: DriveFileResult | None = None,
 ):
-    body = render_reply(parsed, status, error_code, gmail_results, calendar_results)
+    body = render_reply(
+        parsed, status, error_code, gmail_results, calendar_results,
+        draft_result=draft_result, created_event=created_event, updated_event=updated_event,
+        deleted_event_id=deleted_event_id, drive_file_result=drive_file_result,
+    )
     return send_reply(
         agentmail_client,
         inbox_id=AGENTMAIL_INBOX_ID or "",
@@ -251,7 +316,15 @@ def _log_audit(
     calendar_results: list[CalendarEvent] | None = None,
     reply_message_id: str | None = None,
     llm_usage: dict[str, int] | None = None,
+    draft_result: DraftResult | None = None,
+    created_event: CalendarEvent | None = None,
+    updated_event: CalendarEvent | None = None,
+    deleted_event_id: str | None = None,
+    drive_file_result: DriveFileResult | None = None,
 ) -> None:
+    write_result_count = sum(
+        1 for r in (draft_result, created_event, updated_event, deleted_event_id, drive_file_result) if r
+    )
     audit_log.append(
         AuditRecord(
             agentmail_message_id=message_id,
@@ -263,11 +336,21 @@ def _log_audit(
             parsed_source=parsed.source if parsed else None,
             policy_status=decision.status if decision else None,
             policy_error_code=decision.error_code if decision else None,
-            result_count=(len(gmail_results) if gmail_results else 0) + (len(calendar_results) if calendar_results else 0),
+            result_count=(
+                (len(gmail_results) if gmail_results else 0)
+                + (len(calendar_results) if calendar_results else 0)
+                + write_result_count
+            ),
             gmail_message_ids=tuple(r.message_id for r in gmail_results) if gmail_results else (),
             calendar_event_ids=tuple(e.event_id for e in calendar_results) if calendar_results else (),
             reply_message_id=reply_message_id,
             llm_input_tokens=(llm_usage or {}).get("input_tokens"),
             llm_output_tokens=(llm_usage or {}).get("output_tokens"),
+            draft_id=draft_result.draft_id if draft_result else None,
+            draft_to=draft_result.to if draft_result else None,
+            created_event_id=created_event.event_id if created_event else None,
+            updated_event_id=updated_event.event_id if updated_event else None,
+            deleted_event_id=deleted_event_id,
+            drive_file_id=drive_file_result.file_id if drive_file_result else None,
         )
     )

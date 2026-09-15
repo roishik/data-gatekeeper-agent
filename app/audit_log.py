@@ -51,6 +51,16 @@ _FIELD_ORDER = [
     "policy_status", "policy_error_code",
     "result_count", "gmail_message_ids", "calendar_event_ids", "reply_message_id",
     "llm_input_tokens", "llm_output_tokens",
+    # Write-verb outcomes. Unlike reads, minimization does NOT apply here
+    # -- accountability for a write means the log should say exactly what
+    # was sent/created/changed/deleted and to/on what, not just that some
+    # verb ran (see module docstring point 2's read-side rationale, which
+    # deliberately does not extend to these). The literal subject/body/
+    # title text still isn't logged here -- that's what the BCC'd reply
+    # (app/reply_guard.py) is for, same "audit log = tamper-evident ids,
+    # email thread = human-readable content" split as everything else.
+    "draft_id", "draft_to", "created_event_id", "updated_event_id",
+    "deleted_event_id", "drive_file_id",
 ]
 
 
@@ -74,6 +84,12 @@ class AuditRecord:
     reply_message_id: str | None = None
     llm_input_tokens: int | None = None
     llm_output_tokens: int | None = None
+    draft_id: str | None = None
+    draft_to: str | None = None
+    created_event_id: str | None = None
+    updated_event_id: str | None = None
+    deleted_event_id: str | None = None
+    drive_file_id: str | None = None
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 

@@ -35,6 +35,32 @@ class CalendarWindow:
     time_max: str
 
 
+@dataclass(frozen=True)
+class EventTimeSpan:
+    start: str  # RFC3339 with offset
+    end: str
+
+
+def resolve_event_datetime(
+    day_offset: int, start_time: str, duration_minutes: int, timezone_name: str, now: datetime | None = None
+) -> EventTimeSpan:
+    """Same 'the LLM only ever picks small bounded tokens, Python does
+    the date arithmetic' discipline as resolve_window, extended to a
+    single timed event: day_offset (which day) + start_time (an
+    'HH:MM' string, already validated by app/policy.py) + duration_minutes
+    -> a concrete start/end RFC3339 pair in the owner's timezone. The
+    reader LLM never produces a date, a full timestamp, or a timezone --
+    only these three bounded fields."""
+    tz = ZoneInfo(timezone_name)
+    current = (now or datetime.now(tz)).astimezone(tz)
+    today_midnight = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    day = today_midnight + timedelta(days=day_offset)
+    hour, _, minute = start_time.partition(":")
+    start = day.replace(hour=int(hour), minute=int(minute))
+    end = start + timedelta(minutes=duration_minutes)
+    return EventTimeSpan(start=start.isoformat(), end=end.isoformat())
+
+
 def resolve_window(day_offset: int, days: int, timezone_name: str, now: datetime | None = None) -> CalendarWindow:
     """Local midnight to local midnight, in `timezone_name`, starting
     `day_offset` days from today and spanning `days` days.

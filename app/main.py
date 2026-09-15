@@ -34,6 +34,7 @@ from app.config import (
     GOOGLE_SHEETS_STATE_SPREADSHEET_ID,
     STATE_STORE_BACKEND,
 )
+from app.drive_executor import GoogleDriveClient
 from app.gmail_executor import GoogleGmailClient
 from app.pipeline import handle_webhook
 from app.reader_llm import AnthropicReaderLLM
@@ -75,6 +76,7 @@ async def agentmail_webhook(request: Request) -> Response:
         reader_llm=AnthropicReaderLLM(),
         gmail_client_factory=GoogleGmailClient,
         calendar_client_factory=GoogleCalendarClient,
+        drive_client_factory=GoogleDriveClient,
         agentmail_client=HttpAgentMailClient(),
         audit_log=_audit_log,
     )

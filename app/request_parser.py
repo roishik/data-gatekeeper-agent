@@ -104,6 +104,26 @@ def _parse_via_llm(email_text: str, agentmail_message_id: str, reader_llm: Reade
         params["day_offset"] = extraction.day_offset
     if extraction.days is not None:
         params["days"] = extraction.days
+    if extraction.to is not None:
+        params["to"] = extraction.to
+    if extraction.subject is not None:
+        params["subject"] = extraction.subject
+    if extraction.body is not None:
+        params["body"] = extraction.body
+    if extraction.title is not None:
+        params["title"] = extraction.title
+    if extraction.start_time is not None:
+        params["start_time"] = extraction.start_time
+    if extraction.duration_minutes is not None:
+        params["duration_minutes"] = extraction.duration_minutes
+    if extraction.attendees is not None:
+        params["attendees"] = extraction.attendees
+    if extraction.event_id is not None:
+        params["event_id"] = extraction.event_id
+    if extraction.name is not None:
+        params["name"] = extraction.name
+    if extraction.content is not None:
+        params["content"] = extraction.content
 
     request_id = (
         extraction.request_id.strip()

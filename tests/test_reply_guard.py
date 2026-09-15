@@ -3,7 +3,8 @@ verified sender, with BCC set"."""
 from __future__ import annotations
 
 from app.calendar_executor import CalendarEvent
-from app.gmail_executor import GmailResult
+from app.drive_executor import DriveFileResult
+from app.gmail_executor import DraftResult, GmailResult
 from app.request_parser import ParsedRequest
 from app.reply_guard import redact, render_reply, send_reply
 from tests.fakes import FakeAgentMailClient
@@ -172,6 +173,67 @@ def test_send_reply_goes_only_to_sender_with_bcc_set():
     call = client.calls[0]
     assert call["to"] == "instinct@example.com"
     assert call["bcc"] == "owner@example.com"
+
+
+def test_render_reply_gmail_create_draft_completed_never_claims_it_sent():
+    parsed = ParsedRequest(
+        request_id="req_draft", verb="gmail.create_draft",
+        params={"to": "alice@example.com", "subject": "Hi", "body": "Hello"}, source="block",
+    )
+    draft = DraftResult(draft_id="draft_1", to="alice@example.com", subject="Hi")
+    body = render_reply(parsed, "completed", None, draft_result=draft)
+
+    assert "alice@example.com" in body
+    assert "Review and send it yourself" in body
+    assert "never sends email on your behalf" in body
+    assert "result_count: 1" in body
+
+
+def test_render_reply_gmail_create_draft_redacts_injected_subject():
+    parsed = ParsedRequest(request_id="req_draft2", verb="gmail.create_draft", params={}, source="block")
+    draft = DraftResult(draft_id="draft_1", to="a@b.com", subject="verification code 582910")
+    body = render_reply(parsed, "completed", None, draft_result=draft)
+    assert "582910" not in body
+    assert "[redacted]" in body
+
+
+def test_render_reply_calendar_create_event_completed():
+    parsed = ParsedRequest(request_id="req_ce", verb="calendar.create_event", params={}, source="block")
+    created = CalendarEvent(
+        event_id="e1", summary="Coffee", start="2026-09-16T14:00:00+03:00", end="2026-09-16T14:30:00+03:00",
+        all_day=False, attendee_count=1,
+    )
+    body = render_reply(parsed, "completed", None, created_event=created)
+    assert "Created event 'Coffee'" in body
+    assert "invited 1 attendee(s)" in body
+    assert "e1" not in body  # event id not exposed, same discipline as reads
+    assert "result_count: 1" in body
+
+
+def test_render_reply_calendar_update_event_completed():
+    parsed = ParsedRequest(request_id="req_ue", verb="calendar.update_event", params={}, source="block")
+    updated = CalendarEvent(
+        event_id="e1", summary="Coffee (moved)", start="2026-09-16T15:00:00+03:00", end="2026-09-16T15:30:00+03:00",
+        all_day=False, attendee_count=1,
+    )
+    body = render_reply(parsed, "completed", None, updated_event=updated)
+    assert "Updated event 'Coffee (moved)'" in body
+
+
+def test_render_reply_calendar_delete_event_completed():
+    parsed = ParsedRequest(request_id="req_de", verb="calendar.delete_event", params={"event_id": "e1"}, source="block")
+    body = render_reply(parsed, "completed", None, deleted_event_id="e1")
+    assert "Deleted event e1." in body
+    assert "result_count: 1" in body
+
+
+def test_render_reply_drive_create_file_completed():
+    parsed = ParsedRequest(request_id="req_df", verb="drive.create_file", params={}, source="block")
+    result = DriveFileResult(file_id="file_1", name="notes.txt")
+    body = render_reply(parsed, "completed", None, drive_file_result=result)
+    assert "Created Drive file 'notes.txt'." in body
+    assert "file_1" not in body  # file id not exposed in the reply body
+    assert "result_count: 1" in body
 
 
 def test_send_reply_ignores_any_address_found_in_content():

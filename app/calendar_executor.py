@@ -54,10 +54,16 @@ from datetime import datetime, timezone
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
+from app.calendar_window import EventTimeSpan, resolve_event_datetime
 from app.config import OWNER_TIMEZONE
 from app.google_auth_helper import build_google_credentials
 
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+# Read/write access to events only (not calendar settings/ACLs/calendar
+# creation) -- least privilege for create/update/delete_event. Requested
+# only for those three write calls; list_events keeps using the
+# narrower *.readonly scope above, unchanged.
+CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 
 logger = logging.getLogger("gatekeeper.calendar_executor")
 
@@ -75,20 +81,33 @@ class CalendarEvent:
 
 class CalendarClient(Protocol):
     def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]: ...
+    def create_event(
+        self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...]
+    ) -> CalendarEvent: ...
+    def update_event(
+        self,
+        event_id: str,
+        title: str | None,
+        day_offset: int | None,
+        start_time: str | None,
+        duration_minutes: int | None,
+        attendees: tuple[str, ...] | None,
+    ) -> CalendarEvent: ...
+    def delete_event(self, event_id: str) -> None: ...
 
 
 class GoogleCalendarClient:
     """Real implementation, gated behind having Google OAuth credentials
     configured (checked in google_auth_helper.build_google_credentials)."""
 
-    def _service(self):
+    def _service(self, scopes: list[str]):
         from googleapiclient.discovery import build  # lazy: keep this module importable without the package
 
-        creds = build_google_credentials(scopes=[CALENDAR_READONLY_SCOPE])
+        creds = build_google_credentials(scopes=scopes)
         return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
     def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]:
-        service = self._service()
+        service = self._service([CALENDAR_READONLY_SCOPE])
 
         results: list[CalendarEvent] = []
         seen: set[str] = set()
@@ -150,6 +169,58 @@ class GoogleCalendarClient:
         )
         return final
 
+    def create_event(
+        self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...]
+    ) -> CalendarEvent:
+        service = self._service([CALENDAR_EVENTS_SCOPE])
+        span = resolve_event_datetime(day_offset, start_time, duration_minutes, OWNER_TIMEZONE)
+        body = {
+            "summary": title,
+            "start": {"dateTime": span.start, "timeZone": OWNER_TIMEZONE},
+            "end": {"dateTime": span.end, "timeZone": OWNER_TIMEZONE},
+            "attendees": [{"email": a} for a in attendees],
+        }
+        # sendUpdates="all": attendees get a real invite email immediately,
+        # by the owner's explicit choice (CLAUDE.md) -- there is no
+        # approval step for this verb.
+        event = service.events().insert(calendarId="primary", body=body, sendUpdates="all").execute()
+        return _event_from_raw(event)
+
+    def update_event(
+        self,
+        event_id: str,
+        title: str | None,
+        day_offset: int | None,
+        start_time: str | None,
+        duration_minutes: int | None,
+        attendees: tuple[str, ...] | None,
+    ) -> CalendarEvent:
+        service = self._service([CALENDAR_EVENTS_SCOPE])
+        body: dict = {}
+        if title is not None:
+            body["summary"] = title
+        if attendees is not None:
+            body["attendees"] = [{"email": a} for a in attendees]
+        if day_offset is not None or start_time is not None or duration_minutes is not None:
+            existing = service.events().get(calendarId="primary", eventId=event_id).execute()
+            span = _resolve_updated_timing(existing, day_offset, start_time, duration_minutes)
+            body["start"] = {"dateTime": span.start, "timeZone": OWNER_TIMEZONE}
+            body["end"] = {"dateTime": span.end, "timeZone": OWNER_TIMEZONE}
+
+        event = (
+            service.events()
+            .patch(calendarId="primary", eventId=event_id, body=body, sendUpdates="all")
+            .execute()
+        )
+        return _event_from_raw(event)
+
+    def delete_event(self, event_id: str) -> None:
+        service = self._service([CALENDAR_EVENTS_SCOPE])
+        # sendUpdates="all": attendees (if any) get a real cancellation
+        # email immediately, same owner-chosen, no-approval design as
+        # create_event above.
+        service.events().delete(calendarId="primary", eventId=event_id, sendUpdates="all").execute()
+
 
 def _visible_calendar_ids(service) -> list[str]:
     """The calendars the owner has switched on in the Google Calendar UI
@@ -210,3 +281,53 @@ def _start_sort_key(event: CalendarEvent) -> tuple[datetime, int]:
         return (datetime.fromisoformat(event.start).astimezone(timezone.utc), 1)
     except ValueError:
         return (datetime.max.replace(tzinfo=timezone.utc), 1)
+
+
+def _event_from_raw(event: dict) -> CalendarEvent:
+    """Same six-key extraction discipline as the inline construction in
+    list_events (see the module docstring) -- used by create_event/
+    update_event, which get a single event dict back from the API
+    instead of a list."""
+    start = event.get("start", {}) or {}
+    end = event.get("end", {}) or {}
+    return CalendarEvent(
+        event_id=event.get("id", ""),
+        summary=event.get("summary", "") or "",
+        start=start.get("date") or start.get("dateTime") or "",
+        end=end.get("date") or end.get("dateTime") or "",
+        all_day="date" in start,
+        attendee_count=len(event.get("attendees", []) or []),
+        location=event.get("location", "") or "",
+    )
+
+
+def _resolve_updated_timing(
+    existing: dict, day_offset: int | None, start_time: str | None, duration_minutes: int | None
+) -> EventTimeSpan:
+    """update_event lets a request change only some of day_offset/
+    start_time/duration_minutes -- this fills in whichever weren't given
+    from the event's CURRENT start/end (fetched by the caller), so e.g.
+    changing only start_time doesn't silently reset the event's day or
+    duration to something unintended."""
+    tz = ZoneInfo(OWNER_TIMEZONE)
+
+    def _as_local(raw: dict) -> datetime:
+        value = raw.get("dateTime") or raw.get("date")
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+
+    existing_start = _as_local(existing.get("start", {}) or {})
+    existing_end = _as_local(existing.get("end", {}) or {})
+    existing_duration = int((existing_end - existing_start).total_seconds() // 60)
+
+    now = datetime.now(tz)
+    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    existing_day_offset = (existing_start.replace(hour=0, minute=0, second=0, microsecond=0) - today_midnight).days
+
+    resolved_day_offset = day_offset if day_offset is not None else existing_day_offset
+    resolved_start_time = start_time if start_time is not None else existing_start.strftime("%H:%M")
+    resolved_duration = duration_minutes if duration_minutes is not None else existing_duration
+
+    return resolve_event_datetime(resolved_day_offset, resolved_start_time, resolved_duration, OWNER_TIMEZONE, now=now)

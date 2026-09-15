@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.calendar_window import format_event_range, format_event_time, resolve_window
+from app.calendar_window import format_event_range, format_event_time, resolve_event_datetime, resolve_window
 
 
 def test_today_window_is_local_midnight_to_midnight():
@@ -98,3 +98,30 @@ def test_format_event_range_malformed_end_falls_back_to_start_only():
         "2026-09-15T09:00:00+03:00", "not-a-date", all_day=False, timezone_name="Asia/Jerusalem"
     )
     assert result == "Tue Sep 15, 09:00"
+
+
+def test_resolve_event_datetime_today_at_given_time():
+    now = datetime(2026, 9, 14, 8, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
+    span = resolve_event_datetime(day_offset=0, start_time="14:30", duration_minutes=30, timezone_name="Asia/Jerusalem", now=now)
+    assert span.start.startswith("2026-09-14T14:30:00")
+    assert span.end.startswith("2026-09-14T15:00:00")
+
+
+def test_resolve_event_datetime_future_day_offset():
+    now = datetime(2026, 9, 14, 8, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
+    span = resolve_event_datetime(day_offset=3, start_time="09:00", duration_minutes=60, timezone_name="Asia/Jerusalem", now=now)
+    assert span.start.startswith("2026-09-17T09:00:00")
+    assert span.end.startswith("2026-09-17T10:00:00")
+
+
+def test_resolve_event_datetime_duration_crosses_midnight():
+    now = datetime(2026, 9, 14, 8, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
+    span = resolve_event_datetime(day_offset=0, start_time="23:30", duration_minutes=90, timezone_name="Asia/Jerusalem", now=now)
+    assert span.start.startswith("2026-09-14T23:30:00")
+    assert span.end.startswith("2026-09-15T01:00:00")
+
+
+def test_resolve_event_datetime_carries_a_mandatory_utc_offset():
+    now = datetime(2026, 9, 14, 8, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
+    span = resolve_event_datetime(day_offset=0, start_time="10:00", duration_minutes=30, timezone_name="Asia/Jerusalem", now=now)
+    assert "+" in span.start or "-" in span.start[10:]

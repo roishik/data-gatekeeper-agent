@@ -6,7 +6,17 @@ import dataclasses
 
 import pytest
 
-from app.policy import CalendarListEventsParams, GmailSearchParams, Verb, evaluate_policy
+from app.policy import (
+    CalendarCreateEventParams,
+    CalendarDeleteEventParams,
+    CalendarListEventsParams,
+    CalendarUpdateEventParams,
+    DriveCreateFileParams,
+    GmailCreateDraftParams,
+    GmailSearchParams,
+    Verb,
+    evaluate_policy,
+)
 
 
 def test_gmail_search_allowed_with_defaults():
@@ -216,3 +226,246 @@ def test_extra_params_keys_are_ignored_not_propagated():
     assert decision.status == "allowed"
     assert not hasattr(decision.params, "to")
     assert not hasattr(decision.params, "verb")
+
+
+# ── gmail.create_draft ──────────────────────────────────────────────────
+
+
+def test_gmail_create_draft_allowed():
+    decision = evaluate_policy("gmail.create_draft", {"to": "alice@example.com", "subject": "Hi", "body": "Hello there"})
+    assert decision.status == "allowed"
+    assert decision.params == GmailCreateDraftParams(to="alice@example.com", subject="Hi", body="Hello there")
+
+
+@pytest.mark.parametrize("missing", ["to", "subject", "body"])
+def test_gmail_create_draft_missing_required_field_denied(missing):
+    params = {"to": "alice@example.com", "subject": "Hi", "body": "Hello there"}
+    del params[missing]
+    decision = evaluate_policy("gmail.create_draft", params)
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
+@pytest.mark.parametrize(
+    "bad_to", ["not-an-email", "alice@", "@example.com", "alice example.com", "alice@example", ""]
+)
+def test_gmail_create_draft_invalid_email_denied(bad_to):
+    decision = evaluate_policy("gmail.create_draft", {"to": bad_to, "subject": "Hi", "body": "Hello"})
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
+def test_gmail_create_draft_subject_too_long_denied():
+    decision = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "x" * 201, "body": "hi"})
+    assert decision.status == "denied"
+
+
+def test_gmail_create_draft_body_too_long_denied():
+    decision = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "hi", "body": "x" * 5001})
+    assert decision.status == "denied"
+
+
+def test_gmail_create_draft_no_recipient_allowlist_by_design():
+    """Owner's explicit choice (CLAUDE.md): gmail.create_draft only ever
+    creates a DRAFT the owner reviews before sending, so any well-formed
+    email address is accepted -- there is no allowlist gate here."""
+    decision = evaluate_policy("gmail.create_draft", {"to": "anyone-at-all@example.org", "subject": "hi", "body": "hi"})
+    assert decision.status == "allowed"
+
+
+# ── calendar.create_event ───────────────────────────────────────────────
+
+
+def test_calendar_create_event_allowed():
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "Coffee", "day_offset": 2, "start_time": "14:30", "duration_minutes": 30, "attendees": ["a@b.com"]},
+    )
+    assert decision.status == "allowed"
+    assert decision.params == CalendarCreateEventParams(
+        title="Coffee", day_offset=2, start_time="14:30", duration_minutes=30, attendees=("a@b.com",)
+    )
+
+
+def test_calendar_create_event_defaults_to_no_attendees():
+    decision = evaluate_policy(
+        "calendar.create_event", {"title": "Focus block", "day_offset": 0, "start_time": "09:00", "duration_minutes": 60}
+    )
+    assert decision.status == "allowed"
+    assert decision.params.attendees == ()
+
+
+@pytest.mark.parametrize("missing", ["title", "day_offset", "start_time", "duration_minutes"])
+def test_calendar_create_event_missing_required_field_denied(missing):
+    params = {"title": "Coffee", "day_offset": 1, "start_time": "10:00", "duration_minutes": 30}
+    del params[missing]
+    decision = evaluate_policy("calendar.create_event", params)
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
+@pytest.mark.parametrize("day_offset", [-1, 366])
+def test_calendar_create_event_day_offset_out_of_bounds_denied(day_offset):
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": day_offset, "start_time": "10:00", "duration_minutes": 30},
+    )
+    assert decision.status == "denied"
+
+
+@pytest.mark.parametrize("start_time", ["9:00", "24:00", "10:60", "morning", "", "10:00:00"])
+def test_calendar_create_event_invalid_start_time_denied(start_time):
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": start_time, "duration_minutes": 30},
+    )
+    assert decision.status == "denied"
+
+
+@pytest.mark.parametrize("duration", [0, 4, 481, 1000])
+def test_calendar_create_event_duration_out_of_bounds_denied(duration):
+    decision = evaluate_policy(
+        "calendar.create_event", {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": duration}
+    )
+    assert decision.status == "denied"
+
+
+def test_calendar_create_event_too_many_attendees_denied():
+    attendees = [f"user{i}@example.com" for i in range(11)]
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30, "attendees": attendees},
+    )
+    assert decision.status == "denied"
+
+
+def test_calendar_create_event_invalid_attendee_email_denied():
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30, "attendees": ["not-an-email"]},
+    )
+    assert decision.status == "denied"
+
+
+def test_calendar_create_event_attendees_not_a_list_denied():
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30, "attendees": "a@b.com"},
+    )
+    assert decision.status == "denied"
+
+
+def test_calendar_create_event_no_attendee_allowlist_by_design():
+    """Owner's explicit choice (CLAUDE.md): calendar writes run fully
+    autonomously, with no attendee allowlist -- any well-formed address
+    the request names can be invited."""
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30, "attendees": ["stranger@example.org"]},
+    )
+    assert decision.status == "allowed"
+
+
+# ── calendar.update_event ───────────────────────────────────────────────
+
+
+def test_calendar_update_event_allowed_with_one_field():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "title": "New title"})
+    assert decision.status == "allowed"
+    assert decision.params == CalendarUpdateEventParams(event_id="ev1", title="New title")
+
+
+def test_calendar_update_event_missing_event_id_denied():
+    decision = evaluate_policy("calendar.update_event", {"title": "New title"})
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
+def test_calendar_update_event_no_fields_to_update_denied():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1"})
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
+def test_calendar_update_event_invalid_field_value_denied():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "start_time": "not-a-time"})
+    assert decision.status == "denied"
+
+
+def test_calendar_update_event_can_update_attendees_only():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "attendees": ["new@example.com"]})
+    assert decision.status == "allowed"
+    assert decision.params.attendees == ("new@example.com",)
+    assert decision.params.title is None
+
+
+# ── calendar.delete_event ───────────────────────────────────────────────
+
+
+def test_calendar_delete_event_allowed():
+    decision = evaluate_policy("calendar.delete_event", {"event_id": "ev1"})
+    assert decision.status == "allowed"
+    assert decision.params == CalendarDeleteEventParams(event_id="ev1")
+
+
+def test_calendar_delete_event_missing_event_id_denied():
+    decision = evaluate_policy("calendar.delete_event", {})
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
+# ── drive.create_file ───────────────────────────────────────────────────
+
+
+def test_drive_create_file_allowed():
+    decision = evaluate_policy("drive.create_file", {"name": "notes.txt", "content": "hello"})
+    assert decision.status == "allowed"
+    assert decision.params == DriveCreateFileParams(name="notes.txt", content="hello")
+
+
+@pytest.mark.parametrize("missing", ["name", "content"])
+def test_drive_create_file_missing_required_field_denied(missing):
+    params = {"name": "notes.txt", "content": "hello"}
+    del params[missing]
+    decision = evaluate_policy("drive.create_file", params)
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
+def test_drive_create_file_name_too_long_denied():
+    decision = evaluate_policy("drive.create_file", {"name": "x" * 201, "content": "hi"})
+    assert decision.status == "denied"
+
+
+def test_drive_create_file_content_too_long_denied():
+    decision = evaluate_policy("drive.create_file", {"name": "x", "content": "y" * 20001})
+    assert decision.status == "denied"
+
+
+def test_drive_create_file_empty_content_is_allowed():
+    """Empty content is a legitimate empty file, not a missing field --
+    only a missing/non-string 'content' key is denied."""
+    decision = evaluate_policy("drive.create_file", {"name": "empty.txt", "content": ""})
+    assert decision.status == "allowed"
+
+
+# ── write verbs are implemented, not just recognized ────────────────────
+
+
+@pytest.mark.parametrize(
+    "verb",
+    [
+        "gmail.create_draft",
+        "calendar.create_event",
+        "calendar.update_event",
+        "calendar.delete_event",
+        "drive.create_file",
+    ],
+)
+def test_write_verbs_are_recognized_as_implemented(verb):
+    """These must NOT fall into NOT_IMPLEMENTED_VERBS -- a regression
+    there would silently turn a write verb into a no-op 'not_implemented'
+    reply instead of denying or executing it."""
+    from app.policy import IMPLEMENTED_VERBS, Verb
+
+    assert Verb(verb) in IMPLEMENTED_VERBS

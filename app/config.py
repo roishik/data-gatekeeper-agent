@@ -126,6 +126,13 @@ GOOGLE_REFRESH_TOKEN = _env("GOOGLE_REFRESH_TOKEN")
 # any error message readable without cross-referencing the OAuth grant.
 GOOGLE_GMAIL_USER = _env("GOOGLE_GMAIL_USER", "me")
 
+# Fixed parent folder for drive.create_file (Layer 4, app/drive_executor.py)
+# -- the gatekeeper only ever writes inside this one folder, never
+# anywhere else in Drive. Left unset, the folder is created on first use
+# and its id logged loudly so the operator can pin it here, same
+# convention as GOOGLE_SHEETS_LOG_SPREADSHEET_ID / _STATE_SPREADSHEET_ID.
+GOOGLE_DRIVE_FOLDER_ID = _env("GOOGLE_DRIVE_FOLDER_ID")
+
 # ── Reply guard (Layer 5) ────────────────────────────────────────────────
 REPLY_MAX_CHARS = _env_int("REPLY_MAX_CHARS", 4000)
 

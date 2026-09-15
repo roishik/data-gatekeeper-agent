@@ -22,12 +22,24 @@ in, the app still **imports** and the **test suite still runs**
 credentials) — only actually starting the server and hitting the real
 webhook route needs real values.
 
-Two implemented verbs as of this build: `gmail.search` and
-`calendar.list_events`. `calendar.list_events` resolves relative day
-language ("today"/"tomorrow"/"this week") to a `day_offset`/`days` pair
-purely in Python, in the timezone set by `OWNER_TIMEZONE` (default
-`Asia/Jerusalem`) — see `app/calendar_window.py`. `drive.search` and
-`contacts.search` still return `not_implemented`.
+Implemented verbs as of this build: `gmail.search`, `gmail.create_draft`,
+`calendar.list_events`, `calendar.create_event`, `calendar.update_event`,
+`calendar.delete_event`, `drive.create_file`. `calendar.list_events`
+resolves relative day language ("today"/"tomorrow"/"this week") to a
+`day_offset`/`days` pair purely in Python, in the timezone set by
+`OWNER_TIMEZONE` (default `Asia/Jerusalem`) — see
+`app/calendar_window.py`. `drive.search` and `contacts.search` still
+return `not_implemented`.
+
+**Write verbs, by owner's explicit choice (see CLAUDE.md):**
+`gmail.create_draft` only ever creates a Gmail DRAFT — the code never
+calls a send endpoint (see `app/gmail_executor.py`'s docstring) — so the
+owner reviewing and manually sending it in Gmail is the approval step
+for that verb. The calendar write verbs and `drive.create_file` run
+fully autonomously, with **no recipient/attendee allowlist and no
+human-approval step** — `calendar.create_event`/`update_event` send real
+Calendar invite/update emails to whatever attendee addresses the request
+names, immediately. There is no push-approval channel in this build.
 
 **A note on the AgentMail key's name.** This project's code always reads
 `AGENTMAIL_API_KEY` (see `app/config.py`) — not `agent_mail_api_key`,
@@ -73,11 +85,14 @@ Once, by hand, on your own machine — never inside the deployed service:
    Application type **Desktop app**. Download the `client_secret.json`.
 2. Make sure the OAuth consent screen is **In production** (not
    Testing) — an app left in Testing has its refresh tokens killed every
-   7 days. Personal, single-user, unverified is fine; no Google review
-   is required for the scopes this project uses (`gmail.readonly`,
-   `calendar.readonly`, `drive.readonly`, `contacts.readonly`,
-   `drive.file` — none of these are in Google's "sensitive/restricted"
-   tiers that trigger a verification review).
+   7 days. Personal, single-user, unverified was fine for the original
+   read-only scope set (`gmail.readonly`, `calendar.readonly`,
+   `drive.readonly`, `contacts.readonly`, `drive.file`); `gmail.compose`
+   and `calendar.events` were added for write access (`scripts/google_auth.py`'s
+   `SCOPES`) — **not independently re-verified against Google's current
+   sensitive/restricted-scope tiers**, so if the consent screen starts
+   asking for a verification review, that's expected to investigate, not
+   a bug in this doc.
 3. Run:
    ```bash
    uv run python scripts/google_auth.py --client-secret path/to/client_secret.json
@@ -88,6 +103,11 @@ Once, by hand, on your own machine — never inside the deployed service:
    commands to load `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` /
    `GOOGLE_REFRESH_TOKEN` into Secret Manager, reading the values
    straight out of that file (never printing them to the terminal).
+   **If `GOOGLE_REFRESH_TOKEN` was already minted under the OLDER,
+   narrower scope set** (before `gmail.compose`/`calendar.events`
+   existed), it must be re-minted by re-running this script — write
+   calls will fail with an insufficient-scope error against an old
+   token, not silently fall back to read-only behavior.
 4. Delete `client_secret.json` from wherever you downloaded it once
    step 3 has run — it isn't needed again.
 
@@ -144,6 +164,11 @@ Notes:
   `GOOGLE_SHEETS_LOG_SPREADSHEET_ID` / `GOOGLE_SHEETS_STATE_SPREADSHEET_ID`
   (as an env var or another Secret Manager entry), then redeploy — otherwise
   a cold start after scale-to-zero creates a fresh spreadsheet every time.
+- Same idea for `drive.create_file` (`app/drive_executor.py`): the first
+  call with `GOOGLE_DRIVE_FOLDER_ID` unset creates a Drive folder and
+  logs its id at WARNING — pin it into `GOOGLE_DRIVE_FOLDER_ID` so every
+  later write lands in the same folder instead of a fresh one per cold
+  start.
 - Register the deployed service's URL + `/webhooks/agentmail` as the
   AgentMail webhook endpoint (event type `message.received`) once it's
   live, and copy the signing secret AgentMail gives you into the

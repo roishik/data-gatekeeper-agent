@@ -41,7 +41,8 @@ from app.agentmail_client import AgentMailClient, ReplyResult
 from app.calendar_executor import CalendarEvent
 from app.calendar_window import format_event_range
 from app.config import OWNER_TIMEZONE, REPLY_MAX_CHARS
-from app.gmail_executor import GmailResult
+from app.drive_executor import DriveFileResult
+from app.gmail_executor import DraftResult, GmailResult
 from app.request_parser import ParsedRequest
 
 _REDACTED = "[redacted]"
@@ -74,15 +75,28 @@ def render_reply(
     gmail_results: list[GmailResult] | None = None,
     calendar_results: list[CalendarEvent] | None = None,
     clarification_question: str | None = None,
+    draft_result: DraftResult | None = None,
+    created_event: CalendarEvent | None = None,
+    updated_event: CalendarEvent | None = None,
+    deleted_event_id: str | None = None,
+    drive_file_result: DriveFileResult | None = None,
 ) -> str:
     """Builds the full reply body. Deliberately takes no recipient
-    argument at all -- see module docstring point 1. Exactly one of
-    `gmail_results`/`calendar_results` is populated per call in
-    practice (app/pipeline.py only ever executes one verb per request),
-    but both are accepted independently rather than a single ambiguous
-    "results" blob, so a caller can't accidentally hand a Gmail result
-    to the calendar formatter or vice versa."""
-    result_count = len(gmail_results or []) + len(calendar_results or [])
+    argument at all -- see module docstring point 1. Exactly one of the
+    result arguments is populated per call in practice (app/pipeline.py
+    only ever executes one verb per request), but each is accepted
+    independently rather than a single ambiguous "results" blob, so a
+    caller can't accidentally hand one verb's result to another verb's
+    formatter."""
+    result_count = (
+        len(gmail_results or [])
+        + len(calendar_results or [])
+        + (1 if draft_result else 0)
+        + (1 if created_event else 0)
+        + (1 if updated_event else 0)
+        + (1 if deleted_event_id else 0)
+        + (1 if drive_file_result else 0)
+    )
     prose_lines: list[str] = []
 
     if error_code == "rate_limited":
@@ -98,6 +112,24 @@ def render_reply(
                 prose_lines.append(f"- {title} — {when}{location}{attendees}")
         else:
             prose_lines.append("No events found.")
+    elif status == "completed" and parsed_request.verb == "calendar.create_event" and created_event:
+        title = redact(created_event.summary) or "(no title)"
+        when = format_event_range(created_event.start, created_event.end, created_event.all_day, OWNER_TIMEZONE)
+        attendees = f", invited {created_event.attendee_count} attendee(s)" if created_event.attendee_count else ""
+        prose_lines.append(f"Created event '{title}' — {when}{attendees}.")
+    elif status == "completed" and parsed_request.verb == "calendar.update_event" and updated_event:
+        title = redact(updated_event.summary) or "(no title)"
+        when = format_event_range(updated_event.start, updated_event.end, updated_event.all_day, OWNER_TIMEZONE)
+        prose_lines.append(f"Updated event '{title}' — {when}.")
+    elif status == "completed" and parsed_request.verb == "calendar.delete_event" and deleted_event_id:
+        prose_lines.append(f"Deleted event {deleted_event_id}.")
+    elif status == "completed" and parsed_request.verb == "gmail.create_draft" and draft_result:
+        prose_lines.append(
+            f"Created a draft to {draft_result.to}, subject: '{redact(draft_result.subject)}'. "
+            "Review and send it yourself in Gmail -- this gatekeeper never sends email on your behalf."
+        )
+    elif status == "completed" and parsed_request.verb == "drive.create_file" and drive_file_result:
+        prose_lines.append(f"Created Drive file '{redact(drive_file_result.name)}'.")
     elif status == "completed":
         results = gmail_results or []
         if results:

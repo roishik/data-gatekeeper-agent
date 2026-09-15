@@ -1,11 +1,15 @@
 # data-gatekeeper-agent
 
-> **Status: live MVP, two verbs (2026-09-15).** The research below drove the design; `app/`
-> is deployed on Cloud Run and answers allowlisted emails end to end — inbound AgentMail
-> webhook → auth/policy → `gmail.search` or `calendar.list_events` → reply, with a
-> hash-chained audit log. Current state, infrastructure IDs and next steps: `CLAUDE.md`.
-> `calendar.list_events` resolves relative day language ("tomorrow") to a `day_offset`/`days`
-> pair the LLM picks and Python turns into a timezone-aware window — see
+> **Status: live MVP (read-only) + local-only write access (2026-09-15).** The research below
+> drove the design; `app/` is deployed on Cloud Run and answers allowlisted emails end to end for
+> `gmail.search`/`calendar.list_events` — inbound AgentMail webhook → auth/policy → executor →
+> reply, with a hash-chained audit log. This session added write verbs
+> (`gmail.create_draft`, `calendar.create_event`/`update_event`/`delete_event`,
+> `drive.create_file`) that are **not deployed yet** and deliberately depart from the read-only
+> threat model below for calendar writes (autonomous, no recipient allowlist, no approval step
+> — an explicit owner choice, not an oversight). Current state, infrastructure IDs and next
+> steps: `CLAUDE.md`. `calendar.list_events` resolves relative day language ("tomorrow") to a
+> `day_offset`/`days` pair the LLM picks and Python turns into a timezone-aware window — see
 > `app/calendar_window.py`. See `docs/RUNBOOK.md` for how to run it and the tests.
 
 A self-hosted agent that is the **only** thing holding my credentials (Gmail, LinkedIn, ...).
