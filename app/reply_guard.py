@@ -109,18 +109,18 @@ def render_reply(
                 when = format_event_range(e.start, e.end, e.all_day, OWNER_TIMEZONE)
                 location = f", at {redact(e.location)}" if e.location else ""
                 attendees = f", {e.attendee_count} attendee(s)" if e.attendee_count else ""
-                prose_lines.append(f"- {title} — {when}{location}{attendees}")
+                prose_lines.append(f"- {title} — {when}{location}{attendees} (event_id: {e.event_id})")
         else:
             prose_lines.append("No events found.")
     elif status == "completed" and parsed_request.verb == "calendar.create_event" and created_event:
         title = redact(created_event.summary) or "(no title)"
         when = format_event_range(created_event.start, created_event.end, created_event.all_day, OWNER_TIMEZONE)
         attendees = f", invited {created_event.attendee_count} attendee(s)" if created_event.attendee_count else ""
-        prose_lines.append(f"Created event '{title}' — {when}{attendees}.")
+        prose_lines.append(f"Created event '{title}' — {when}{attendees} (event_id: {created_event.event_id}).")
     elif status == "completed" and parsed_request.verb == "calendar.update_event" and updated_event:
         title = redact(updated_event.summary) or "(no title)"
         when = format_event_range(updated_event.start, updated_event.end, updated_event.all_day, OWNER_TIMEZONE)
-        prose_lines.append(f"Updated event '{title}' — {when}.")
+        prose_lines.append(f"Updated event '{title}' — {when} (event_id: {updated_event.event_id}).")
     elif status == "completed" and parsed_request.verb == "calendar.delete_event" and deleted_event_id:
         prose_lines.append(f"Deleted event {deleted_event_id}.")
     elif status == "completed" and parsed_request.verb == "gmail.create_draft" and draft_result:

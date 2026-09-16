@@ -107,8 +107,11 @@ def test_render_reply_calendar_completed_lists_events():
     assert "Company holiday" in body
     assert "(all day)" in body
     assert "result_count: 2" in body
-    assert "e1" not in body  # event ids are not exposed in the reply body
-    assert "e2" not in body
+    # event ids ARE exposed (as of the write-access build) -- it's the only
+    # way a later calendar.update_event/delete_event request can reference
+    # one of these events; see app/calendar_executor.py's docstring.
+    assert "event_id: e1" in body
+    assert "event_id: e2" in body
 
 
 def test_render_reply_calendar_event_without_location_omits_location_line():
@@ -206,7 +209,9 @@ def test_render_reply_calendar_create_event_completed():
     body = render_reply(parsed, "completed", None, created_event=created)
     assert "Created event 'Coffee'" in body
     assert "invited 1 attendee(s)" in body
-    assert "e1" not in body  # event id not exposed, same discipline as reads
+    # event id IS exposed -- it's the only way a later update_event/
+    # delete_event request can reference the event this call just created.
+    assert "event_id: e1" in body
     assert "result_count: 1" in body
 
 
@@ -218,6 +223,7 @@ def test_render_reply_calendar_update_event_completed():
     )
     body = render_reply(parsed, "completed", None, updated_event=updated)
     assert "Updated event 'Coffee (moved)'" in body
+    assert "event_id: e1" in body
 
 
 def test_render_reply_calendar_delete_event_completed():

@@ -4,16 +4,21 @@ Calendar.
 
 Executes calendar.list_events via `events.list(calendarId="primary",
 singleEvents=True, orderBy="startTime", timeMin=..., timeMax=...)`.
-Returns only: an event id (for the audit log only -- never shown in a
-reply), summary, start, end, an all-day flag, location, and the attendee
-COUNT -- never attendee emails, description, conference links
-(hangoutLink/conferenceData), or attachments. Location and summary are
-free text an attacker with calendar-write access controls directly, so
-both go through app/reply_guard.py's redaction pass before ever reaching
-a reply, same as a Gmail snippet. That restriction is enforced by only
-ever reading six keys off each raw event dict below, never by trusting a
-caller not to look further (the same discipline as
-app/gmail_executor.py's `_METADATA_HEADERS` allowlist).
+Returns only: an event id (shown in the reply as an opaque `event_id` --
+the only way a request can later reference this same event via
+calendar.update_event/delete_event, per the owner's explicit choice to
+expose it once it became clear there was otherwise no way to reference
+an existing event at all; the id itself carries no attacker-controlled
+content, unlike summary/location below), summary, start, end, an
+all-day flag, location, and the attendee COUNT -- never attendee
+emails, description, conference links (hangoutLink/conferenceData), or
+attachments. Location and summary are free text an attacker with
+calendar-write access controls directly, so both go through
+app/reply_guard.py's redaction pass before ever reaching a reply, same
+as a Gmail snippet. That restriction is enforced by only ever reading
+six keys off each raw event dict below, never by trusting a caller not
+to look further (the same discipline as app/gmail_executor.py's
+`_METADATA_HEADERS` allowlist).
 
 Scope: calendar.readonly only, same refresh-token credential plumbing as
 app/gmail_executor.py (see app/google_auth_helper.py).
