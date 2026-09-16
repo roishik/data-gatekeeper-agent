@@ -12,15 +12,20 @@ kill it: `docs/RUNBOOK.md`.
 **Live on Cloud Run, including write access.** Refresh token re-minted with the new scopes and
 redeployed same day (2026-09-15).
 
-- Read verbs: `gmail.search` (metadata + snippet only), `calendar.list_events` (all calendars
-  switched on in Google Calendar, deduped, window resolved in Asia/Jerusalem, **now includes
-  each event's `event_id` in the reply** — see below).
+- Read verbs: `gmail.search` (metadata + snippet only, **now also returns each result's Gmail
+  `thread_id` in the reply** — same opaque-token, appended-raw treatment as `event_id`, so a
+  follow-up `gmail.create_draft` can reply into that thread), `calendar.list_events` (all
+  calendars switched on in Google Calendar, deduped, window resolved in Asia/Jerusalem, **now
+  includes each event's `event_id` in the reply** — see below).
 - Write verbs (live): `gmail.create_draft`, `calendar.create_event`, `calendar.update_event`,
   `calendar.delete_event`, `drive.create_file`. **Deliberate, owner-chosen departure from this
   project's original read-only threat model** — see "Write access design" below before touching
-  any of this code. Not yet tested against a real inbound email (only offline against fakes) —
-  next step is a hand-sent test request per verb before trusting it against real Instinct
-  traffic (see Open items).
+  any of this code. **`gmail.create_draft` now takes an optional `thread_id`** (copied from a
+  prior `gmail.search` reply): with it, the draft is filed into that conversation as a
+  reply-in-thread instead of a new email — still a DRAFT only, never sent (2026-09-16, commit
+  `f5579b3`; added after Instinct hit exactly this gap replying to a Palantir email). The read
+  verbs and `gmail.create_draft` are now exercised live (see the e2e suite below); the calendar/
+  drive write verbs are still only offline-tested against fakes.
 - `drive.search` and `contacts.search` still return `not_implemented`.
 - **`event_id` is now exposed in `calendar.list_events`/`create_event`/`update_event` replies**
   (2026-09-16, commit `f49e15b`) — originally minimized out, but that left no way for a
@@ -39,19 +44,21 @@ redeployed same day (2026-09-15).
   security invariants are unchanged. Verified against the live Anthropic API and end-to-end
   against the deploy. The offline suite never caught it because the reader LLM was only ever run
   against a fake — hence the new live e2e suite (below).
-- Live revision: `data-gatekeeper-00010-674` (commit `42c5a88`, includes everything from
-  `f49e15b`, `cffc5b0` and `974f3a8` too).
+- Live revision: `data-gatekeeper-00011-2xk` (commit `f5579b3`, includes `42c5a88` reader-LLM
+  fix, `f49e15b`, `cffc5b0` and `974f3a8` too).
 - `GOOGLE_REFRESH_TOKEN`/`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` are now at Secret Manager
   version 2 (minted via `scripts/google_auth.py`, covering `gmail.compose` + `calendar.events`
   in addition to the original read scopes). `GOOGLE_DRIVE_FOLDER_ID` is still unset — first live
   `drive.create_file` call will create the folder and log its id; pin it once that happens.
-- Tests: `uv run pytest -q`, 240 passing, fully offline (fakes behind Protocols). Plus a **live
-  end-to-end suite** (`tests/test_e2e_live.py`, 3 tests, skipped unless `RUN_E2E=1`) that sends a
+- Tests: `uv run pytest -q`, 253 passing, fully offline (fakes behind Protocols). Plus a **live
+  end-to-end suite** (`tests/test_e2e_live.py`, 4 tests, skipped unless `RUN_E2E=1`) that sends a
   real email from `roishik10@gmail.com` to the gatekeeper and asserts on the real reply — the
   first tests that actually cross AgentMail + Cloud Run + the reader LLM + Google, i.e. the layer
-  the offline fakes can't see. Run with: `RUN_E2E=1 uv run pytest tests/test_e2e_live.py -v`
-  (needs the owner OAuth creds + `OWNER_EMAIL`/`GATEKEEPER_INBOX_ADDRESS` in env; sends real mail
-  and consumes daily-cap slots, so run deliberately). All 3 pass against `00010-674`.
+  the offline fakes can't see. Covers: fenced-block gmail.search, freeform gmail.search + freeform
+  calendar.list (reader-LLM path), and a gmail.search→create_draft **reply-in-thread** round trip.
+  Run with: `RUN_E2E=1 uv run pytest tests/test_e2e_live.py -v` (needs the owner OAuth creds +
+  `OWNER_EMAIL`/`GATEKEEPER_INBOX_ADDRESS` in env; sends real mail and consumes daily-cap slots,
+  so run deliberately). All 4 pass against `00011-2xk`.
 - First real round trip (me → gatekeeper, "calendar tomorrow") worked. The first version missed
   the shared "למשפחה" calendar because it read only primary; fixed in `521da72`.
 
