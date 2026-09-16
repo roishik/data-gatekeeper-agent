@@ -157,3 +157,138 @@ def test_reader_llm_verb_literal_matches_policy_verb_enum():
     literal_values = set(typing.get_args(VerbLiteral))
     policy_values = {v.value for v in Verb}
     assert literal_values == policy_values
+
+
+# ── Two-stage extraction (regression guards for the 2026-09-16
+# "Schema is too complex." outage) ─────────────────────────────────────────
+
+# The empirically-safe ceiling: the original read-only combined schema had
+# 7 properties and Anthropic accepted it; the 17-property combined schema
+# (after write verbs were added) got a 400 "Schema is too complex.". Each
+# per-stage schema must stay at or below 7.
+_MAX_STAGE_SCHEMA_PROPS = 7
+
+
+def test_reader_llm_stage_schemas_stay_small_enough_for_structured_output():
+    """Regression guard: the reader LLM must never hand Anthropic a single
+    flat schema with every verb's fields at once (that's what started
+    getting HTTP 400 'Schema is too complex.', silently turning every
+    LLM-fallback request into 'unsupported'). Every per-stage schema stays
+    small."""
+    from app.reader_llm import _STAGE2, _VerbSelection
+
+    assert len(_VerbSelection.model_json_schema()["properties"]) <= _MAX_STAGE_SCHEMA_PROPS
+    for model_cls, _prompt in _STAGE2.values():
+        assert len(model_cls.model_json_schema()["properties"]) <= _MAX_STAGE_SCHEMA_PROPS
+
+
+def test_reader_llm_stage_fields_cover_llm_extraction_exactly():
+    """The two-stage split must be able to fill every field LLMExtraction
+    can hold -- no field left silently unreachable, none invented. Stage 1
+    owns verb+request_id; the stage-2 models own the rest, partitioned by
+    verb."""
+    from app.reader_llm import _STAGE2, _VerbSelection
+
+    stage1 = set(_VerbSelection.model_json_schema()["properties"])
+    stage2_union: set[str] = set()
+    for model_cls, _prompt in _STAGE2.values():
+        stage2_union |= set(model_cls.model_json_schema()["properties"])
+
+    assert stage1 | stage2_union == set(LLMExtraction.model_json_schema()["properties"])
+
+
+def test_reader_llm_every_implemented_verb_has_a_stage2_model():
+    """Every verb policy.py actually executes must have a stage-2 field
+    model, or the LLM path could select it but never extract its params."""
+    from app.policy import IMPLEMENTED_VERBS
+    from app.reader_llm import _STAGE2
+
+    for verb in IMPLEMENTED_VERBS:
+        assert verb.value in _STAGE2, f"{verb.value} has no stage-2 extraction model"
+
+
+class _StubResponse:
+    def __init__(self, text: str):
+        self.content = [type("Block", (), {"type": "text", "text": text})()]
+        self.usage = type("Usage", (), {"input_tokens": 10, "output_tokens": 3})()
+
+
+class _StubMessages:
+    def __init__(self, texts: list[str]):
+        self._texts = list(texts)
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _StubResponse(self._texts.pop(0))
+
+
+class _StubAnthropic:
+    """Minimal stand-in for anthropic.Anthropic that returns a queued JSON
+    string per messages.create() call -- lets us exercise the real
+    two-stage control flow (stage 1 then stage 2, usage accumulation,
+    merge into LLMExtraction) without any network."""
+
+    last_instance: "_StubAnthropic | None" = None
+
+    def __init__(self, api_key=None, texts: list[str] | None = None):
+        self.messages = _StubMessages(texts or _StubAnthropic._queued)
+        _StubAnthropic.last_instance = self
+
+    _queued: list[str] = []
+
+
+def _install_stub_anthropic(monkeypatch, texts: list[str]):
+    import anthropic
+
+    from app import reader_llm as rl
+
+    monkeypatch.setattr(rl, "ANTHROPIC_API_KEY", "test-key")
+    _StubAnthropic._queued = list(texts)
+    monkeypatch.setattr(anthropic, "Anthropic", _StubAnthropic)
+    return rl.AnthropicReaderLLM(model="claude-haiku-4-5-20251001")
+
+
+def test_anthropic_reader_does_two_calls_and_merges(monkeypatch):
+    """A verb-with-params extraction makes exactly two structured-output
+    calls (verb selection, then that verb's fields) and merges them into
+    one LLMExtraction, summing usage across both."""
+    reader = _install_stub_anthropic(
+        monkeypatch,
+        texts=[
+            '{"verb": "gmail.search", "request_id": "req_x"}',
+            '{"query": "from:wiz", "max_results": 5}',
+        ],
+    )
+    result = reader.extract("search my gmail for wiz")
+
+    assert result is not None
+    assert result.verb == "gmail.search"
+    assert result.request_id == "req_x"
+    assert result.query == "from:wiz"
+    assert result.max_results == 5
+    assert _StubAnthropic.last_instance is not None
+    assert len(_StubAnthropic.last_instance.messages.calls) == 2
+    assert reader.last_usage == {"input_tokens": 20, "output_tokens": 6}
+
+
+def test_anthropic_reader_unsupported_skips_stage2(monkeypatch):
+    """A stage-1 'unsupported' selection needs no field extraction: only
+    one call is made, and the result is an empty-param unsupported."""
+    reader = _install_stub_anthropic(monkeypatch, texts=['{"verb": "unsupported"}'])
+    result = reader.extract("what's the weather?")
+
+    assert result is not None
+    assert result.verb == "unsupported"
+    assert result.query is None
+    assert _StubAnthropic.last_instance is not None
+    assert len(_StubAnthropic.last_instance.messages.calls) == 1
+
+
+def test_anthropic_reader_stage1_failure_is_unsupported(monkeypatch):
+    """If stage 1 returns unparseable JSON, extract() returns None (which
+    request_parser turns into 'unsupported') and never reaches stage 2."""
+    reader = _install_stub_anthropic(monkeypatch, texts=["not json at all"])
+    assert reader.extract("anything") is None
+    assert _StubAnthropic.last_instance is not None
+    assert len(_StubAnthropic.last_instance.messages.calls) == 1

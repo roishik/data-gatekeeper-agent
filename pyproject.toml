@@ -22,6 +22,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "e2e: live end-to-end test that sends real email through the deployed service (skipped unless RUN_E2E=1)",
+]
 
 [build-system]
 requires = ["hatchling"]
