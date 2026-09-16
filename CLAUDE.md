@@ -9,25 +9,29 @@ kill it: `docs/RUNBOOK.md`.
 
 ## Current state (as of 2026-09-15)
 
-**Live on Cloud Run for the read-only build. Write access was added in this session and is NOT
-deployed yet** (needs a fresh Google OAuth consent for the new scopes before it can go live —
-see "Deploy" below).
+**Live on Cloud Run, including write access.** Refresh token re-minted with the new scopes and
+redeployed same day.
 
 - Read verbs: `gmail.search` (metadata + snippet only), `calendar.list_events` (all calendars
   switched on in Google Calendar, deduped, window resolved in Asia/Jerusalem).
-- Write verbs (new, undeployed): `gmail.create_draft`, `calendar.create_event`,
-  `calendar.update_event`, `calendar.delete_event`, `drive.create_file`. **Deliberate,
-  owner-chosen departure from this project's original read-only threat model** — see "Write
-  access design" below before touching any of this code.
+- Write verbs (live): `gmail.create_draft`, `calendar.create_event`, `calendar.update_event`,
+  `calendar.delete_event`, `drive.create_file`. **Deliberate, owner-chosen departure from this
+  project's original read-only threat model** — see "Write access design" below before touching
+  any of this code. Not yet tested against a real inbound email (only offline against fakes) —
+  next step is a hand-sent test request per verb before trusting it against real Instinct
+  traffic (see Open items).
 - `drive.search` and `contacts.search` still return `not_implemented`.
-- Live revision: `data-gatekeeper-00004-67h` (commit `521da72`) — read-only build only.
-  **Commit `974f3a8` (calendar end time/location in replies + all-day date-leak fix) is ALSO NOT
-  deployed yet.** Review both, then redeploy together (see "Deploy" below).
+- Live revision: `data-gatekeeper-00007-cll` (commit `cffc5b0`, includes `974f3a8`'s calendar
+  end time/location fix too — both were undeployed together and shipped in the same rollout).
+- `GOOGLE_REFRESH_TOKEN`/`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` are now at Secret Manager
+  version 2 (minted via `scripts/google_auth.py`, covering `gmail.compose` + `calendar.events`
+  in addition to the original read scopes). `GOOGLE_DRIVE_FOLDER_ID` is still unset — first live
+  `drive.create_file` call will create the folder and log its id; pin it once that happens.
 - Tests: `uv run pytest -q`, 234 passing, fully offline (fakes behind Protocols).
 - First real round trip (me → gatekeeper, "calendar tomorrow") worked. The first version missed
   the shared "למשפחה" calendar because it read only primary; fixed in `521da72`.
 
-## Write access design (added 2026-09-15, not yet deployed)
+## Write access design (added 2026-09-15, deployed same day)
 
 I asked for write access (create calendar events, send email, create Drive files) and walked
 through the security trade-offs before building. Key decisions, all mine, all deliberate:
@@ -53,12 +57,12 @@ through the security trade-offs before building. Key decisions, all mine, all de
   `deleted_event_id`/`drive_file_id` — accountability for a write means recording what happened,
   not just that some verb ran. Literal subject/body/title text still isn't logged there; that's
   what the BCC'd reply is for, same split as everything else.
-- **Before deploying:** re-run `scripts/google_auth.py` (it now requests `gmail.compose` +
-  `calendar.events` in addition to the original read scopes — the old `GOOGLE_REFRESH_TOKEN`
-  does not cover them and write calls will fail with an insufficient-scope error, not silently
-  degrade to read-only), and re-check whether the wider scope set changes anything about the
-  OAuth consent screen's unverified/single-user status (not independently re-verified this
-  session — see `docs/RUNBOOK.md`).
+- **Deployed 2026-09-15**: refresh token re-minted via `scripts/google_auth.py` (now covers
+  `gmail.compose` + `calendar.events` in addition to the original read scopes), new Secret
+  Manager versions loaded, redeployed as `data-gatekeeper-00007-cll`. Whether the wider scope
+  set changes anything about the OAuth consent screen's unverified/single-user status was NOT
+  independently re-verified — the consent flow completed without Google flagging anything, which
+  is a good sign but not the same as reading Google's current policy (see `docs/RUNBOOK.md`).
 
 ## Open items (next steps, in order)
 
@@ -74,15 +78,16 @@ through the security trade-offs before building. Key decisions, all mine, all de
 2. Once Instinct's round trip works: **remove `roishik10@gmail.com` from `ALLOWED_SENDERS`**
    (it was added only for testing), and I **revoke Instinct's Google access** at
    myaccount.google.com/connections.
-3. Deploy `974f3a8` after review.
-4. **Deploy write access** (this session's work, currently local-only): re-run
-   `scripts/google_auth.py` for the new scopes, redeploy, then test each write verb by hand
-   before trusting it against real Instinct traffic — there's no injection test suite covering
-   these yet (see item 5).
-5. Later: implement `drive.search` / `contacts.search`; the injection test suite in CI
+3. **Hand-test each write verb** against the live deploy before trusting it against real
+   Instinct traffic: send a real request for `gmail.create_draft` (check the draft actually
+   lands, unsent, in Gmail), `calendar.create_event` (with and without an attendee),
+   `calendar.update_event`/`delete_event`, and `drive.create_file` (confirm the folder gets
+   created and pin `GOOGLE_DRIVE_FOLDER_ID` once it does). Only exercised against fakes so far.
+4. Later: implement `drive.search` / `contacts.search`; the injection test suite in CI
    (promptfoo/AgentDojo) — now higher priority given write verbs have real external side
-   effects to inject toward; daily digest; a push-approval channel (ntfy/Pushover), if I ever
-   want calendar writes gated instead of autonomous. LinkedIn is parked (`research/06`).
+   effects to inject toward, and are now live; daily digest; a push-approval channel
+   (ntfy/Pushover), if I ever want calendar writes gated instead of autonomous. LinkedIn is
+   parked (`research/06`).
 
 ## Architecture (app/)
 
@@ -114,9 +119,9 @@ writes, never literal content). Health: `GET /health` (Cloud Run reserves `/heal
 | Env vars (non-secret) | `AGENTMAIL_INBOX_ID`/`GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to`, `ALLOWED_SENDERS=roishikler@mail.instinct.com,roishik10@gmail.com`, `OWNER_EMAIL=roishik10@gmail.com`, `OWNER_TIMEZONE=Asia/Jerusalem`, `MAX_REQUESTS_PER_DAY=20`, `ANTHROPIC_MODEL=claude-haiku-4-5-20251001`, `AUDIT_LOG_BACKEND=sheets`, `STATE_STORE_BACKEND=sheets` |
 | Audit log sheet | `GOOGLE_SHEETS_LOG_SPREADSHEET_ID=1Ra4fpTY2ABoD39tLE4UJpT7FuJrauK-CrdcHVA2fmY8` |
 | State sheet | `GOOGLE_SHEETS_STATE_SPREADSHEET_ID=1TjTLHMi1k01K4JWkiHJZ7OGtb8C5-8WUAlH-4RDe2YA` |
-| Drive write folder | `GOOGLE_DRIVE_FOLDER_ID` — not yet set; `drive.create_file`'s first live call creates it and logs the id (see `docs/RUNBOOK.md`) |
+| Drive write folder | `GOOGLE_DRIVE_FOLDER_ID` — still not set; `drive.create_file`'s first live call creates it and logs the id (see `docs/RUNBOOK.md`) |
 | AgentMail | inbox `roi.shikler@agentmail.to`; webhook `ep_3JKjKK1JWfKzqJLv0By5fTvKqFn` → `/webhooks/agentmail`, events `message.received` |
-| Google OAuth app | Desktop client, consent screen **In production** (unverified, single user), for the ORIGINAL read-only scope set. Scopes now requested by `scripts/google_auth.py`: gmail.readonly, **gmail.compose**, calendar.readonly, **calendar.events**, drive.readonly, contacts.readonly, drive.file (bold = added for write access, not yet re-consented — the deployed `GOOGLE_REFRESH_TOKEN` still only covers the non-bold set) |
+| Google OAuth app | Desktop client, consent screen **In production** (unverified, single user). Scopes as of 2026-09-15: gmail.readonly, gmail.compose, calendar.readonly, calendar.events, drive.readonly, contacts.readonly, drive.file — refresh token re-minted and live (Secret Manager version 2) |
 | OAuth app pages | https://roishikler.com/data-gatekeeper/ and `/privacy/`: static files in `~/MEGA/Projects/personal_links-fixed/client/public/data-gatekeeper/` (uncommitted in that repo; live on App Engine version `dg-pages-20260914`) |
 | Local secrets | `~/.config/data-gatekeeper/client_secret.json` and `token.json` (0600, outside the repo); repo `.env` (gitignored) holds `AGENTMAIL_API_KEY`, `ANTHROPIC_API_KEY` |
 
