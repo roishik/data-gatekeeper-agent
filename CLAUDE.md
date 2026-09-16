@@ -28,13 +28,30 @@ redeployed same day (2026-09-15).
   unreachable in practice. Instinct itself flagged this gap when asking for the write-verb
   schema. The id is an opaque Google-generated token, not attacker-controlled content, so this
   doesn't reopen the redaction concerns summary/location still go through.
-- Live revision: `data-gatekeeper-00009-2lm` (commit `f49e15b`, includes everything from
-  `cffc5b0` and `974f3a8` too).
+- **Reader LLM fixed (2026-09-16, commit `42c5a88`).** The quarantined Layer-2 fallback
+  (`reader_llm.py`) had been silently dead in prod: after the write verbs grew `LLMExtraction`
+  to 17 fields, its combined structured-output JSON schema exceeded Anthropic's limit, so every
+  *freeform* (non-fenced-block) request got HTTP 400 "Schema is too complex.", was swallowed
+  into `verb="unsupported"`, and replied "could not be understood." This is what made Instinct's
+  `gmail.search` email fail. Now split into **two small structured-output calls** — stage 1 picks
+  the verb (+ `request_id`), stage 2 extracts only that verb's params (≤6 fields). `LLMExtraction`
+  stays the assembled result/return type but is no longer sent to the API; downstream and all
+  security invariants are unchanged. Verified against the live Anthropic API and end-to-end
+  against the deploy. The offline suite never caught it because the reader LLM was only ever run
+  against a fake — hence the new live e2e suite (below).
+- Live revision: `data-gatekeeper-00010-674` (commit `42c5a88`, includes everything from
+  `f49e15b`, `cffc5b0` and `974f3a8` too).
 - `GOOGLE_REFRESH_TOKEN`/`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` are now at Secret Manager
   version 2 (minted via `scripts/google_auth.py`, covering `gmail.compose` + `calendar.events`
   in addition to the original read scopes). `GOOGLE_DRIVE_FOLDER_ID` is still unset — first live
   `drive.create_file` call will create the folder and log its id; pin it once that happens.
-- Tests: `uv run pytest -q`, 234 passing, fully offline (fakes behind Protocols).
+- Tests: `uv run pytest -q`, 240 passing, fully offline (fakes behind Protocols). Plus a **live
+  end-to-end suite** (`tests/test_e2e_live.py`, 3 tests, skipped unless `RUN_E2E=1`) that sends a
+  real email from `roishik10@gmail.com` to the gatekeeper and asserts on the real reply — the
+  first tests that actually cross AgentMail + Cloud Run + the reader LLM + Google, i.e. the layer
+  the offline fakes can't see. Run with: `RUN_E2E=1 uv run pytest tests/test_e2e_live.py -v`
+  (needs the owner OAuth creds + `OWNER_EMAIL`/`GATEKEEPER_INBOX_ADDRESS` in env; sends real mail
+  and consumes daily-cap slots, so run deliberately). All 3 pass against `00010-674`.
 - First real round trip (me → gatekeeper, "calendar tomorrow") worked. The first version missed
   the shared "למשפחה" calendar because it read only primary; fixed in `521da72`.
 
@@ -111,7 +128,9 @@ Webhook `POST /webhooks/agentmail` → `pipeline.handle_webhook`:
    allowlist; loop prevention. Rejections are logged, never answered (HTTP 202).
 1. `state_store.py`: message/request dedupe and a daily cap (Sheets in prod).
 2. `request_parser.py`: fenced `---GATEKEEPER-REQUEST---` YAML first; otherwise the quarantined
-   `reader_llm.py` (Haiku 4.5, **no tools**, structured output, `extra="forbid"`).
+   `reader_llm.py` (Haiku 4.5, **no tools**, structured output, `extra="forbid"`) — now a
+   **two-stage** extraction (verb selection, then that verb's small param schema) so no single
+   schema is large enough to trip Anthropic's "Schema is too complex." limit (see Current state).
 3. `policy.py`: deny by default, bounded params, refuses sensitive Gmail queries.
 4. Executors, one verb per request: `gmail_executor.py` (search, read-only + create_draft,
    drafts only, never sends), `calendar_executor.py` (list_events read-only + create/update/
