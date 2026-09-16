@@ -197,7 +197,8 @@ def handle_webhook(
     elif decision.status == "allowed" and isinstance(decision.params, GmailCreateDraftParams):
         gmail_client = gmail_client_factory()
         draft_result = gmail_client.create_draft(
-            to=decision.params.to, subject=decision.params.subject, body=decision.params.body
+            to=decision.params.to, subject=decision.params.subject, body=decision.params.body,
+            thread_id=decision.params.thread_id,
         )
     elif decision.status == "allowed" and isinstance(decision.params, CalendarListEventsParams):
         window = resolve_window(decision.params.day_offset, decision.params.days, OWNER_TIMEZONE)

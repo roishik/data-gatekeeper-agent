@@ -116,6 +116,19 @@ def test_llm_extracts_gmail_create_draft_fields():
     assert parsed.params == {"to": "a@b.com", "subject": "Hi", "body": "Hello"}
 
 
+def test_llm_extracts_gmail_create_draft_thread_id_for_reply():
+    reader = FakeReaderLLM(
+        response=LLMExtraction(
+            verb="gmail.create_draft", request_id="req_r", to="a@b.com",
+            subject="Re: Q3", body="ok", thread_id="thread_xyz",
+        )
+    )
+    parsed = parse_request("reply to that thread", "msg_1", reader)
+
+    assert parsed.verb == "gmail.create_draft"
+    assert parsed.params == {"to": "a@b.com", "subject": "Re: Q3", "body": "ok", "thread_id": "thread_xyz"}
+
+
 def test_llm_extracts_calendar_create_event_fields_including_attendees():
     reader = FakeReaderLLM(
         response=LLMExtraction(

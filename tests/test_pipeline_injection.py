@@ -406,12 +406,41 @@ def test_gmail_create_draft_end_to_end_only_creates_a_draft(configured_env, audi
 
     assert outcome.http_status == 200
     assert len(fake_gmail.calls) == 1
-    assert fake_gmail.calls[0] == {"to": "alice@example.com", "subject": "Hi", "body": "Hello there"}
+    assert fake_gmail.calls[0] == {"to": "alice@example.com", "subject": "Hi", "body": "Hello there", "thread_id": None}
     reply_text = agentmail.calls[0]["text"]
     assert "status: completed" in reply_text
     assert "Review and send it yourself" in reply_text
+    # No thread_id given -> a plain new-email draft, not a reply-in-thread.
+    assert "as a reply in thread" not in reply_text
     # reply goes only to the verified sender, never to the draft's own "to" address
     assert agentmail.calls[0]["to"] == configured_env["sender"]
+
+
+def test_gmail_create_draft_reply_in_thread_end_to_end(configured_env, audit_log):
+    """A create_draft carrying a thread_id flows through the pipeline: the
+    executor is asked to file the draft into that thread, and the reply
+    reports it as a reply-in-thread."""
+    text = (
+        "---GATEKEEPER-REQUEST---\n"
+        "request_id: req_draft_thread\n"
+        "verb: gmail.create_draft\n"
+        "params:\n"
+        "  to: alice@example.com\n"
+        "  subject: 'Re: Q3 review'\n"
+        "  body: Sounds good\n"
+        "  thread_id: thread_xyz\n"
+        "---END---\n"
+    )
+    agentmail = FakeAgentMailClient()
+    body = make_body(text=text)
+    outcome, fake_gmail, _ = _call(body, agentmail_client=agentmail, audit_log=audit_log)
+
+    assert outcome.http_status == 200
+    assert len(fake_gmail.calls) == 1
+    assert fake_gmail.calls[0]["thread_id"] == "thread_xyz"
+    reply_text = agentmail.calls[0]["text"]
+    assert "status: completed" in reply_text
+    assert "as a reply in thread thread_xyz" in reply_text
 
 
 def test_calendar_create_event_end_to_end_invites_attendee_autonomously(configured_env, audit_log):

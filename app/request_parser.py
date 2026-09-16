@@ -110,6 +110,8 @@ def _parse_via_llm(email_text: str, agentmail_message_id: str, reader_llm: Reade
         params["subject"] = extraction.subject
     if extraction.body is not None:
         params["body"] = extraction.body
+    if extraction.thread_id is not None:
+        params["thread_id"] = extraction.thread_id
     if extraction.title is not None:
         params["title"] = extraction.title
     if extraction.start_time is not None:

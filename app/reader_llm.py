@@ -106,6 +106,10 @@ class LLMExtraction(BaseModel):
     to: str | None = None
     subject: str | None = None
     body: str | None = None
+    # gmail.create_draft: optional thread to file the draft into, copied
+    # verbatim from a thread_id the gatekeeper returned in an earlier
+    # gmail.search reply -- never invented.
+    thread_id: str | None = None
     # calendar.create_event / update_event fields.
     title: str | None = None
     start_time: str | None = None  # "HH:MM", owner's local time -- never a full date/timestamp
@@ -157,6 +161,7 @@ class _GmailDraftFields(BaseModel):
     to: str | None = None
     subject: str | None = None
     body: str | None = None
+    thread_id: str | None = None
 
 
 class _CalendarCreateFields(BaseModel):
@@ -234,7 +239,11 @@ _STAGE2_GMAIL_DRAFT_PROMPT = _QUARANTINE_PREAMBLE + (
     "recipient email address the request names), 'subject', and 'body'. "
     "Compose subject/body only from what the email explicitly asks the "
     "draft to say -- never add claims, links, prices, or commitments the "
-    "request didn't state. This only ever creates a DRAFT; it never sends."
+    "request didn't state. If (and only if) the email is asking to REPLY "
+    "within an existing email thread and plainly states a thread_id (e.g. "
+    "one the gatekeeper returned from an earlier gmail.search), copy it "
+    "verbatim into 'thread_id'; otherwise omit thread_id entirely. This "
+    "only ever creates a DRAFT; it never sends."
 )
 
 _STAGE2_CALENDAR_CREATE_PROMPT = _QUARANTINE_PREAMBLE + (

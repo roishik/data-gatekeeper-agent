@@ -200,6 +200,33 @@ def test_render_reply_gmail_create_draft_redacts_injected_subject():
     assert "[redacted]" in body
 
 
+def test_render_reply_gmail_create_draft_reports_thread_when_threaded():
+    """A draft filed into an existing thread says so (and names the thread),
+    so the requester/owner can tell it's a reply-in-thread, not a new email."""
+    parsed = ParsedRequest(request_id="req_draft3", verb="gmail.create_draft", params={}, source="block")
+    draft = DraftResult(draft_id="draft_1", to="alice@example.com", subject="Re: Q3", thread_id="thread_xyz")
+    body = render_reply(parsed, "completed", None, draft_result=draft)
+    assert "as a reply in thread thread_xyz" in body
+    assert "Review and send it yourself" in body
+
+
+def test_render_reply_gmail_search_exposes_thread_id_unredacted():
+    """thread_id is shown raw so a follow-up create_draft can reply into the
+    thread -- it must survive the redaction pass intact even when it looks
+    digit-heavy."""
+    parsed = ParsedRequest(request_id="req_t", verb="gmail.search", params={"query": "x"}, source="block")
+    results = [
+        GmailResult(
+            message_id="m1", sender="alice@example.com", subject="Q3 review",
+            date="Mon, 14 Sep 2026 10:00:00 +0000", snippet="let's sync",
+            thread_id="18f2a9c0b1d3e4f5",
+        )
+    ]
+    body = render_reply(parsed, "completed", None, gmail_results=results)
+    assert "thread_id: 18f2a9c0b1d3e4f5" in body
+    assert "m1" not in body  # the message id is still never exposed
+
+
 def test_render_reply_calendar_create_event_completed():
     parsed = ParsedRequest(request_id="req_ce", verb="calendar.create_event", params={}, source="block")
     created = CalendarEvent(

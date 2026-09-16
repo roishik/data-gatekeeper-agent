@@ -273,6 +273,42 @@ def test_gmail_create_draft_no_recipient_allowlist_by_design():
     assert decision.status == "allowed"
 
 
+def test_gmail_create_draft_thread_id_absent_is_none():
+    """thread_id is optional: without it, a plain new-email draft (thread_id
+    stays None), unchanged from before this field existed."""
+    decision = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "Hi", "body": "hi"})
+    assert decision.status == "allowed"
+    assert decision.params == GmailCreateDraftParams(to="a@example.com", subject="Hi", body="hi", thread_id=None)
+
+
+def test_gmail_create_draft_valid_thread_id_allowed():
+    decision = evaluate_policy(
+        "gmail.create_draft",
+        {"to": "a@example.com", "subject": "Re: Q3", "body": "ok", "thread_id": "18f2a9c0b1d3e4f5"},
+    )
+    assert decision.status == "allowed"
+    assert decision.params.thread_id == "18f2a9c0b1d3e4f5"
+
+
+@pytest.mark.parametrize(
+    "bad_thread_id",
+    [
+        "",  # empty when given
+        "has space",  # whitespace
+        "with/slash",  # not an opaque-token char
+        "line\nbreak",  # header/CRLF-shaped
+        "x" * 513,  # too long
+    ],
+)
+def test_gmail_create_draft_invalid_thread_id_denied(bad_thread_id):
+    decision = evaluate_policy(
+        "gmail.create_draft",
+        {"to": "a@example.com", "subject": "Re: Q3", "body": "ok", "thread_id": bad_thread_id},
+    )
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
 # ── calendar.create_event ───────────────────────────────────────────────
 
 

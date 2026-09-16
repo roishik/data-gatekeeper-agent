@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import time
 import uuid
 
@@ -139,10 +140,11 @@ def _parse_response_block(body: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _wait_for_reply(request_id: str) -> dict:
+def _wait_for_reply(request_id: str) -> tuple[dict, str]:
     """Poll the owner's Gmail for a gatekeeper reply whose response block
-    carries `request_id`. Returns the parsed response block, or fails the
-    test after E2E_REPLY_TIMEOUT seconds."""
+    carries `request_id`. Returns (parsed response block, full body text),
+    or fails the test after E2E_REPLY_TIMEOUT seconds. The body is returned
+    too so a caller can read prose the block omits (e.g. a `thread_id`)."""
     service = _gmail_service(_GMAIL_READONLY_SCOPE)
     query = f"from:{GATEKEEPER_INBOX_ADDRESS} newer_than:1d"
     deadline = time.monotonic() + E2E_REPLY_TIMEOUT
@@ -155,7 +157,7 @@ def _wait_for_reply(request_id: str) -> dict:
             if request_id in body:
                 block = _parse_response_block(body)
                 if block and block.get("request_id") == request_id:
-                    return block
+                    return block, body
         time.sleep(E2E_POLL_INTERVAL)
 
     pytest.fail(f"no gatekeeper reply for request_id={request_id} within {E2E_REPLY_TIMEOUT}s")
@@ -182,7 +184,7 @@ def test_e2e_fenced_block_gmail_search_completes():
     )
     _send_from_owner(f"gatekeeper e2e block {request_id}", body)
 
-    block = _wait_for_reply(request_id)
+    block, _body = _wait_for_reply(request_id)
     assert block["status"] == "completed", block
 
 
@@ -201,7 +203,7 @@ def test_e2e_freeform_gmail_search_completes_via_reader_llm():
     )
     _send_from_owner(f"gatekeeper e2e freeform {request_id}", body)
 
-    block = _wait_for_reply(request_id)
+    block, _body = _wait_for_reply(request_id)
     assert block["status"] == "completed", block
 
 
@@ -216,5 +218,56 @@ def test_e2e_freeform_calendar_list_completes_via_reader_llm():
     )
     _send_from_owner(f"gatekeeper e2e calendar {request_id}", body)
 
-    block = _wait_for_reply(request_id)
+    block, _body = _wait_for_reply(request_id)
     assert block["status"] == "completed", block
+
+
+def test_e2e_gmail_create_draft_replies_in_thread():
+    """The Palantir-reply fix, end to end: gmail.search exposes a real
+    thread_id, and a follow-up gmail.create_draft carrying that thread_id
+    files the draft into that conversation (reply-in-thread) rather than a
+    new email. Both halves must round-trip live through the deployed
+    service."""
+    _require_config()
+
+    # Step 1: derive a real thread_id from a live gmail.search reply.
+    search_id = _new_request_id("thread-search")
+    search_req = (
+        "---GATEKEEPER-REQUEST---\n"
+        f"request_id: {search_id}\n"
+        "verb: gmail.search\n"
+        "params:\n"
+        "  query: newer_than:30d\n"
+        "  max_results: 1\n"
+        "---END---\n"
+    )
+    _send_from_owner(f"gatekeeper e2e thread-search {search_id}", search_req)
+    search_block, search_body = _wait_for_reply(search_id)
+    assert search_block["status"] == "completed", search_block
+    if search_block.get("result_count", 0) < 1:
+        pytest.skip("no recent Gmail message to derive a thread_id from")
+    match = re.search(r"thread_id:\s*([A-Za-z0-9_-]+)", search_body)
+    assert match, f"gmail.search reply did not expose a thread_id:\n{search_body}"
+    thread_id = match.group(1)
+
+    # Step 2: create a draft filed into that thread.
+    draft_id = _new_request_id("thread-draft")
+    draft_req = (
+        "---GATEKEEPER-REQUEST---\n"
+        f"request_id: {draft_id}\n"
+        "verb: gmail.create_draft\n"
+        "params:\n"
+        f"  to: {OWNER_EMAIL}\n"
+        "  subject: '[gatekeeper-e2e] Re: thread test'\n"
+        "  body: Automated e2e draft, safe to delete.\n"
+        f"  thread_id: {thread_id}\n"
+        "---END---\n"
+    )
+    _send_from_owner(f"gatekeeper e2e thread-draft {draft_id}", draft_req)
+    draft_block, draft_body = _wait_for_reply(draft_id)
+
+    assert draft_block["status"] == "completed", draft_block
+    # The reply echoes the thread the draft ACTUALLY landed in (read back
+    # from Gmail's API response in the executor), so this proves Gmail
+    # accepted the threadId, not just that we sent it.
+    assert f"as a reply in thread {thread_id}" in draft_body, draft_body

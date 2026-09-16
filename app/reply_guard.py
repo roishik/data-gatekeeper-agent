@@ -124,8 +124,13 @@ def render_reply(
     elif status == "completed" and parsed_request.verb == "calendar.delete_event" and deleted_event_id:
         prose_lines.append(f"Deleted event {deleted_event_id}.")
     elif status == "completed" and parsed_request.verb == "gmail.create_draft" and draft_result:
+        where = (
+            f" (as a reply in thread {draft_result.thread_id})"
+            if draft_result.thread_id
+            else ""
+        )
         prose_lines.append(
-            f"Created a draft to {draft_result.to}, subject: '{redact(draft_result.subject)}'. "
+            f"Created a draft to {draft_result.to}, subject: '{redact(draft_result.subject)}'{where}. "
             "Review and send it yourself in Gmail -- this gatekeeper never sends email on your behalf."
         )
     elif status == "completed" and parsed_request.verb == "drive.create_file" and drive_file_result:
@@ -137,9 +142,15 @@ def render_reply(
             for r in results:
                 subject = redact(r.subject) or "(no subject)"
                 snippet = redact(r.snippet)
+                # thread_id is an opaque Google token (like a calendar
+                # event_id), so it's appended RAW -- never through redact(),
+                # which would mangle its digit runs and break the ability to
+                # reply into the thread. It's what a follow-up
+                # gmail.create_draft copies to file a reply into this thread.
+                thread = f" (thread_id: {r.thread_id})" if r.thread_id else ""
                 # The sender header is attacker-controlled too (display names can carry
                 # URLs or instructions), so it goes through the same redaction.
-                prose_lines.append(f"- {subject} — {redact(r.sender)} ({r.date})\n  {snippet}")
+                prose_lines.append(f"- {subject} — {redact(r.sender)} ({r.date}){thread}\n  {snippet}")
         else:
             prose_lines.append("No matching emails found.")
     elif status == "needs_clarification":

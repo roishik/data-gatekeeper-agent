@@ -98,6 +98,13 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DRAFT_TO_MAX_CHARS = 254  # RFC 5321 max mailbox length
 DRAFT_SUBJECT_MAX_CHARS = 200
 DRAFT_BODY_MAX_CHARS = 5000
+# Optional thread_id: a value the requester copied from a prior
+# gmail.search reply so a draft can be filed into that conversation. It's
+# passed to Gmail's API in a JSON body (never a mail header), but we still
+# constrain it to an opaque-token shape -- deny-by-default never means
+# "accept anything", and this keeps anything odd out of the API call.
+_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+DRAFT_THREAD_ID_MAX_CHARS = 512
 
 # calendar.create_event / update_event bounds. day_offset/start_time are
 # the same "small bounded token, never a real date/timestamp" trick as
@@ -137,6 +144,7 @@ class GmailCreateDraftParams:
     to: str
     subject: str
     body: str
+    thread_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -344,7 +352,20 @@ def _evaluate_gmail_create_draft(params: dict[str, Any]) -> PolicyDecision:
             reason=f"'body' exceeds {DRAFT_BODY_MAX_CHARS} characters",
         )
 
-    return PolicyDecision(status="allowed", verb=verb, params=GmailCreateDraftParams(to=to, subject=subject, body=body))
+    # Optional: file the draft into an existing thread (reply-in-thread).
+    # Absent -> a new-email draft, exactly as before.
+    thread_id_raw = params.get("thread_id")
+    thread_id: str | None = None
+    if thread_id_raw is not None:
+        if not isinstance(thread_id_raw, str) or not thread_id_raw.strip():
+            return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'thread_id' must be a non-empty string when given")
+        thread_id = thread_id_raw.strip()
+        if len(thread_id) > DRAFT_THREAD_ID_MAX_CHARS or not _THREAD_ID_RE.match(thread_id):
+            return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'thread_id' is not a valid thread id")
+
+    return PolicyDecision(
+        status="allowed", verb=verb, params=GmailCreateDraftParams(to=to, subject=subject, body=body, thread_id=thread_id)
+    )
 
 
 def _evaluate_calendar_list_events(params: dict[str, Any]) -> PolicyDecision:

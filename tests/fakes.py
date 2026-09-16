@@ -49,9 +49,9 @@ class FakeGmailClient:
         self.calls.append({"query": query, "max_results": max_results, "newer_than_days": newer_than_days})
         return self.results[:max_results]
 
-    def create_draft(self, to: str, subject: str, body: str) -> DraftResult:
-        self.calls.append({"to": to, "subject": subject, "body": body})
-        return DraftResult(draft_id="draft_1", to=to, subject=subject)
+    def create_draft(self, to: str, subject: str, body: str, thread_id: str | None = None) -> DraftResult:
+        self.calls.append({"to": to, "subject": subject, "body": body, "thread_id": thread_id})
+        return DraftResult(draft_id="draft_1", to=to, subject=subject, thread_id=thread_id)
 
 
 class FakeCalendarClient:

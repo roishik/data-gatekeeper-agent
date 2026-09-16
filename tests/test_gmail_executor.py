@@ -32,7 +32,11 @@ class _Drafts:
 
     def create(self, userId, body):
         self.created_bodies.append(body)
-        return _Call({"id": "draft_abc"})
+        # Echo back the threadId the caller set (Gmail returns the draft's
+        # message resource, which carries the thread it landed in), or None
+        # for a new-email draft.
+        thread_id = body.get("message", {}).get("threadId")
+        return _Call({"id": "draft_abc", "message": {"id": "m1", "threadId": thread_id}})
 
 
 class _Users:
@@ -81,3 +85,33 @@ def test_create_draft_encodes_to_and_subject_and_body():
     assert message["to"] == "alice@example.com"
     assert message["subject"] == "Hi there"
     assert message.get_payload() == "Hello there"
+
+
+def test_create_draft_without_thread_id_starts_a_new_thread():
+    """No thread_id -> the draft body carries no threadId, i.e. a plain new
+    email, and the result reports no thread."""
+    service = _Service()
+    client = GoogleGmailClient()
+    client._service = lambda scopes: service  # type: ignore[method-assign]
+
+    result = client.create_draft(to="alice@example.com", subject="Hi", body="Hello")
+
+    assert "threadId" not in service._drafts.created_bodies[0]["message"]
+    assert result.thread_id is None
+
+
+def test_create_draft_files_into_thread_when_thread_id_given():
+    """A thread_id -> the draft is created with that threadId (reply-in-
+    thread), and the result reflects the thread it landed in."""
+    service = _Service()
+    client = GoogleGmailClient()
+    client._service = lambda scopes: service  # type: ignore[method-assign]
+
+    result = client.create_draft(
+        to="alice@example.com", subject="Re: Q3 review", body="Sounds good", thread_id="thread_xyz"
+    )
+
+    assert service._drafts.created_bodies[0]["message"]["threadId"] == "thread_xyz"
+    assert result.thread_id == "thread_xyz"
+    # Still never a send: the fake service exposes only drafts().create().
+    assert result.draft_id == "draft_abc"
