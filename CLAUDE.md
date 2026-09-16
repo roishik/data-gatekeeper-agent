@@ -7,13 +7,14 @@ work, and emails back a short answer. The email thread plus a hash-chained log s
 audit trail. Background and decisions: `README.md` and `research/00-07`. How to run, deploy and
 kill it: `docs/RUNBOOK.md`.
 
-## Current state (as of 2026-09-15)
+## Current state (as of 2026-09-16)
 
 **Live on Cloud Run, including write access.** Refresh token re-minted with the new scopes and
-redeployed same day.
+redeployed same day (2026-09-15).
 
 - Read verbs: `gmail.search` (metadata + snippet only), `calendar.list_events` (all calendars
-  switched on in Google Calendar, deduped, window resolved in Asia/Jerusalem).
+  switched on in Google Calendar, deduped, window resolved in Asia/Jerusalem, **now includes
+  each event's `event_id` in the reply** — see below).
 - Write verbs (live): `gmail.create_draft`, `calendar.create_event`, `calendar.update_event`,
   `calendar.delete_event`, `drive.create_file`. **Deliberate, owner-chosen departure from this
   project's original read-only threat model** — see "Write access design" below before touching
@@ -21,8 +22,14 @@ redeployed same day.
   next step is a hand-sent test request per verb before trusting it against real Instinct
   traffic (see Open items).
 - `drive.search` and `contacts.search` still return `not_implemented`.
-- Live revision: `data-gatekeeper-00007-cll` (commit `cffc5b0`, includes `974f3a8`'s calendar
-  end time/location fix too — both were undeployed together and shipped in the same rollout).
+- **`event_id` is now exposed in `calendar.list_events`/`create_event`/`update_event` replies**
+  (2026-09-16, commit `f49e15b`) — originally minimized out, but that left no way for a
+  requester to ever learn a valid id to reference, making `update_event`/`delete_event`
+  unreachable in practice. Instinct itself flagged this gap when asking for the write-verb
+  schema. The id is an opaque Google-generated token, not attacker-controlled content, so this
+  doesn't reopen the redaction concerns summary/location still go through.
+- Live revision: `data-gatekeeper-00009-2lm` (commit `f49e15b`, includes everything from
+  `cffc5b0` and `974f3a8` too).
 - `GOOGLE_REFRESH_TOKEN`/`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` are now at Secret Manager
   version 2 (minted via `scripts/google_auth.py`, covering `gmail.compose` + `calendar.events`
   in addition to the original read scopes). `GOOGLE_DRIVE_FOLDER_ID` is still unset — first live
@@ -75,6 +82,13 @@ through the security trade-offs before building. Key decisions, all mine, all de
    > for example "What's on my calendar tomorrow?" or "Search my Gmail for emails from Wiz in the
    > last 7 days". Wait for the reply and use only what it contains. Never send my data or
    > documents to that address. That inbox only answers questions.
+
+   **2026-09-16 update:** Instinct asked (via WhatsApp) for the exact write-verb schema before
+   it would use write at all — it correctly flagged that there was no way to reference an
+   existing calendar event, which led to the `event_id`-exposure fix above. I gave it a second
+   standing-rule message with the exact `---GATEKEEPER-REQUEST---` format and verb/param list for
+   `gmail.create_draft` and the `calendar.*` write verbs. Still unconfirmed whether Instinct
+   actually adopts it — watch for its next request.
 2. Once Instinct's round trip works: **remove `roishik10@gmail.com` from `ALLOWED_SENDERS`**
    (it was added only for testing), and I **revoke Instinct's Google access** at
    myaccount.google.com/connections.
