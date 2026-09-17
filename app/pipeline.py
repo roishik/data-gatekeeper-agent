@@ -20,10 +20,11 @@ from app.agentmail_client import AgentMailClient
 from app.audit_log import AuditLog, AuditRecord
 from app.calendar_executor import CalendarClient, CalendarEvent
 from app.calendar_window import resolve_window
-from app.config import AGENTMAIL_INBOX_ID, MAX_REQUESTS_PER_DAY, OWNER_EMAIL, OWNER_TIMEZONE
+from app.config import AGENTMAIL_INBOX_ID, INJECTION_DENY_THRESHOLD, MAX_REQUESTS_PER_DAY, OWNER_EMAIL, OWNER_TIMEZONE
 from app.drive_executor import DriveClient, DriveFileResult
 from app.gmail_executor import DraftResult, GmailClient, GmailResult
 from app.ingress import check_event, parsed_sender_address, verify_signature
+from app.injection_screen import InjectionScreen
 from app.policy import (
     CalendarCreateEventParams,
     CalendarDeleteEventParams,
@@ -96,6 +97,7 @@ def handle_webhook(
     *,
     state_store,
     reader_llm: ReaderLLM,
+    injection_screen: InjectionScreen,
     gmail_client_factory: Callable[[], GmailClient],
     calendar_client_factory: Callable[[], CalendarClient],
     drive_client_factory: Callable[[], DriveClient],
@@ -165,12 +167,29 @@ def handle_webhook(
         _reply(agentmail_client, message_id, sender_address, _unresolved_request(message_id), "error", "rate_limited")
         return WebhookOutcome(200, "rate_limited")
 
+    # ── Injection screen (additive tripwire, not a layer of its own --
+    # see app/injection_screen.py). Scored on subject + body together
+    # (research/03's OpenClaw lesson: the subject line is just as
+    # attacker-influenced as the body) BEFORE parsing, so its score is
+    # available to both the audit log and Layer 2's freeform-path
+    # short-circuit below, regardless of which path resolves the request.
+    injection_score = injection_screen.screen(f"Subject: {fields['subject']}\n\n{fields['text']}")
+
     # ── Layer 2: parse ───────────────────────────────────────────────────
-    parsed = parse_request(fields["text"], message_id, reader_llm)
+    parsed = parse_request(
+        fields["text"],
+        message_id,
+        reader_llm,
+        injection_score=injection_score,
+        injection_deny_threshold=INJECTION_DENY_THRESHOLD,
+    )
     llm_usage = getattr(reader_llm, "last_usage", None) if parsed.source == "llm" else None
 
     if state_store.is_duplicate_request(parsed.request_id):
-        _log_audit(audit_log, message_id, sender_address, layer0="ok", layer1="duplicate_request", parsed=parsed)
+        _log_audit(
+            audit_log, message_id, sender_address, layer0="ok", layer1="duplicate_request",
+            parsed=parsed, injection_score=injection_score,
+        )
         return WebhookOutcome(200, "duplicate_request")
     state_store.mark_request_seen(parsed.request_id)
     state_store.record_request(sender_address)
@@ -259,6 +278,7 @@ def handle_webhook(
         calendar_results=calendar_results,
         reply_message_id=reply_result.message_id if reply_result else None,
         llm_usage=llm_usage,
+        injection_score=injection_score,
     )
     return WebhookOutcome(200, "processed")
 
@@ -322,6 +342,7 @@ def _log_audit(
     updated_event: CalendarEvent | None = None,
     deleted_event_id: str | None = None,
     drive_file_result: DriveFileResult | None = None,
+    injection_score: float | None = None,
 ) -> None:
     write_result_count = sum(
         1 for r in (draft_result, created_event, updated_event, deleted_event_id, drive_file_result) if r
@@ -335,6 +356,7 @@ def _log_audit(
             parsed_request_id=parsed.request_id if parsed else None,
             parsed_verb=parsed.verb if parsed else None,
             parsed_source=parsed.source if parsed else None,
+            injection_score=injection_score,
             policy_status=decision.status if decision else None,
             policy_error_code=decision.error_code if decision else None,
             result_count=(

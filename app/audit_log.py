@@ -48,6 +48,7 @@ _FIELD_ORDER = [
     "event_id", "timestamp", "agentmail_message_id", "sender",
     "layer0_verdict", "layer1_verdict",
     "parsed_request_id", "parsed_verb", "parsed_source",
+    "injection_score",
     "policy_status", "policy_error_code",
     "result_count", "gmail_message_ids", "calendar_event_ids", "reply_message_id",
     "llm_input_tokens", "llm_output_tokens",
@@ -72,7 +73,13 @@ class AuditRecord:
     layer1_verdict: str
     parsed_request_id: str | None = None
     parsed_verb: str | None = None
-    parsed_source: str | None = None  # "block" | "llm" | None
+    parsed_source: str | None = None  # "block" | "llm" | "screened" | None
+    # TypeSafe/Jev Noul probability that this email attempts a prompt
+    # injection (app/injection_screen.py) -- None if the screen wasn't
+    # configured or its call failed. Visibility only; never itself
+    # authorizes or denies anything downstream of app/request_parser.py's
+    # "screened" short-circuit -- see that module's docstring.
+    injection_score: float | None = None
     policy_status: str | None = None
     policy_error_code: str | None = None
     result_count: int = 0

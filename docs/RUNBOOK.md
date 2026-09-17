@@ -22,6 +22,16 @@ in, the app still **imports** and the **test suite still runs**
 credentials) — only actually starting the server and hitting the real
 webhook route needs real values.
 
+**Optional: `TYPESAFE_API_KEY`.** Added 2026-09-17 (`app/injection_screen.py`)
+-- an additive tripwire, not the security boundary (see that module's
+docstring), that scores every inbound email for likely prompt-injection
+content via TypeSafe's Jev model, and (only on the freeform/LLM-fallback
+parse path, above `INJECTION_DENY_THRESHOLD`, default `0.85`) skips the
+paid Anthropic reader-LLM call and denies early. Left unset,
+`app/main.py` falls back to `NoOpInjectionScreen` and the pipeline
+behaves exactly as it did before this feature existed -- nothing else in
+this build depends on it.
+
 Implemented verbs as of this build: `gmail.search`, `gmail.create_draft`,
 `calendar.list_events`, `calendar.create_event`, `calendar.update_event`,
 `calendar.delete_event`, `drive.create_file`. `calendar.list_events`
@@ -138,6 +148,7 @@ gcloud builds submit --tag "$REGION-docker.pkg.dev/$PROJECT/gatekeeper/$SERVICE:
 #   gcloud secrets create AGENTMAIL_API_KEY --data-file=-   # then paste + Ctrl-D
 #   gcloud secrets create AGENTMAIL_WEBHOOK_SECRET --data-file=-
 #   gcloud secrets create ANTHROPIC_API_KEY --data-file=-
+#   gcloud secrets create TYPESAFE_API_KEY --data-file=-   # optional, see "Local run" above
 
 gcloud run deploy "$SERVICE" \
   --project "$PROJECT" \

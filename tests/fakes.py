@@ -36,6 +36,20 @@ class FakeReaderLLM:
         return self.response
 
 
+class FakeInjectionScreen:
+    """Scripted TypeSafe/Jev stand-in. Returns a fixed `score` (or None,
+    simulating "no signal" -- see app/injection_screen.py) regardless of
+    what `text` says. Records every call for assertions."""
+
+    def __init__(self, score: float | None = None):
+        self.score = score
+        self.calls: list[str] = []
+
+    def screen(self, text: str) -> float | None:
+        self.calls.append(text)
+        return self.score
+
+
 class FakeGmailClient:
     """Returns a fixed list of GmailResult regardless of the query --
     tests that care about query construction assert against

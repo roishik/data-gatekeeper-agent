@@ -33,9 +33,11 @@ from app.config import (
     GOOGLE_SHEETS_LOG_SPREADSHEET_ID,
     GOOGLE_SHEETS_STATE_SPREADSHEET_ID,
     STATE_STORE_BACKEND,
+    have_typesafe_key,
 )
 from app.drive_executor import GoogleDriveClient
 from app.gmail_executor import GoogleGmailClient
+from app.injection_screen import InjectionScreen, NoOpInjectionScreen, TypeSafeInjectionScreen
 from app.pipeline import handle_webhook
 from app.reader_llm import AnthropicReaderLLM
 from app.state_store import InMemoryStateStore, SheetsStateStore, StateStore
@@ -58,6 +60,16 @@ def _build_audit_log() -> AuditLog:
     return JSONLAuditLog(AUDIT_LOG_PATH)
 
 
+def _build_injection_screen() -> InjectionScreen:
+    # Falls back to a no-op (every request scores None, unused by
+    # anything) until TYPESAFE_API_KEY is actually configured -- lets
+    # this ship and deploy before the secret exists. See
+    # app/injection_screen.py's module docstring.
+    if have_typesafe_key():
+        return TypeSafeInjectionScreen()
+    return NoOpInjectionScreen()
+
+
 # Built once at import time -- see module docstring for why this pair is
 # the exception to "construct credentialed things lazily".
 _state_store = _build_state_store()
@@ -74,6 +86,7 @@ async def agentmail_webhook(request: Request) -> Response:
         svix_signature=request.headers.get("svix-signature", ""),
         state_store=_state_store,
         reader_llm=AnthropicReaderLLM(),
+        injection_screen=_build_injection_screen(),
         gmail_client_factory=GoogleGmailClient,
         calendar_client_factory=GoogleCalendarClient,
         drive_client_factory=GoogleDriveClient,

@@ -65,6 +65,16 @@ def _env_int(name: str, default: int) -> int:
     return int(val) if val else default
 
 
+def _env_float(name: str, default: float) -> float:
+    val = os.environ.get(name)
+    return float(val) if val else default
+
+
+def _env_str(name: str, default: str) -> str:
+    val = os.environ.get(name)
+    return val if val else default
+
+
 def _env_list(name: str, default: str = "") -> list[str]:
     """Comma-separated env var -> list of trimmed, non-empty strings."""
     raw = os.environ.get(name, default)
@@ -98,6 +108,24 @@ ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY")
 # Pinned, dated snapshot on purpose — see research/03 and research/05: a
 # model swap should be a deliberate, tested change, never a silent float.
 ANTHROPIC_MODEL = _env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+
+# ── TypeSafe (additive injection-screening tripwire, between Layers 1/2) ───
+# Added 2026-09-17. NOT the security boundary -- see app/injection_screen.py's
+# module docstring. Left unset, TypeSafeInjectionScreen simply isn't
+# constructed (app/main.py falls back to NoOpInjectionScreen) and the
+# pipeline behaves exactly as it did before this feature existed.
+TYPESAFE_API_KEY = _env("TYPESAFE_API_KEY")
+# Pinned, versioned snapshot on purpose -- same reasoning as ANTHROPIC_MODEL
+# above: a model swap should be a deliberate, tested change, never a silent
+# float via the "jev-latest" alias.
+TYPESAFE_MODEL = _env_str("TYPESAFE_MODEL", "jev-1.13.0")
+# Noul probability at/above which the freeform (LLM-fallback) parse path is
+# denied BEFORE the Anthropic reader LLM is ever called (app/request_parser.py).
+# Deliberately high: this is an additive tripwire on top of the quarantined
+# reader LLM + Layer 3 revalidation, not a replacement for them (research/03
+# section 5: classifiers are "one layer, never the only layer"), so a false
+# positive here should be rare, not merely unlikely.
+INJECTION_DENY_THRESHOLD = _env_float("INJECTION_DENY_THRESHOLD", 0.85)
 
 # ── Policy (Layer 3) ─────────────────────────────────────────────────────
 # Query terms that make a gmail.search request refuse to run, regardless
@@ -165,6 +193,10 @@ PORT = _env_int("PORT", 8080)  # Cloud Run injects PORT; 8080 is its own default
 
 def have_anthropic_key() -> bool:
     return bool(ANTHROPIC_API_KEY)
+
+
+def have_typesafe_key() -> bool:
+    return bool(TYPESAFE_API_KEY)
 
 
 def have_google_credentials() -> bool:

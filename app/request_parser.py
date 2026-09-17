@@ -19,6 +19,19 @@ becomes verb="unsupported", never a best-effort guess -- this is the
 "never coerce" rule from the brief, and it's also what research/03
 section 2.5 calls the "structured-output-only extraction" baseline: a
 schema violation is a parse failure, full stop.
+
+Injection pre-filter (added 2026-09-17)
+----------------------------------------
+`parse_request` optionally takes a score from app/injection_screen.py's
+TypeSafe/Jev tripwire, already computed by app/pipeline.py against the
+raw email before either path above runs. It is used ONLY to short-circuit
+path (2): when the deterministic block (1) is absent AND the score is at
+or above the configured threshold, the (paid, slower) reader LLM call is
+skipped entirely and the request resolves straight to verb="unsupported"
+-- same outcome a genuine extraction failure produces, so a would-be
+attacker learns nothing about having been flagged. The score never
+affects path (1) -- see app/injection_screen.py's module docstring for
+why a classifier score must stay a tripwire, not a gate, everywhere else.
 """
 from __future__ import annotations
 
@@ -40,13 +53,37 @@ class ParsedRequest:
     request_id: str
     verb: str
     params: dict[str, Any] = field(default_factory=dict)
-    source: str = "block"  # "block" | "llm"
+    source: str = "block"  # "block" | "llm" | "screened"
 
 
-def parse_request(email_text: str, agentmail_message_id: str, reader_llm: ReaderLLM) -> ParsedRequest:
+def parse_request(
+    email_text: str,
+    agentmail_message_id: str,
+    reader_llm: ReaderLLM,
+    *,
+    injection_score: float | None = None,
+    injection_deny_threshold: float | None = None,
+) -> ParsedRequest:
     block_result = _parse_fenced_block(email_text)
     if block_result is not None:
         return block_result
+
+    # Freeform path only, below this point -- see the module docstring's
+    # "Injection pre-filter" section. `source="screened"` (rather than
+    # "llm") makes it visible in the audit log that the reader LLM was
+    # never even called for this request.
+    if (
+        injection_score is not None
+        and injection_deny_threshold is not None
+        and injection_score >= injection_deny_threshold
+    ):
+        return ParsedRequest(
+            request_id=fallback_request_id_for(agentmail_message_id),
+            verb="unsupported",
+            params={},
+            source="screened",
+        )
+
     return _parse_via_llm(email_text, agentmail_message_id, reader_llm)
 
 
