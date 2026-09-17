@@ -7,7 +7,7 @@ work, and emails back a short answer. The email thread plus a hash-chained log s
 audit trail. Background and decisions: `README.md` and `research/00-07`. How to run, deploy and
 kill it: `docs/RUNBOOK.md`.
 
-## Current state (as of 2026-09-16)
+## Current state (as of 2026-09-17)
 
 **Live on Cloud Run, including write access.** Refresh token re-minted with the new scopes and
 redeployed same day (2026-09-15).
@@ -44,21 +44,43 @@ redeployed same day (2026-09-15).
   security invariants are unchanged. Verified against the live Anthropic API and end-to-end
   against the deploy. The offline suite never caught it because the reader LLM was only ever run
   against a fake — hence the new live e2e suite (below).
-- Live revision: `data-gatekeeper-00011-2xk` (commit `f5579b3`, includes `42c5a88` reader-LLM
-  fix, `f49e15b`, `cffc5b0` and `974f3a8` too).
+- **TypeSafe/Jev injection-screening tripwire added (2026-09-17, commit `c121049`).**
+  `app/injection_screen.py` scores every inbound email (subject+body) with TypeSafe's Jev
+  `Noul` primitive for likely prompt-injection/jailbreak content — logged on every request as
+  `AuditRecord.injection_score`, **including the deterministic block path** (log-only, never
+  denied there). On the freeform/LLM-fallback path only, a score at/above
+  `INJECTION_DENY_THRESHOLD` (default `0.85`) skips the paid Anthropic reader-LLM call entirely
+  and resolves straight to `verb="unsupported"` — same generic reply any other unparseable
+  request gets, so nothing tips off an attacker that they were specifically flagged. This is
+  **additive, not the security boundary** — my own instinct going in was that it might replace
+  something, but research/03 §5 is explicit that classifiers are "a tripwire, not a gate," and
+  that's how it's wired: the quarantined reader LLM + Layer 3's from-scratch revalidation are
+  unchanged and remain the actual guarantee. Falls back to `NoOpInjectionScreen` (always `None`,
+  no-op) whenever `TYPESAFE_API_KEY` is unset, so the feature ships inert until turned on.
+  Verified against the real TypeSafe API before deploy (not just the stubbed-SDK offline
+  tests): benign requests scored ~0.02–0.03, injection attempts ~0.98–0.99 — comfortably either
+  side of the threshold. **Not yet verified with a full live AgentMail→Cloud Run round trip**
+  (only the direct TypeSafe API call and the offline pipeline suite) — a reasonable next
+  hand-test alongside the write-verb ones in "Open items" below.
+- Live revision: `data-gatekeeper-00014-mpj` (commit `c121049`, on top of everything from
+  `data-gatekeeper-00011-2xk`: `f5579b3`, `42c5a88` reader-LLM fix, `f49e15b`, `cffc5b0`,
+  `974f3a8`).
 - `GOOGLE_REFRESH_TOKEN`/`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` are now at Secret Manager
   version 2 (minted via `scripts/google_auth.py`, covering `gmail.compose` + `calendar.events`
   in addition to the original read scopes). `GOOGLE_DRIVE_FOLDER_ID` is still unset — first live
   `drive.create_file` call will create the folder and log its id; pin it once that happens.
-- Tests: `uv run pytest -q`, 253 passing, fully offline (fakes behind Protocols). Plus a **live
-  end-to-end suite** (`tests/test_e2e_live.py`, 4 tests, skipped unless `RUN_E2E=1`) that sends a
-  real email from `roishik10@gmail.com` to the gatekeeper and asserts on the real reply — the
-  first tests that actually cross AgentMail + Cloud Run + the reader LLM + Google, i.e. the layer
-  the offline fakes can't see. Covers: fenced-block gmail.search, freeform gmail.search + freeform
+- Tests: `uv run pytest -q`, 267 passing, fully offline (fakes behind Protocols). Plus two live
+  suites, both skipped unless `RUN_E2E=1`: **`tests/test_e2e_live.py`** (4 tests) sends a real
+  email from `roishik10@gmail.com` to the gatekeeper and asserts on the real reply — the tests
+  that actually cross AgentMail + Cloud Run + the reader LLM + Google, i.e. the layer the offline
+  fakes can't see. Covers: fenced-block gmail.search, freeform gmail.search + freeform
   calendar.list (reader-LLM path), and a gmail.search→create_draft **reply-in-thread** round trip.
-  Run with: `RUN_E2E=1 uv run pytest tests/test_e2e_live.py -v` (needs the owner OAuth creds +
-  `OWNER_EMAIL`/`GATEKEEPER_INBOX_ADDRESS` in env; sends real mail and consumes daily-cap slots,
-  so run deliberately). All 4 pass against `00011-2xk`.
+  **`tests/test_injection_screen_live.py`** (2 tests, added 2026-09-17) calls the real TypeSafe
+  API directly (cheap/fast, no AgentMail round trip needed) and asserts a plain request scores
+  low while an injection attempt scores at/above the deny threshold. Run either with
+  `RUN_E2E=1 uv run pytest tests/<file> -v` (the first needs the owner OAuth creds +
+  `OWNER_EMAIL`/`GATEKEEPER_INBOX_ADDRESS`; the second needs `TYPESAFE_API_KEY`; both send real
+  traffic, so run deliberately). All pass against `00014-mpj`.
 - First real round trip (me → gatekeeper, "calendar tomorrow") worked. The first version missed
   the shared "למשפחה" calendar because it read only primary; fixed in `521da72`.
 
@@ -122,6 +144,10 @@ through the security trade-offs before building. Key decisions, all mine, all de
    `calendar.update_event`/`delete_event`, and `drive.create_file` (confirm the folder gets
    created and pin `GOOGLE_DRIVE_FOLDER_ID` once it does). Only exercised against fakes so far.
    Once a given test's reply looks correct, archive that thread per the live-test rule below.
+   Same idea for the injection screen (2026-09-17): send a real freeform email with an obvious
+   injection payload and confirm via the audit-log sheet (`injection_score` +
+   `parsed_source=screened` on that request) that the deployed service actually gated it — only
+   the direct TypeSafe API call and the offline pipeline suite have been verified so far.
 4. Later: implement `drive.search` / `contacts.search`; the injection test suite in CI
    (promptfoo/AgentDojo) — now higher priority given write verbs have real external side
    effects to inject toward, and are now live; daily digest; a push-approval channel
@@ -156,7 +182,7 @@ writes, never literal content). Health: `GET /health` (Cloud Run reserves `/heal
 | GCP project / region | `data-gatekeeper-roishik` / `europe-west1` (billing linked) |
 | Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated) |
 | Runtime service account | `gatekeeper-run@data-gatekeeper-roishik.iam.gserviceaccount.com` (secretAccessor per secret only) |
-| Secret Manager | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `ANTHROPIC_API_KEY`, `AGENTMAIL_API_KEY`, `AGENTMAIL_WEBHOOK_SECRET` |
+| Secret Manager | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `ANTHROPIC_API_KEY`, `AGENTMAIL_API_KEY`, `AGENTMAIL_WEBHOOK_SECRET`, `TYPESAFE_API_KEY` (added 2026-09-17, `gatekeeper-run@...` granted `secretAccessor` on this one) |
 | Env vars (non-secret) | `AGENTMAIL_INBOX_ID`/`GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to`, `ALLOWED_SENDERS=roishikler@mail.instinct.com,roishik10@gmail.com`, `OWNER_EMAIL=roishik10@gmail.com`, `OWNER_TIMEZONE=Asia/Jerusalem`, `MAX_REQUESTS_PER_DAY=50` (raised from 20 on 2026-09-16 — the "10 requests" limit Instinct hit was NOT this cap, since the rate-limited reply never states a number; source still unconfirmed, likely Instinct's own platform), `ANTHROPIC_MODEL=claude-haiku-4-5-20251001`, `AUDIT_LOG_BACKEND=sheets`, `STATE_STORE_BACKEND=sheets` |
 | Audit log sheet | `GOOGLE_SHEETS_LOG_SPREADSHEET_ID=1Ra4fpTY2ABoD39tLE4UJpT7FuJrauK-CrdcHVA2fmY8` |
 | State sheet | `GOOGLE_SHEETS_STATE_SPREADSHEET_ID=1TjTLHMi1k01K4JWkiHJZ7OGtb8C5-8WUAlH-4RDe2YA` |
