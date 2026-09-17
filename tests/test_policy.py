@@ -42,14 +42,14 @@ def test_gmail_search_query_at_max_length_allowed():
     assert decision.status == "allowed"
 
 
-@pytest.mark.parametrize("max_results", [0, -1, 11, 100])
+@pytest.mark.parametrize("max_results", [0, -1, 31, 100])
 def test_gmail_search_max_results_out_of_bounds_denied(max_results):
     decision = evaluate_policy("gmail.search", {"query": "invoice", "max_results": max_results})
     assert decision.status == "denied"
     assert decision.error_code == "invalid_params"
 
 
-@pytest.mark.parametrize("max_results", [1, 5, 10])
+@pytest.mark.parametrize("max_results", [1, 5, 30])
 def test_gmail_search_max_results_in_bounds_allowed(max_results):
     decision = evaluate_policy("gmail.search", {"query": "invoice", "max_results": max_results})
     assert decision.status == "allowed"
