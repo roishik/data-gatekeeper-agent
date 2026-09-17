@@ -134,7 +134,14 @@ GOOGLE_GMAIL_USER = _env("GOOGLE_GMAIL_USER", "me")
 GOOGLE_DRIVE_FOLDER_ID = _env("GOOGLE_DRIVE_FOLDER_ID")
 
 # ── Reply guard (Layer 5) ────────────────────────────────────────────────
-REPLY_MAX_CHARS = _env_int("REPLY_MAX_CHARS", 4000)
+# The cap always still exists (app/reply_guard.py truncates the prose,
+# never the machine-readable status block, past this point) -- raised
+# from the original 4000 to 25000 (2026-09-17, owner request, after
+# raising gmail.search's own max_results made 4000 too tight for a full
+# 30-result reply). Not the same limit as AgentMail's own message size
+# cap, if it has one -- unverified either way (see agentmail_client.py's
+# "NOT exercised against a live AgentMail API call" caveat).
+REPLY_MAX_CHARS = _env_int("REPLY_MAX_CHARS", 25000)
 
 # ── Audit log ─────────────────────────────────────────────────────────────
 # "jsonl" for local/dev/tests, "sheets" for prod (see app/audit_log.py).

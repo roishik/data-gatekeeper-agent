@@ -3,6 +3,7 @@ verified sender, with BCC set"."""
 from __future__ import annotations
 
 from app.calendar_executor import CalendarEvent
+from app.config import REPLY_MAX_CHARS
 from app.drive_executor import DriveFileResult
 from app.gmail_executor import DraftResult, GmailResult
 from app.request_parser import ParsedRequest
@@ -71,13 +72,17 @@ def test_render_reply_denied_sensitive_query():
 
 
 def test_render_reply_size_cap_preserves_status_block():
+    # Enough results to comfortably exceed REPLY_MAX_CHARS regardless of its
+    # configured value, so this test keeps exercising the truncation path
+    # (rather than silently passing because the reply happened to fit).
+    result_count = (REPLY_MAX_CHARS // 300) + 20
     parsed = ParsedRequest(request_id="req_4", verb="gmail.search", params={"query": "x"}, source="block")
     results = [
         GmailResult(message_id=f"m{i}", sender="a@example.com", subject="s" * 300, date="d", snippet="s" * 300)
-        for i in range(20)
+        for i in range(result_count)
     ]
     body = render_reply(parsed, "completed", None, gmail_results=results)
-    assert len(body) <= 4000 + 200  # small slack for the block itself, which is never truncated
+    assert len(body) <= REPLY_MAX_CHARS + 200  # small slack for the block itself, which is never truncated
     assert "---GATEKEEPER-RESPONSE---" in body
     assert "request_id: req_4" in body
     assert "---END---" in body
