@@ -121,6 +121,7 @@ through the security trade-offs before building. Key decisions, all mine, all de
    lands, unsent, in Gmail), `calendar.create_event` (with and without an attendee),
    `calendar.update_event`/`delete_event`, and `drive.create_file` (confirm the folder gets
    created and pin `GOOGLE_DRIVE_FOLDER_ID` once it does). Only exercised against fakes so far.
+   Once a given test's reply looks correct, archive that thread per the live-test rule below.
 4. Later: implement `drive.search` / `contacts.search`; the injection test suite in CI
    (promptfoo/AgentDojo) — now higher priority given write verbs have real external side
    effects to inject toward, and are now live; daily digest; a push-approval channel
@@ -194,6 +195,13 @@ classifier also blocks it without explicit approval.
   access design" above), not an oversight. Don't quietly extend that exception's *reach* (e.g.
   giving some future verb a real send with an unfiltered recipient) without the same explicit
   conversation.
+- **After a successful live test, archive the thread.** When testing the agent's behavior live —
+  sending a real request from `roishik10@gmail.com` to the gatekeeper and confirming the reply
+  looks correct — archive that Gmail thread (the outgoing request + the AgentMail/gatekeeper
+  reply) once satisfied. This is an active step to actually perform (e.g. via the Gmail
+  archive action), not just something to note happened; it keeps the inbox free of test
+  traffic from the live e2e suite and the hand-tests in "Open items" above. Only archive after
+  confirming the result is good — a failed or ambiguous test should stay visible for debugging.
 - Match the existing style (plain Python, Protocol + fake for every external boundary, module
   docstrings explaining the security reasoning). Run the tests before committing.
 - The old personal site deploy script (`personal_links-fixed/deploy.sh`) builds from the
