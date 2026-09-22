@@ -25,9 +25,13 @@ Two backends behind the AuditLog Protocol:
     Per research/07 section 4's own finding, a Sheets log alone is NOT
     strong tamper-evidence on its own (the same credential that appends
     can also rewrite/delete rows) -- the hash chain here makes tampering
-    DETECTABLE, and the BCC'd email thread (app/reply_guard.py) is the
-    second, harder-to-reach copy that research/07 recommends relying on
-    for real tamper resistance.
+    DETECTABLE. Until 2026-09-22 every reply was also BCC'd to the owner's
+    Gmail -- a second copy in a separate account, as research/07
+    recommends for real tamper resistance. The owner dropped that BCC
+    (AgentMail's own thread history gives full visibility); the trade-off
+    is that AgentMail's copy sits in an inbox this service's own API key
+    can modify, so this hash chain is now the only tamper-EVIDENT record
+    (scripts/verify_audit_chain.py checks it).
 """
 from __future__ import annotations
 
@@ -50,16 +54,24 @@ _FIELD_ORDER = [
     "parsed_request_id", "parsed_verb", "parsed_source",
     "injection_score",
     "policy_status", "policy_error_code",
+    # What the requester was actually told (added 2026-09-22): the policy
+    # verdict alone can't show a duplicate, an error, or a rate limit.
+    "reply_status", "reply_error_code",
     "result_count", "gmail_message_ids", "calendar_event_ids", "reply_message_id",
+    # Failures (added 2026-09-22 -- see app/failures.py): a code, the layer
+    # it escaped from, and the exception CLASS name only, never its message,
+    # which can echo request content. `reply_error` is set when the reply
+    # itself could not be sent.
+    "reply_error", "failure_code", "failure_stage", "failure_type",
     "llm_input_tokens", "llm_output_tokens",
     # Write-verb outcomes. Unlike reads, minimization does NOT apply here
     # -- accountability for a write means the log should say exactly what
     # was sent/created/changed/deleted and to/on what, not just that some
     # verb ran (see module docstring point 2's read-side rationale, which
     # deliberately does not extend to these). The literal subject/body/
-    # title text still isn't logged here -- that's what the BCC'd reply
-    # (app/reply_guard.py) is for, same "audit log = tamper-evident ids,
-    # email thread = human-readable content" split as everything else.
+    # title text still isn't logged here -- that's what the AgentMail reply
+    # thread is for, same "audit log = tamper-evident ids, email thread =
+    # human-readable content" split as everything else.
     "draft_id", "draft_to", "created_event_id", "updated_event_id",
     "deleted_event_id", "drive_file_id",
 ]
@@ -82,6 +94,8 @@ class AuditRecord:
     injection_score: float | None = None
     policy_status: str | None = None
     policy_error_code: str | None = None
+    reply_status: str | None = None
+    reply_error_code: str | None = None
     result_count: int = 0
     gmail_message_ids: tuple[str, ...] = field(default_factory=tuple)
     # Event ids only, never a summary/title -- see app/calendar_executor.py
@@ -89,6 +103,10 @@ class AuditRecord:
     # which applies identically here.
     calendar_event_ids: tuple[str, ...] = field(default_factory=tuple)
     reply_message_id: str | None = None
+    reply_error: str | None = None
+    failure_code: str | None = None
+    failure_stage: str | None = None
+    failure_type: str | None = None
     llm_input_tokens: int | None = None
     llm_output_tokens: int | None = None
     draft_id: str | None = None
@@ -225,7 +243,7 @@ class SheetsAuditLog:
         # shape is expected to grow (new verbs, new verdicts), and a
         # single-column append needs no migration when AuditRecord gains
         # a field. Costs "not human-skimmable without opening a cell" --
-        # an accepted tradeoff, since the BCC'd email thread is the
+        # an accepted tradeoff, since the AgentMail thread is the
         # human-readable log; this one is the tamper-evident one.
         self._service.spreadsheets().values().append(
             spreadsheetId=self.spreadsheet_id,

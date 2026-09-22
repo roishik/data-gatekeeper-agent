@@ -13,7 +13,7 @@ the brief, across both implemented verbs:
      otherwise rendered inert) before it can reach the reply.
 
 Plus: dedupe, the daily cap, non-allowlisted senders never being
-answered, "reply only to the sender, with BCC set" at the full pipeline
+answered, "reply only to the sender, no cc/bcc" at the full pipeline
 level, a free-text "tomorrow" request through the fake reader LLM, and
 not_implemented still holding for drive/contacts (unit-level versions of
 most of these live in their own layer's test file; these confirm the
@@ -89,7 +89,7 @@ def test_valid_gmail_search_request_completes_and_replies_only_to_sender(configu
     assert fake_gmail.calls[0]["query"] == "invoice"
     assert len(agentmail.calls) == 1
     assert agentmail.calls[0]["to"] == configured_env["sender"]
-    assert agentmail.calls[0]["bcc"] == configured_env["owner_email"]
+    assert set(agentmail.calls[0]) == {"inbox_id", "message_id", "to", "text"}  # no cc/bcc field at all
     assert "status: completed" in agentmail.calls[0]["text"]
 
 
@@ -164,11 +164,16 @@ def test_duplicate_request_id_in_a_new_message_is_not_reprocessed(configured_env
     body2 = make_body(message_id="msg_2", text=text)  # different AgentMail message, same request_id
 
     outcome1, _, _ = _call(body1, state_store=store, agentmail_client=agentmail, audit_log=audit_log)
-    outcome2, _, _ = _call(body2, state_store=store, agentmail_client=agentmail, audit_log=audit_log)
+    outcome2, gmail2, _ = _call(body2, state_store=store, agentmail_client=agentmail, audit_log=audit_log)
 
     assert outcome1.reason == "processed"
     assert outcome2.reason == "duplicate_request"
-    assert len(agentmail.calls) == 1
+    assert gmail2.calls == []  # not run again...
+    # ...but, unlike a redelivered MESSAGE, a resent request is answered, so
+    # the requester learns why nothing new happened.
+    assert len(agentmail.calls) == 2
+    assert "status: duplicate" in agentmail.calls[1]["text"]
+    assert "error_code: duplicate_request" in agentmail.calls[1]["text"]
 
 
 def test_daily_cap_blocks_further_requests(configured_env, audit_log, monkeypatch):

@@ -1,27 +1,50 @@
 """
 pipeline.py — wires Layers 0-5 together for a single inbound webhook
-event, and writes exactly one AuditRecord no matter where processing
-stops.
+event.
 
 app/main.py's FastAPI route does almost nothing itself: it hands the raw
 body + headers to `handle_webhook()` below and returns whatever HTTP
 status it's told to. Keeping the actual logic here, not in main.py, is
 what makes the whole pipeline testable without an HTTP client or any
 real credentials -- see tests/test_pipeline_injection.py.
+
+Guarantees, in order of where processing can stop:
+
+  1. An UNSIGNED/forged webhook (bad signature, stale timestamp) is
+     rejected, never answered, and logged to Cloud Logging only -- NOT to
+     the Sheets audit log. The public endpoint is reachable by anyone, and
+     writing a Sheets row per unauthenticated POST made it free to burn the
+     Sheets write quota and bloat the tamper-evident log (found 2026-09-19).
+  2. A signed event that's rejected at Layer 0 (wrong inbox, sender not on
+     the allowlist, own-inbox loop, unrecognized payload) is never answered
+     but IS audited: it's real mail, and seeing it is the point.
+  3. Anything that fails BEFORE a message is marked seen propagates as a
+     5xx, so AgentMail retries it -- nothing has happened yet.
+  4. From the moment a message is marked seen, every path -- success, a
+     denial, a duplicate, or any exception anywhere in Layers 1-4 -- ends
+     in exactly one reply attempt to the verified sender and exactly one
+     audit record. An exception becomes `status: error` with a code from
+     app/failures.py; a failed reply send is recorded on that same audit
+     record (`reply_error`) rather than lost.
+  5. A write verb's request status is set to `effect_done` as soon as the
+     side effect has happened, BEFORE the reply is attempted, so a resend of
+     the same request_id after a failed reply can never repeat the write
+     (see app/state_store.py).
 """
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from app.agentmail_client import AgentMailClient
 from app.audit_log import AuditLog, AuditRecord
 from app.calendar_executor import CalendarClient, CalendarEvent
 from app.calendar_window import resolve_window
-from app.config import AGENTMAIL_INBOX_ID, INJECTION_DENY_THRESHOLD, MAX_REQUESTS_PER_DAY, OWNER_EMAIL, OWNER_TIMEZONE
+from app.config import AGENTMAIL_INBOX_ID, INJECTION_DENY_THRESHOLD, MAX_REQUESTS_PER_DAY, OWNER_TIMEZONE
 from app.drive_executor import DriveClient, DriveFileResult
+from app.failures import GatekeeperDenied, classify_failure
 from app.gmail_executor import DraftResult, GmailClient, GmailResult
 from app.ingress import check_event, parsed_sender_address, verify_signature
 from app.injection_screen import InjectionScreen
@@ -37,9 +60,15 @@ from app.policy import (
     evaluate_policy,
 )
 from app.reader_llm import ReaderLLM
-from app.reply_guard import render_reply, send_reply
-from app.request_parser import ParsedRequest, parse_request
-from app.state_store import REQUEST_COMPLETED, REQUEST_PROCESSING, is_duplicate_request_status
+from app.reply_guard import render_minimal_reply, render_reply, send_reply
+from app.request_parser import ParsedRequest, fallback_request_id_for, parse_request
+from app.state_store import (
+    REQUEST_COMPLETED,
+    REQUEST_EFFECT_DONE,
+    REQUEST_FAILED,
+    REQUEST_PROCESSING,
+    is_duplicate_request_status,
+)
 
 logger = logging.getLogger("gatekeeper.pipeline")
 
@@ -47,22 +76,72 @@ logger = logging.getLogger("gatekeeper.pipeline")
 @dataclass(frozen=True)
 class WebhookOutcome:
     http_status: int
-    reason: str
+    reason: str  # internal only -- app/main.py never echoes it to the caller
+
+
+@dataclass
+class ExecutionResults:
+    """What Layer 4 produced. At most one field is populated per request
+    (exactly one verb runs), but each is kept separate so one verb's
+    result can never be handed to another verb's formatter."""
+
+    gmail_results: list[GmailResult] | None = None
+    calendar_results: list[CalendarEvent] | None = None
+    draft_result: DraftResult | None = None
+    created_event: CalendarEvent | None = None
+    updated_event: CalendarEvent | None = None
+    deleted_event_id: str | None = None
+    drive_file_result: DriveFileResult | None = None
+
+    @property
+    def wrote(self) -> bool:
+        return any((self.draft_result, self.created_event, self.updated_event, self.deleted_event_id, self.drive_file_result))
+
+    def render_kwargs(self) -> dict[str, Any]:
+        return {
+            "gmail_results": self.gmail_results,
+            "calendar_results": self.calendar_results,
+            "draft_result": self.draft_result,
+            "created_event": self.created_event,
+            "updated_event": self.updated_event,
+            "deleted_event_id": self.deleted_event_id,
+            "drive_file_result": self.drive_file_result,
+        }
+
+
+@dataclass
+class _RequestState:
+    """Everything one request accumulates on its way through Layers 1-5,
+    so the single reply and the single audit record at the end can be
+    built from one place however far processing got."""
+
+    message_id: str
+    sender: str
+    parsed: ParsedRequest
+    layer1: str = "ok"
+    injection_score: float | None = None
+    llm_usage: dict[str, int] | None = None
+    decision: PolicyDecision | None = None
+    results: ExecutionResults = field(default_factory=ExecutionResults)
+    reply_status: str = "error"
+    error_code: str | None = "internal_error"
+    retryable: bool = False
+    request_started: bool = False  # set once request status 'processing' was written
+    failure_code: str | None = None
+    failure_stage: str | None = None
+    failure_type: str | None = None
+    reply_message_id: str | None = None
+    reply_error: str | None = None
+    outcome_reason: str = "processed"
 
 
 def extract_message_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
     """Pulls the fields this pipeline needs out of an AgentMail webhook
-    JSON body. The envelope shape (`event_type` at the top level,
-    dot-notation values like "message.received", fields nested under
-    `"message"`, `message.message_id`, `message.from`) was confirmed
-    against AgentMail's current published API reference (raw markdown
-    fetched during this build) -- see the final build report. Still NOT
-    exercised against a live webhook delivery, so a couple of plausible
-    key-name variants (`type` alongside `event_type`, `id` alongside
-    `message_id`) are accepted defensively in case a real delivery
-    differs from the reference doc in some small way; returns None if
-    the payload doesn't look like a message event at all, which the
-    caller treats as an ignored (never a trusted) event."""
+    JSON body (`event_type` at the top level, fields nested under
+    `"message"`). A couple of plausible key-name variants (`type` alongside
+    `event_type`, `id` alongside `message_id`) are accepted defensively;
+    returns None if the payload doesn't look like a message event at all,
+    which the caller treats as an ignored (never a trusted) event."""
     if not isinstance(payload, dict):
         return None
 
@@ -112,40 +191,28 @@ def handle_webhook(
     for signature verification -- the two must be consistent in real
     use, which app/main.py guarantees by parsing `body` itself.
 
-    `gmail_client_factory`/`calendar_client_factory`/`drive_client_factory`
-    are zero-arg callables rather than client instances so a (possibly
-    credentialed) client is constructed only on the one request path that
-    actually reaches Layer 4 for that verb -- a gmail.search request
-    never touches Calendar or Drive credentials, and vice versa."""
+    The client factories are zero-arg callables rather than client
+    instances so a (possibly credentialed) client is constructed only on
+    the one request path that actually reaches Layer 4 for that verb."""
+    # ── Layer 0: authenticity ────────────────────────────────────────────
     sig_verdict = verify_signature(body, svix_id, svix_timestamp, svix_signature)
-
-    # Best-effort extraction of a message id / sender for the audit log
-    # EVEN when the signature is invalid -- an unauthenticated or
-    # forged webhook attempt is itself worth a tamper-evident record
-    # (research/03 section 4.6, anomaly detection), clearly distinct
-    # from a genuine, verified request. These values are UNVERIFIED and
-    # must never be used for anything but logging.
-    claimed_message_id = "unknown"
-    claimed_sender = "unknown"
-    data: dict[str, Any] | None = None
-    try:
-        data = payload if payload is not None else json.loads(body)
-        probe = extract_message_fields(data) if isinstance(data, dict) else None
-        if probe:
-            claimed_message_id = probe["message_id"]
-            claimed_sender = parsed_sender_address(probe["sender"])
-    except Exception:
-        data = None
-
     if not sig_verdict.accepted:
-        logger.info("webhook rejected at layer 0: %s", sig_verdict.reason)
-        _log_audit(audit_log, claimed_message_id, claimed_sender, layer0=sig_verdict.reason, layer1="not_reached")
+        # Unauthenticated -- Cloud Logging only, never the Sheets audit log
+        # (module docstring, guarantee 1).
+        logger.warning("unsigned webhook rejected at layer 0 (not audited): %s", sig_verdict.reason)
         return WebhookOutcome(202, sig_verdict.reason)
 
+    try:
+        data = payload if payload is not None else json.loads(body)
+    except Exception:
+        data = None
     fields = extract_message_fields(data) if isinstance(data, dict) else None
     if fields is None:
         logger.info("webhook rejected at layer 0: unrecognized_payload_shape")
-        _log_audit(audit_log, claimed_message_id, claimed_sender, layer0="unrecognized_payload_shape", layer1="not_reached")
+        _append_audit(audit_log, AuditRecord(
+            agentmail_message_id="unknown", sender="unknown",
+            layer0_verdict="unrecognized_payload_shape", layer1_verdict="not_reached",
+        ))
         return WebhookOutcome(202, "unrecognized_payload_shape")
 
     message_id = fields["message_id"]
@@ -154,135 +221,162 @@ def handle_webhook(
     event_verdict = check_event(event_type=fields["event_type"], inbox_id=fields["inbox_id"], sender_header=fields["sender"])
     if not event_verdict.accepted:
         logger.info("webhook rejected at layer 0: %s", event_verdict.reason)
-        _log_audit(audit_log, message_id, sender_address, layer0=event_verdict.reason, layer1="not_reached")
+        _append_audit(audit_log, AuditRecord(
+            agentmail_message_id=message_id, sender=sender_address,
+            layer0_verdict=event_verdict.reason, layer1_verdict="not_reached",
+        ))
         return WebhookOutcome(202, event_verdict.reason)  # rejected, never answered
 
-    # ── Layer 1: idempotency + daily cap ────────────────────────────────
+    # ── Layer 1: message dedupe ──────────────────────────────────────────
+    # Deliberately unguarded: a failure here propagates as a 5xx and
+    # AgentMail retries, because nothing has happened yet (guarantee 3).
     if state_store.is_duplicate_message(message_id):
-        _log_audit(audit_log, message_id, sender_address, layer0="ok", layer1="duplicate_message")
-        return WebhookOutcome(200, "duplicate_message")
+        _append_audit(audit_log, AuditRecord(
+            agentmail_message_id=message_id, sender=sender_address,
+            layer0_verdict="ok", layer1_verdict="duplicate_message",
+        ))
+        return WebhookOutcome(200, "duplicate_message")  # that message already got its reply
     state_store.mark_message_seen(message_id)
 
-    if state_store.count_today(sender_address) >= MAX_REQUESTS_PER_DAY:
-        _log_audit(audit_log, message_id, sender_address, layer0="ok", layer1="rate_limited")
-        _reply(agentmail_client, message_id, sender_address, _unresolved_request(message_id), "error", "rate_limited")
-        return WebhookOutcome(200, "rate_limited")
-
-    # ── Injection screen (additive tripwire, not a layer of its own --
-    # see app/injection_screen.py). Scored on subject + body together
-    # (research/03's OpenClaw lesson: the subject line is just as
-    # attacker-influenced as the body) BEFORE parsing, so its score is
-    # available to both the audit log and Layer 2's freeform-path
-    # short-circuit below, regardless of which path resolves the request.
-    injection_score = injection_screen.screen(f"Subject: {fields['subject']}\n\n{fields['text']}")
-
-    # ── Layer 2: parse ───────────────────────────────────────────────────
-    parsed = parse_request(
-        fields["text"],
-        message_id,
-        reader_llm,
-        injection_score=injection_score,
-        injection_deny_threshold=INJECTION_DENY_THRESHOLD,
-    )
-    llm_usage = getattr(reader_llm, "last_usage", None) if parsed.source == "llm" else None
-
-    if is_duplicate_request_status(state_store.get_request_status(parsed.request_id)):
-        _log_audit(
-            audit_log, message_id, sender_address, layer0="ok", layer1="duplicate_request",
-            parsed=parsed, injection_score=injection_score,
+    # ── From here on: exactly one reply + one audit record (guarantee 4) ─
+    state = _RequestState(message_id=message_id, sender=sender_address, parsed=_unresolved_request(message_id))
+    stage = "layer1"
+    try:
+        stage = _run_request(
+            state, fields,
+            state_store=state_store, reader_llm=reader_llm, injection_screen=injection_screen,
+            gmail_client_factory=gmail_client_factory, calendar_client_factory=calendar_client_factory,
+            drive_client_factory=drive_client_factory,
         )
-        return WebhookOutcome(200, "duplicate_request")
-    state_store.set_request_status(parsed.request_id, REQUEST_PROCESSING, sender_address)
-    state_store.record_request(sender_address, parsed.request_id)
-
-    # ── Layer 3: policy ──────────────────────────────────────────────────
-    decision = evaluate_policy(parsed.verb, parsed.params)
-
-    # ── Layer 4: executor (only for an allowed verb -- exactly one
-    # verb, read or write, runs per request) ────────────────────────────
-    gmail_results: list[GmailResult] | None = None
-    calendar_results: list[CalendarEvent] | None = None
-    draft_result: DraftResult | None = None
-    created_event: CalendarEvent | None = None
-    updated_event: CalendarEvent | None = None
-    deleted_event_id: str | None = None
-    drive_file_result: DriveFileResult | None = None
-    if decision.status == "allowed" and isinstance(decision.params, GmailSearchParams):
-        gmail_client = gmail_client_factory()
-        gmail_results = gmail_client.search(
-            query=decision.params.query,
-            max_results=decision.params.max_results,
-            newer_than_days=decision.params.newer_than_days,
-        )
-    elif decision.status == "allowed" and isinstance(decision.params, GmailCreateDraftParams):
-        gmail_client = gmail_client_factory()
-        draft_result = gmail_client.create_draft(
-            to=decision.params.to, subject=decision.params.subject, body=decision.params.body,
-            thread_id=decision.params.thread_id,
-        )
-    elif decision.status == "allowed" and isinstance(decision.params, CalendarListEventsParams):
-        window = resolve_window(decision.params.day_offset, decision.params.days, OWNER_TIMEZONE)
-        calendar_client = calendar_client_factory()
-        calendar_results = calendar_client.list_events(
-            time_min=window.time_min, time_max=window.time_max, max_results=decision.params.max_results
-        )
-    elif decision.status == "allowed" and isinstance(decision.params, CalendarCreateEventParams):
-        calendar_client = calendar_client_factory()
-        created_event = calendar_client.create_event(
-            title=decision.params.title,
-            day_offset=decision.params.day_offset,
-            start_time=decision.params.start_time,
-            duration_minutes=decision.params.duration_minutes,
-            attendees=decision.params.attendees,
-        )
-    elif decision.status == "allowed" and isinstance(decision.params, CalendarUpdateEventParams):
-        calendar_client = calendar_client_factory()
-        updated_event = calendar_client.update_event(
-            event_id=decision.params.event_id,
-            title=decision.params.title,
-            day_offset=decision.params.day_offset,
-            start_time=decision.params.start_time,
-            duration_minutes=decision.params.duration_minutes,
-            attendees=decision.params.attendees,
-        )
-    elif decision.status == "allowed" and isinstance(decision.params, CalendarDeleteEventParams):
-        calendar_client = calendar_client_factory()
-        calendar_client.delete_event(event_id=decision.params.event_id)
-        deleted_event_id = decision.params.event_id
-    elif decision.status == "allowed" and isinstance(decision.params, DriveCreateFileParams):
-        drive_client = drive_client_factory()
-        drive_file_result = drive_client.create_file(name=decision.params.name, content=decision.params.content)
-
-    reply_status, error_code = _status_for_decision(decision)
+    except GatekeeperDenied as denied:
+        state.reply_status, state.error_code, state.retryable = "denied", denied.error_code, False
+    except Exception as exc:
+        failure = classify_failure(exc)
+        stage = getattr(exc, "_gatekeeper_stage", stage)
+        logger.exception("request %s failed at %s (%s)", state.parsed.request_id, stage, failure.code)
+        state.reply_status, state.error_code, state.retryable = "error", failure.code, failure.retryable
+        state.failure_code, state.failure_stage, state.failure_type = failure.code, stage, failure.type_name
+        state.outcome_reason = "failed"
 
     # ── Layer 5: reply ───────────────────────────────────────────────────
-    reply_result = _reply(
-        agentmail_client, message_id, sender_address, parsed, reply_status, error_code, gmail_results, calendar_results,
-        draft_result=draft_result, created_event=created_event, updated_event=updated_event,
-        deleted_event_id=deleted_event_id, drive_file_result=drive_file_result,
-    )
+    _send(state, agentmail_client)
+    _append_audit(audit_log, _audit_record(state))
+    _finalize_request_status(state, state_store)
+    return WebhookOutcome(200, state.outcome_reason)
 
-    _log_audit(
-        audit_log,
-        message_id,
-        sender_address,
-        layer0="ok",
-        layer1="ok",
-        parsed=parsed,
-        decision=decision,
-        gmail_results=gmail_results,
-        draft_result=draft_result,
-        created_event=created_event,
-        updated_event=updated_event,
-        deleted_event_id=deleted_event_id,
-        drive_file_result=drive_file_result,
-        calendar_results=calendar_results,
-        reply_message_id=reply_result.message_id if reply_result else None,
-        llm_usage=llm_usage,
-        injection_score=injection_score,
-    )
-    state_store.set_request_status(parsed.request_id, REQUEST_COMPLETED, sender_address)
-    return WebhookOutcome(200, "processed")
+
+def _run_request(
+    state: _RequestState,
+    fields: dict[str, Any],
+    *,
+    state_store,
+    reader_llm: ReaderLLM,
+    injection_screen: InjectionScreen,
+    gmail_client_factory: Callable[[], GmailClient],
+    calendar_client_factory: Callable[[], CalendarClient],
+    drive_client_factory: Callable[[], DriveClient],
+) -> str:
+    """Layers 1 (cap, request dedupe) through 4. Returns normally for every
+    handled outcome -- including denials, duplicates and the rate limit --
+    and records the reply to send on `state`. Raises for anything broken;
+    handle_webhook turns that into an error reply. Tags any exception with
+    the stage it escaped from, for the audit record."""
+    stage = "layer1"
+    try:
+        if state_store.count_today(state.sender) >= MAX_REQUESTS_PER_DAY:
+            state.layer1 = "rate_limited"
+            state.reply_status, state.error_code = "error", "rate_limited"
+            state.outcome_reason = "rate_limited"
+            return stage
+
+        # ── Injection screen (additive tripwire -- app/injection_screen.py).
+        # Subject + body together: the subject line is just as
+        # attacker-influenced as the body (research/03's OpenClaw lesson).
+        stage = "screen"
+        state.injection_score = injection_screen.screen(f"Subject: {fields['subject']}\n\n{fields['text']}")
+
+        # ── Layer 2: parse ───────────────────────────────────────────────
+        stage = "layer2"
+        state.parsed = parse_request(
+            fields["text"], state.message_id, reader_llm,
+            injection_score=state.injection_score, injection_deny_threshold=INJECTION_DENY_THRESHOLD,
+        )
+        if state.parsed.source == "llm":
+            state.llm_usage = getattr(reader_llm, "last_usage", None)
+
+        # ── Layer 1 (cont.): request dedupe, now that we know the id ─────
+        stage = "layer1"
+        prior_status = state_store.get_request_status(state.parsed.request_id)
+        if is_duplicate_request_status(prior_status):
+            state.layer1 = "duplicate_request"
+            state.reply_status, state.error_code = "duplicate", "duplicate_request"
+            state.outcome_reason = "duplicate_request"
+            return stage
+        state_store.set_request_status(state.parsed.request_id, REQUEST_PROCESSING, state.sender)
+        state.request_started = True
+        state_store.record_request(state.sender, state.parsed.request_id)
+
+        # ── Layer 3: policy ──────────────────────────────────────────────
+        stage = "layer3"
+        state.decision = evaluate_policy(state.parsed.verb, state.parsed.params)
+
+        # ── Layer 4: executor ────────────────────────────────────────────
+        stage = "layer4"
+        state.results = _execute(state.decision, state.parsed, gmail_client_factory, calendar_client_factory, drive_client_factory)
+        if state.results.wrote:
+            stage = "layer1"
+            state_store.set_request_status(state.parsed.request_id, REQUEST_EFFECT_DONE, state.sender)
+
+        state.reply_status, state.error_code = _status_for_decision(state.decision)
+        state.retryable = False
+        return stage
+    except Exception as exc:
+        exc._gatekeeper_stage = stage  # type: ignore[attr-defined]
+        raise
+
+
+def _execute(
+    decision: PolicyDecision,
+    parsed: ParsedRequest,
+    gmail_client_factory: Callable[[], GmailClient],
+    calendar_client_factory: Callable[[], CalendarClient],
+    drive_client_factory: Callable[[], DriveClient],
+) -> ExecutionResults:
+    """Layer 4: only for an allowed verb -- exactly one verb, read or
+    write, runs per request."""
+    results = ExecutionResults()
+    if decision.status != "allowed":
+        return results
+    params = decision.params
+    if isinstance(params, GmailSearchParams):
+        results.gmail_results = gmail_client_factory().search(
+            query=params.query, max_results=params.max_results, newer_than_days=params.newer_than_days,
+        )
+    elif isinstance(params, GmailCreateDraftParams):
+        results.draft_result = gmail_client_factory().create_draft(
+            to=params.to, subject=params.subject, body=params.body, thread_id=params.thread_id,
+        )
+    elif isinstance(params, CalendarListEventsParams):
+        window = resolve_window(params.day_offset, params.days, OWNER_TIMEZONE)
+        results.calendar_results = calendar_client_factory().list_events(
+            time_min=window.time_min, time_max=window.time_max, max_results=params.max_results,
+        )
+    elif isinstance(params, CalendarCreateEventParams):
+        results.created_event = calendar_client_factory().create_event(
+            title=params.title, day_offset=params.day_offset, start_time=params.start_time,
+            duration_minutes=params.duration_minutes, attendees=params.attendees,
+        )
+    elif isinstance(params, CalendarUpdateEventParams):
+        results.updated_event = calendar_client_factory().update_event(
+            event_id=params.event_id, title=params.title, day_offset=params.day_offset,
+            start_time=params.start_time, duration_minutes=params.duration_minutes, attendees=params.attendees,
+        )
+    elif isinstance(params, CalendarDeleteEventParams):
+        calendar_client_factory().delete_event(event_id=params.event_id)
+        results.deleted_event_id = params.event_id
+    elif isinstance(params, DriveCreateFileParams):
+        results.drive_file_result = drive_client_factory().create_file(name=params.name, content=params.content)
+    return results
 
 
 def _status_for_decision(decision: PolicyDecision) -> tuple[str, str | None]:
@@ -292,90 +386,111 @@ def _status_for_decision(decision: PolicyDecision) -> tuple[str, str | None]:
 
 
 def _unresolved_request(message_id: str) -> ParsedRequest:
-    return ParsedRequest(request_id=f"unresolved-{message_id}", verb="unsupported", params={}, source="block")
+    """Stand-in until (or if) Layer 2 resolves a real request -- the
+    request_id is still stable per message, so a reply is always
+    correlatable."""
+    return ParsedRequest(request_id=fallback_request_id_for(message_id), verb="unsupported", params={}, source="block")
 
 
-def _reply(
-    agentmail_client: AgentMailClient,
-    message_id: str,
-    sender_address: str,
-    parsed: ParsedRequest,
-    status: str,
-    error_code: str | None,
-    gmail_results: list[GmailResult] | None = None,
-    calendar_results: list[CalendarEvent] | None = None,
-    *,
-    draft_result: DraftResult | None = None,
-    created_event: CalendarEvent | None = None,
-    updated_event: CalendarEvent | None = None,
-    deleted_event_id: str | None = None,
-    drive_file_result: DriveFileResult | None = None,
-):
-    body = render_reply(
-        parsed, status, error_code, gmail_results, calendar_results,
-        draft_result=draft_result, created_event=created_event, updated_event=updated_event,
-        deleted_event_id=deleted_event_id, drive_file_result=drive_file_result,
-    )
-    return send_reply(
-        agentmail_client,
-        inbox_id=AGENTMAIL_INBOX_ID or "",
-        agentmail_message_id=message_id,
-        sender_address=sender_address,
-        bcc_address=OWNER_EMAIL or "",
-        body=body,
-    )
-
-
-def _log_audit(
-    audit_log: AuditLog,
-    message_id: str,
-    sender: str,
-    *,
-    layer0: str,
-    layer1: str,
-    parsed: ParsedRequest | None = None,
-    decision: PolicyDecision | None = None,
-    gmail_results: list[GmailResult] | None = None,
-    calendar_results: list[CalendarEvent] | None = None,
-    reply_message_id: str | None = None,
-    llm_usage: dict[str, int] | None = None,
-    draft_result: DraftResult | None = None,
-    created_event: CalendarEvent | None = None,
-    updated_event: CalendarEvent | None = None,
-    deleted_event_id: str | None = None,
-    drive_file_result: DriveFileResult | None = None,
-    injection_score: float | None = None,
-) -> None:
-    write_result_count = sum(
-        1 for r in (draft_result, created_event, updated_event, deleted_event_id, drive_file_result) if r
-    )
-    audit_log.append(
-        AuditRecord(
-            agentmail_message_id=message_id,
-            sender=sender,
-            layer0_verdict=layer0,
-            layer1_verdict=layer1,
-            parsed_request_id=parsed.request_id if parsed else None,
-            parsed_verb=parsed.verb if parsed else None,
-            parsed_source=parsed.source if parsed else None,
-            injection_score=injection_score,
-            policy_status=decision.status if decision else None,
-            policy_error_code=decision.error_code if decision else None,
-            result_count=(
-                (len(gmail_results) if gmail_results else 0)
-                + (len(calendar_results) if calendar_results else 0)
-                + write_result_count
-            ),
-            gmail_message_ids=tuple(r.message_id for r in gmail_results) if gmail_results else (),
-            calendar_event_ids=tuple(e.event_id for e in calendar_results) if calendar_results else (),
-            reply_message_id=reply_message_id,
-            llm_input_tokens=(llm_usage or {}).get("input_tokens"),
-            llm_output_tokens=(llm_usage or {}).get("output_tokens"),
-            draft_id=draft_result.draft_id if draft_result else None,
-            draft_to=draft_result.to if draft_result else None,
-            created_event_id=created_event.event_id if created_event else None,
-            updated_event_id=updated_event.event_id if updated_event else None,
-            deleted_event_id=deleted_event_id,
-            drive_file_id=drive_file_result.file_id if drive_file_result else None,
+def _send(state: _RequestState, agentmail_client: AgentMailClient) -> None:
+    """Render and send the one reply. Never raises: a rendering failure
+    falls back to a minimal status-only reply, and a send failure is
+    recorded on the audit record instead of being lost."""
+    try:
+        body = render_reply(
+            state.parsed, state.reply_status, state.error_code,
+            retryable=state.retryable, **state.results.render_kwargs(),
         )
+    except Exception:
+        logger.exception("rendering the reply for %s failed; sending a minimal reply", state.parsed.request_id)
+        body = render_minimal_reply(state.parsed.request_id, state.reply_status, state.error_code, state.retryable)
+    try:
+        result = send_reply(
+            agentmail_client,
+            inbox_id=AGENTMAIL_INBOX_ID or "",
+            agentmail_message_id=state.message_id,
+            sender_address=state.sender,
+            body=body,
+        )
+        state.reply_message_id = result.message_id if result else None
+    except Exception as exc:
+        logger.exception("sending the reply for %s failed", state.parsed.request_id)
+        state.reply_error = type(exc).__name__
+
+
+def _finalize_request_status(state: _RequestState, state_store) -> None:
+    """The request's last status row (app/state_store.py). A resend may run
+    again only from FAILED: a read whose reply never arrived, or anything
+    that errored before a side effect. A write that happened stays at
+    EFFECT_DONE unless its reply was delivered."""
+    if not state.request_started:
+        return
+    wrote = state.results.wrote
+    replied = state.reply_error is None
+    if wrote:
+        status = REQUEST_COMPLETED if replied else REQUEST_EFFECT_DONE
+    elif state.reply_status == "error" or not replied:
+        status = REQUEST_FAILED
+    else:
+        status = REQUEST_COMPLETED
+    try:
+        state_store.set_request_status(state.parsed.request_id, status, state.sender)
+    except Exception:
+        logger.exception("could not record final status %s for request %s", status, state.parsed.request_id)
+
+
+def _audit_record(state: _RequestState) -> AuditRecord:
+    results = state.results
+    parsed = state.parsed if state.layer1 != "rate_limited" else None
+    return AuditRecord(
+        agentmail_message_id=state.message_id,
+        sender=state.sender,
+        layer0_verdict="ok",
+        layer1_verdict=state.layer1,
+        parsed_request_id=parsed.request_id if parsed else None,
+        parsed_verb=parsed.verb if parsed else None,
+        parsed_source=parsed.source if parsed else None,
+        injection_score=state.injection_score,
+        policy_status=state.decision.status if state.decision else None,
+        policy_error_code=state.decision.error_code if state.decision else None,
+        reply_status=state.reply_status,
+        reply_error_code=state.error_code,
+        result_count=(
+            len(results.gmail_results or [])
+            + len(results.calendar_results or [])
+            + sum(1 for r in (results.draft_result, results.created_event, results.updated_event,
+                              results.deleted_event_id, results.drive_file_result) if r)
+        ),
+        gmail_message_ids=tuple(r.message_id for r in results.gmail_results or ()),
+        calendar_event_ids=tuple(e.event_id for e in results.calendar_results or ()),
+        reply_message_id=state.reply_message_id,
+        reply_error=state.reply_error,
+        failure_code=state.failure_code,
+        failure_stage=state.failure_stage,
+        failure_type=state.failure_type,
+        llm_input_tokens=(state.llm_usage or {}).get("input_tokens"),
+        llm_output_tokens=(state.llm_usage or {}).get("output_tokens"),
+        draft_id=results.draft_result.draft_id if results.draft_result else None,
+        draft_to=results.draft_result.to if results.draft_result else None,
+        created_event_id=results.created_event.event_id if results.created_event else None,
+        updated_event_id=results.updated_event.event_id if results.updated_event else None,
+        deleted_event_id=results.deleted_event_id,
+        drive_file_id=results.drive_file_result.file_id if results.drive_file_result else None,
     )
+
+
+def _append_audit(audit_log: AuditLog, record: AuditRecord) -> None:
+    """The audit append never takes the request down with it. If Sheets is
+    unreachable, the full record -- ids and verdicts only, per the audit
+    log's own minimization rule -- goes to Cloud Logging at ERROR instead,
+    so it's still recoverable."""
+    try:
+        audit_log.append(record)
+    except Exception:
+        logger.exception("audit append failed; record follows: %s", json.dumps(_record_for_log(record), sort_keys=True))
+
+
+def _record_for_log(record: AuditRecord) -> dict[str, Any]:
+    from dataclasses import asdict
+
+    return {k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(record).items()}

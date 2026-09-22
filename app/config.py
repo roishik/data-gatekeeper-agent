@@ -27,7 +27,10 @@ import logging
 import os
 from pathlib import Path
 
-logging.getLogger("httpx").setLevel(logging.WARNING)  # never log auth headers
+# Never log auth headers, and keep per-request HTTP chatter out of Cloud
+# Logging. "httpx2" is the fork the anthropic/typesafe SDKs log through.
+for _noisy in ("httpx", "httpx2"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 logger = logging.getLogger("gatekeeper.config")
 

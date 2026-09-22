@@ -11,7 +11,9 @@ layer:
      exactly once, from app/ingress.py's `parsed_sender_address()`,
      never from a Reply-To header or from anything inside the email body
      or a Gmail result. An injected instruction anywhere upstream has no
-     field to write a different recipient into.
+     field to write a different recipient into. No cc, no bcc: until
+     2026-09-22 every reply was BCC'd to the owner; the owner dropped that
+     in favor of AgentMail's own thread history.
   2. Gmail result text (subject, snippet, sender) and Calendar result
      text (event summary, location) are redacted for OTP-like codes,
      URLs, and email-verification phrasing BEFORE they can appear in a
@@ -29,7 +31,8 @@ layer:
 
 Every reply is: human-readable prose first, then a fenced
 ---GATEKEEPER-RESPONSE--- YAML block with request_id/status/error_code/
-result_count -- research/05 section 2's "Design C" hybrid protocol.
+retryable/result_count -- research/05 section 2's "Design C" hybrid
+protocol. docs/PROTOCOL.md documents every status and error_code.
 """
 from __future__ import annotations
 
@@ -80,6 +83,7 @@ def render_reply(
     updated_event: CalendarEvent | None = None,
     deleted_event_id: str | None = None,
     drive_file_result: DriveFileResult | None = None,
+    retryable: bool = False,
 ) -> str:
     """Builds the full reply body. Deliberately takes no recipient
     argument at all -- see module docstring point 1. Exactly one of the
@@ -101,6 +105,13 @@ def render_reply(
 
     if error_code == "rate_limited":
         prose_lines.append("You've hit today's request limit for this inbox. Please try again tomorrow.")
+    elif status == "duplicate":
+        prose_lines.append(
+            "This request_id was already received, so it was not run again. "
+            "The earlier reply for it carries the result."
+        )
+    elif status == "error":
+        prose_lines.append(_error_prose(error_code, retryable))
     elif status == "completed" and parsed_request.verb == "calendar.list_events":
         if calendar_results:
             prose_lines.append(f"Found {len(calendar_results)} event(s):")
@@ -170,13 +181,7 @@ def render_reply(
 
     prose = "\n".join(prose_lines)
 
-    block = {
-        "request_id": parsed_request.request_id,
-        "status": status,
-        "error_code": error_code,
-        "result_count": result_count,
-    }
-    yaml_block = yaml.safe_dump(block, sort_keys=False, default_flow_style=False).strip()
+    yaml_block = _status_block(parsed_request.request_id, status, error_code, result_count, retryable)
     body = f"{prose}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
 
     if len(body) > REPLY_MAX_CHARS:
@@ -190,14 +195,51 @@ def render_reply(
     return body
 
 
+_ERROR_PROSE = {
+    "not_found": "The item this request refers to was not found.",
+    "conflict": "This request conflicts with the current state of the item it refers to.",
+    "upstream_rejected": "Google rejected this request.",
+    "upstream_unavailable": "A service this request depends on was unavailable.",
+    "internal_error": "Something went wrong inside the gatekeeper while handling this request.",
+}
+
+
+def _error_prose(error_code: str | None, retryable: bool) -> str:
+    base = _ERROR_PROSE.get(error_code or "", "This request could not be completed.")
+    hint = (
+        " It is safe to resend it with the same request_id."
+        if retryable
+        else " Resending it unchanged is unlikely to help."
+    )
+    return base + hint
+
+
+def _status_block(request_id: str, status: str, error_code: str | None, result_count: int, retryable: bool) -> str:
+    block = {
+        "request_id": request_id,
+        "status": status,
+        "error_code": error_code,
+        "retryable": retryable,
+        "result_count": result_count,
+    }
+    return yaml.safe_dump(block, sort_keys=False, default_flow_style=False).strip()
+
+
+def render_minimal_reply(request_id: str, status: str, error_code: str | None, retryable: bool) -> str:
+    """Fallback used only if render_reply itself raises: no result content
+    at all, just the machine-readable status block, so the requester still
+    learns what happened to its request."""
+    yaml_block = _status_block(request_id, status, error_code, 0, retryable)
+    return f"This request was processed, but its results could not be formatted.\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+
+
 def send_reply(
     agentmail_client: AgentMailClient,
     inbox_id: str,
     agentmail_message_id: str,
     sender_address: str,
-    bcc_address: str,
     body: str,
 ) -> ReplyResult:
-    return agentmail_client.reply(
-        inbox_id=inbox_id, message_id=agentmail_message_id, to=sender_address, bcc=bcc_address, text=body
-    )
+    """Sends to `sender_address` ONLY -- no cc, no bcc (see module docstring
+    point 1; the owner BCC was removed 2026-09-22)."""
+    return agentmail_client.reply(inbox_id=inbox_id, message_id=agentmail_message_id, to=sender_address, text=body)

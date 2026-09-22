@@ -25,7 +25,6 @@ from tests.webhook_helpers import TEST_WEBHOOK_SECRET
 TEST_INBOX_ID = "inbox_1"
 TEST_ALLOWED_SENDER = "instinct@example.com"
 TEST_GATEKEEPER_ADDRESS = "gatekeeper@example.com"
-TEST_OWNER_EMAIL = "owner@example.com"
 
 
 @pytest.fixture()
@@ -37,12 +36,10 @@ def configured_env(monkeypatch):
     monkeypatch.setattr(ingress, "WEBHOOK_TOLERANCE_SECONDS", 300)
     monkeypatch.setattr(pipeline, "AGENTMAIL_INBOX_ID", TEST_INBOX_ID)
     monkeypatch.setattr(pipeline, "MAX_REQUESTS_PER_DAY", 20)
-    monkeypatch.setattr(pipeline, "OWNER_EMAIL", TEST_OWNER_EMAIL)
     return {
         "inbox_id": TEST_INBOX_ID,
         "sender": TEST_ALLOWED_SENDER,
         "gatekeeper_address": TEST_GATEKEEPER_ADDRESS,
-        "owner_email": TEST_OWNER_EMAIL,
         "secret": TEST_WEBHOOK_SECRET,
     }
 

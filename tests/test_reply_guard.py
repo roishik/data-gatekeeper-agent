@@ -1,5 +1,5 @@
 """Layer 5 tests: redaction, reply rendering, and "reply only to the
-verified sender, with BCC set"."""
+verified sender, no cc/bcc"."""
 from __future__ import annotations
 
 from app.calendar_executor import CalendarEvent
@@ -167,20 +167,19 @@ def test_render_reply_calendar_redacts_injected_event_title():
     assert "[redacted]" in body
 
 
-def test_send_reply_goes_only_to_sender_with_bcc_set():
+def test_send_reply_goes_only_to_sender_with_no_cc_or_bcc():
     client = FakeAgentMailClient()
     send_reply(
         client,
         inbox_id="inbox_1",
         agentmail_message_id="msg_1",
         sender_address="instinct@example.com",
-        bcc_address="owner@example.com",
         body="hello",
     )
     assert len(client.calls) == 1
     call = client.calls[0]
     assert call["to"] == "instinct@example.com"
-    assert call["bcc"] == "owner@example.com"
+    assert "bcc" not in call and "cc" not in call
 
 
 def test_render_reply_gmail_create_draft_completed_never_claims_it_sent():
@@ -285,7 +284,6 @@ def test_send_reply_ignores_any_address_found_in_content():
         inbox_id="inbox_1",
         agentmail_message_id="msg_1",
         sender_address="instinct@example.com",
-        bcc_address="owner@example.com",
         body=malicious_body,
     )
     assert client.calls[0]["to"] == "instinct@example.com"

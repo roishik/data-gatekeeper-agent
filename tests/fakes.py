@@ -139,15 +139,18 @@ class FakeDriveClient:
 
 class FakeAgentMailClient:
     """Records every reply() call instead of sending anything -- tests
-    assert on `self.calls` to check who got mailed and what BCC was
-    set, which is exactly what the "reply only to the verified sender,
-    with BCC set" test needs."""
+    assert on `self.calls` to check who got mailed, which is exactly what
+    the "reply only to the verified sender, no cc/bcc" test needs. Set
+    `fail_with` to make reply() raise, for the failed-reply paths."""
 
     def __init__(self):
         self.calls: list[dict] = []
         self._next_id = 0
+        self.fail_with: BaseException | None = None
 
-    def reply(self, inbox_id: str, message_id: str, to: str, bcc: str, text: str) -> ReplyResult:
+    def reply(self, inbox_id: str, message_id: str, to: str, text: str) -> ReplyResult:
         self._next_id += 1
-        self.calls.append({"inbox_id": inbox_id, "message_id": message_id, "to": to, "bcc": bcc, "text": text})
+        self.calls.append({"inbox_id": inbox_id, "message_id": message_id, "to": to, "text": text})
+        if self.fail_with is not None:
+            raise self.fail_with
         return ReplyResult(message_id=f"reply-{self._next_id}", thread_id=f"thread-{self._next_id}")
