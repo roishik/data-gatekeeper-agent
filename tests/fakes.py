@@ -13,6 +13,7 @@ from app.agentmail_client import ReplyResult
 from app.calendar_executor import CalendarEvent
 from app.drive_executor import DriveFileResult
 from app.injection_screen import InboundScreenResult
+from app.output_screen import ItemVerdict, OutputScreenResult
 from app.gmail_executor import DraftResult, GmailResult
 from app.reader_llm import LLMExtraction
 
@@ -166,3 +167,38 @@ class FakeAgentMailClient:
         if self.fail_with is not None:
             raise self.fail_with
         return ReplyResult(message_id=f"reply-{self._next_id}", thread_id=f"thread-{self._next_id}")
+
+
+class FakeOutputScreen:
+    """Scripted outbound-screen stand-in. Items whose key is in `withhold`
+    come back flagged sensitive; everything else clean. `fail_with` makes
+    screen_items() raise, for the pipeline's fail-closed path. Records every
+    call: `item_calls` (the items dict) and `text_calls` (whole-reply text)."""
+
+    def __init__(self, withhold: set[str] | None = None, fail_with: BaseException | None = None,
+                 reply_scores: tuple[float | None, float | None] = (0.05, 0.05)):
+        self.withhold = set(withhold or ())
+        self.fail_with = fail_with
+        self.reply_scores = reply_scores
+        self.item_calls: list[dict[str, dict[str, str]]] = []
+        self.text_calls: list[str] = []
+
+    def screen_items(self, items: dict[str, dict[str, str]]) -> OutputScreenResult:
+        self.item_calls.append({k: dict(v) for k, v in items.items()})
+        if self.fail_with is not None:
+            raise self.fail_with
+        verdicts = {
+            key: ItemVerdict(
+                sensitive=0.95 if key in self.withhold else 0.05,
+                targets_reader=0.05,
+                category="security_codes_or_credentials" if key in self.withhold else "none",
+                withheld=key in self.withhold,
+                screened=True,
+            )
+            for key in items
+        }
+        return OutputScreenResult(verdicts=verdicts, status="ok")
+
+    def screen_text(self, text: str) -> tuple[float | None, float | None]:
+        self.text_calls.append(text)
+        return self.reply_scores

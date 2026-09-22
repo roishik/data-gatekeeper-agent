@@ -84,7 +84,7 @@ _CRITERIA = {
 @dataclass(frozen=True)
 class InboundScreenResult:
     scores: dict[str, float | None]  # part name -> max score over its chunks (None = no signal)
-    status: str  # "ok" | "degraded" (some call failed) | "off" (no screen configured)
+    status: str  # "ok" | "degraded" (some call failed) | "disabled" (no screen configured)
 
     def max_of(self, names: list[str]) -> float | None:
         return max_score([self.scores.get(name) for name in names])
@@ -107,7 +107,7 @@ class NoOpInjectionScreen:
         return None
 
     def screen_parts(self, parts: dict[str, str]) -> InboundScreenResult:
-        return InboundScreenResult(scores={name: None for name in parts}, status="off")
+        return InboundScreenResult(scores={name: None for name in parts}, status="disabled")
 
 
 class TypeSafeInjectionScreen:

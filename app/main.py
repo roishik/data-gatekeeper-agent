@@ -59,6 +59,7 @@ from app.config import (
 from app.drive_executor import GoogleDriveClient
 from app.gmail_executor import GoogleGmailClient
 from app.injection_screen import InjectionScreen, NoOpInjectionScreen, TypeSafeInjectionScreen
+from app.output_screen import NoOpOutputScreen, OutputScreen, TypeSafeOutputScreen
 from app.pipeline import handle_webhook
 from app.reader_llm import AnthropicReaderLLM
 from app.state_store import InMemoryStateStore, SheetsStateStore, StateStore
@@ -93,6 +94,15 @@ def _build_injection_screen() -> InjectionScreen:
     return NoOpInjectionScreen()
 
 
+def _build_output_screen() -> OutputScreen:
+    # Same no-key fallback as the injection screen. In prod the key is
+    # always set; see app/output_screen.py for the fail-closed behavior
+    # when TypeSafe itself is unreachable.
+    if have_typesafe_key():
+        return TypeSafeOutputScreen()
+    return NoOpOutputScreen()
+
+
 # Built once at import time -- see module docstring for why this pair is
 # the exception to "construct credentialed things lazily".
 _state_store = _build_state_store()
@@ -109,6 +119,7 @@ def _handle_locked(body: bytes, svix_id: str, svix_timestamp: str, svix_signatur
             state_store=_state_store,
             reader_llm=AnthropicReaderLLM(),
             injection_screen=_build_injection_screen(),
+            output_screen=_build_output_screen(),
             gmail_client_factory=GoogleGmailClient,
             calendar_client_factory=GoogleCalendarClient,
             drive_client_factory=GoogleDriveClient,

@@ -170,7 +170,7 @@ def test_failed_calls_are_no_signal_and_mark_the_screen_degraded(monkeypatch):
 
 def test_noop_screen_parts_is_off():
     result = NoOpInjectionScreen().screen_parts({"subject": "x"})
-    assert (result.scores, result.status) == ({"subject": None}, "off")
+    assert (result.scores, result.status) == ({"subject": None}, "disabled")
 
 
 # ── the block-path write gate (app/policy.py) ──────────────────────────

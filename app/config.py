@@ -145,6 +145,19 @@ JEV_CHUNK_OVERLAP = _env_int("JEV_CHUNK_OVERLAP", 200)
 JEV_MAX_WORKERS = _env_int("JEV_MAX_WORKERS", 8)
 JEV_TIMEOUT_SECONDS = _env_float("JEV_TIMEOUT_SECONDS", 10.0)
 
+# Outbound screen (app/output_screen.py, added 2026-09-22): an item going
+# back to Instinct has its text withheld when Jev scores it at/above either
+# threshold. Deliberately lower than the inbound deny threshold: a false
+# positive here only hides one item's text (its ids stay), while a false
+# negative forwards sensitive material. Calibrate against the live suite.
+OUTPUT_SENSITIVE_THRESHOLD = _env_float("OUTPUT_SENSITIVE_THRESHOLD", 0.5)
+OUTPUT_INJECTION_THRESHOLD = _env_float("OUTPUT_INJECTION_THRESHOLD", 0.7)
+# "closed" (default): an item that can't be screened is withheld. "open":
+# it's sent as-is. See app/output_screen.py for why outbound fails closed.
+OUTPUT_SCREEN_FAIL_MODE = _env_str("OUTPUT_SCREEN_FAIL_MODE", "closed")
+if OUTPUT_SCREEN_FAIL_MODE not in {"closed", "open"}:
+    raise RuntimeError("OUTPUT_SCREEN_FAIL_MODE must be 'closed' or 'open'")
+
 # ── Policy (Layer 3) ─────────────────────────────────────────────────────
 # Query terms that make a gmail.search request refuse to run, regardless
 # of who's asking or how politely. Configurable, not hardcoded, per the

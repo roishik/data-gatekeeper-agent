@@ -65,6 +65,10 @@ _FIELD_ORDER = [
     # which can echo request content. `reply_error` is set when the reply
     # itself could not be sent.
     "reply_error", "failure_code", "failure_stage", "failure_type",
+    # Outbound screen (added 2026-09-22 -- app/output_screen.py): numbers and
+    # category labels only, never item text.
+    "output_screen_status", "output_withheld_count", "output_withheld_categories",
+    "output_max_sensitive", "output_max_injection", "output_reply_sensitive", "output_reply_injection",
     "llm_input_tokens", "llm_output_tokens",
     # Write-verb outcomes. Unlike reads, minimization does NOT apply here
     # -- accountability for a write means the log should say exactly what
@@ -100,7 +104,7 @@ class AuditRecord:
     # REQUEST score (subject + request block, or body on the freeform
     # path); payload text is scored separately and never gates.
     payload_injection_score: float | None = None
-    injection_screen_status: str | None = None  # "ok" | "degraded" | "off"
+    injection_screen_status: str | None = None  # "ok" | "degraded" | "disabled"
     policy_status: str | None = None
     policy_error_code: str | None = None
     reply_status: str | None = None
@@ -116,6 +120,13 @@ class AuditRecord:
     failure_code: str | None = None
     failure_stage: str | None = None
     failure_type: str | None = None
+    output_screen_status: str | None = None
+    output_withheld_count: int = 0
+    output_withheld_categories: tuple[str, ...] = field(default_factory=tuple)
+    output_max_sensitive: float | None = None
+    output_max_injection: float | None = None
+    output_reply_sensitive: float | None = None
+    output_reply_injection: float | None = None
     llm_input_tokens: int | None = None
     llm_output_tokens: int | None = None
     draft_id: str | None = None

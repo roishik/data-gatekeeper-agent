@@ -30,6 +30,10 @@ Guarantees, in order of where processing can stop:
      side effect has happened, BEFORE the reply is attempted, so a resend of
      the same request_id after a failed reply can never repeat the write
      (see app/state_store.py).
+  6. Everything Layer 4 returns is screened by app/output_screen.py before
+     it's rendered: flagged items go out with their text withheld (ids
+     kept), and a calendar write that would send a flagged title to
+     attendees is refused before it happens.
 """
 from __future__ import annotations
 
@@ -42,12 +46,25 @@ from app.agentmail_client import AgentMailClient
 from app.audit_log import AuditLog, AuditRecord
 from app.calendar_executor import CalendarClient, CalendarEvent
 from app.calendar_window import resolve_window
-from app.config import AGENTMAIL_INBOX_ID, INJECTION_DENY_THRESHOLD, MAX_REQUESTS_PER_DAY, OWNER_TIMEZONE
+from app.config import AGENTMAIL_INBOX_ID, INJECTION_DENY_THRESHOLD, MAX_REQUESTS_PER_DAY, OUTPUT_SCREEN_FAIL_MODE, OWNER_TIMEZONE
 from app.drive_executor import DriveClient, DriveFileResult
 from app.failures import GatekeeperDenied, classify_failure
 from app.gmail_executor import DraftResult, GmailClient, GmailResult
 from app.ingress import check_event, parsed_sender_address, verify_signature
 from app.injection_screen import InjectionScreen
+from app.output_screen import (
+    CREATED_EVENT_KEY,
+    DRAFT_KEY,
+    DRIVE_FILE_KEY,
+    INVITE_KEY,
+    UPDATED_EVENT_KEY,
+    NoOpOutputScreen,
+    OutputScreen,
+    OutputScreenResult,
+    all_withheld,
+    event_key,
+    gmail_key,
+)
 from app.policy import (
     CalendarCreateEventParams,
     CalendarDeleteEventParams,
@@ -137,6 +154,9 @@ class _RequestState:
     reply_message_id: str | None = None
     reply_error: str | None = None
     outcome_reason: str = "processed"
+    output: OutputScreenResult | None = None
+    output_reply_sensitive: float | None = None
+    output_reply_injection: float | None = None
 
 
 def extract_message_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -188,6 +208,7 @@ def handle_webhook(
     agentmail_client: AgentMailClient,
     audit_log: AuditLog,
     payload: dict[str, Any] | None = None,
+    output_screen: OutputScreen | None = None,
 ) -> WebhookOutcome:
     """The single entry point every caller (app/main.py and every test)
     uses. `payload` lets tests pass a pre-parsed dict instead of
@@ -243,12 +264,14 @@ def handle_webhook(
     state_store.mark_message_seen(message_id)
 
     # ── From here on: exactly one reply + one audit record (guarantee 4) ─
+    output_screen = output_screen or NoOpOutputScreen()
     state = _RequestState(message_id=message_id, sender=sender_address, parsed=_unresolved_request(message_id))
     stage = "layer1"
     try:
         stage = _run_request(
             state, fields,
             state_store=state_store, reader_llm=reader_llm, injection_screen=injection_screen,
+            output_screen=output_screen,
             gmail_client_factory=gmail_client_factory, calendar_client_factory=calendar_client_factory,
             drive_client_factory=drive_client_factory,
         )
@@ -263,7 +286,7 @@ def handle_webhook(
         state.outcome_reason = "failed"
 
     # ── Layer 5: reply ───────────────────────────────────────────────────
-    _send(state, agentmail_client)
+    _send(state, agentmail_client, output_screen)
     _append_audit(audit_log, _audit_record(state))
     _finalize_request_status(state, state_store)
     return WebhookOutcome(200, state.outcome_reason)
@@ -276,11 +299,12 @@ def _run_request(
     state_store,
     reader_llm: ReaderLLM,
     injection_screen: InjectionScreen,
+    output_screen: OutputScreen,
     gmail_client_factory: Callable[[], GmailClient],
     calendar_client_factory: Callable[[], CalendarClient],
     drive_client_factory: Callable[[], DriveClient],
 ) -> str:
-    """Layers 1 (cap, request dedupe) through 4. Returns normally for every
+    """Layers 1 (cap, request dedupe) through 4, then the output screen. Returns normally for every
     handled outcome -- including denials, duplicates and the rate limit --
     and records the reply to send on `state`. Raises for anything broken;
     handle_webhook turns that into an error reply. Tags any exception with
@@ -337,10 +361,18 @@ def _run_request(
 
         # ── Layer 4: executor ────────────────────────────────────────────
         stage = "layer4"
-        state.results = _execute(state.decision, state.parsed, gmail_client_factory, calendar_client_factory, drive_client_factory)
+        state.results = _execute(
+            state.decision, state.parsed, gmail_client_factory, calendar_client_factory, drive_client_factory,
+            invite_guard=_make_invite_guard(output_screen),
+        )
         if state.results.wrote:
             stage = "layer1"
             state_store.set_request_status(state.parsed.request_id, REQUEST_EFFECT_DONE, state.sender)
+
+        # ── Output screen (app/output_screen.py): never raises -- a failure
+        # here must not turn a completed write into an error reply.
+        stage = "output_screen"
+        state.output = _screen_output(output_screen, state.results)
 
         state.reply_status, state.error_code = _status_for_decision(state.decision)
         state.retryable = False
@@ -369,12 +401,63 @@ def _inbound_screen_parts(subject: str, parts: EmailParts) -> tuple[dict[str, st
     return screen, request_names
 
 
+def _make_invite_guard(output_screen: OutputScreen) -> Callable[[str], None]:
+    """A calendar event with attendees sends its title to third parties the
+    moment it's written, with no human review -- so the title is screened
+    first, and a flagged (or, failing closed, unscreenable) title refuses
+    the write. See app/output_screen.py."""
+
+    def guard(title: str) -> None:
+        try:
+            result = output_screen.screen_items({INVITE_KEY: {"title": title}})
+        except Exception:
+            logger.exception("invite title screen failed")
+            result = all_withheld([INVITE_KEY], fail_closed=OUTPUT_SCREEN_FAIL_MODE != "open")
+        if result.is_withheld(INVITE_KEY):
+            raise GatekeeperDenied(
+                "sensitive_content_refused",
+                "the event title was flagged as sensitive (or could not be screened) and the event has attendees",
+            )
+
+    return guard
+
+
+def _output_items(results: ExecutionResults) -> dict[str, dict[str, str]]:
+    items: dict[str, dict[str, str]] = {}
+    for i, r in enumerate(results.gmail_results or []):
+        items[gmail_key(i)] = {"from": r.sender, "subject": r.subject, "date": r.date, "snippet": r.snippet}
+    for i, e in enumerate(results.calendar_results or []):
+        items[event_key(i)] = {"title": e.summary, "location": e.location}
+    if results.created_event:
+        items[CREATED_EVENT_KEY] = {"title": results.created_event.summary}
+    if results.updated_event:
+        items[UPDATED_EVENT_KEY] = {"title": results.updated_event.summary}
+    if results.draft_result:
+        items[DRAFT_KEY] = {"to": results.draft_result.to, "subject": results.draft_result.subject}
+    if results.drive_file_result:
+        items[DRIVE_FILE_KEY] = {"name": results.drive_file_result.name}
+    return items
+
+
+def _screen_output(output_screen: OutputScreen, results: ExecutionResults) -> OutputScreenResult | None:
+    items = _output_items(results)
+    if not items:
+        return None
+    try:
+        return output_screen.screen_items(items)
+    except Exception:
+        logger.exception("output screen failed; applying fail mode %s", OUTPUT_SCREEN_FAIL_MODE)
+        return all_withheld(list(items), fail_closed=OUTPUT_SCREEN_FAIL_MODE != "open")
+
+
 def _execute(
     decision: PolicyDecision,
     parsed: ParsedRequest,
     gmail_client_factory: Callable[[], GmailClient],
     calendar_client_factory: Callable[[], CalendarClient],
     drive_client_factory: Callable[[], DriveClient],
+    *,
+    invite_guard: Callable[[str], None],
 ) -> ExecutionResults:
     """Layer 4: only for an allowed verb -- exactly one verb, read or
     write, runs per request."""
@@ -396,6 +479,8 @@ def _execute(
             time_min=window.time_min, time_max=window.time_max, max_results=params.max_results,
         )
     elif isinstance(params, CalendarCreateEventParams):
+        if params.attendees:
+            invite_guard(params.title)
         results.created_event = calendar_client_factory().create_event(
             title=params.title, day_offset=params.day_offset, start_time=params.start_time,
             duration_minutes=params.duration_minutes, attendees=params.attendees,
@@ -426,7 +511,7 @@ def _unresolved_request(message_id: str) -> ParsedRequest:
     return ParsedRequest(request_id=fallback_request_id_for(message_id), verb="unsupported", params={}, source="block")
 
 
-def _send(state: _RequestState, agentmail_client: AgentMailClient) -> None:
+def _send(state: _RequestState, agentmail_client: AgentMailClient, output_screen: OutputScreen) -> None:
     """Render and send the one reply. Never raises: a rendering failure
     falls back to a minimal status-only reply, and a send failure is
     recorded on the audit record instead of being lost."""
@@ -434,11 +519,21 @@ def _send(state: _RequestState, agentmail_client: AgentMailClient) -> None:
         body = render_reply(
             state.parsed, state.reply_status, state.error_code,
             retryable=state.retryable, detail=state.decision.reason if state.decision else None,
+            output=state.output,
             **state.results.render_kwargs(),
         )
     except Exception:
         logger.exception("rendering the reply for %s failed; sending a minimal reply", state.parsed.request_id)
         body = render_minimal_reply(state.parsed.request_id, state.reply_status, state.error_code, state.retryable)
+    if state.output is not None:
+        # Whole-reply backstop: the rendered prose (not the status block) is
+        # screened once more. Audit-only -- a calibration signal for the
+        # per-item thresholds, never a second withholding pass.
+        try:
+            prose = body.split("\n\n---GATEKEEPER-RESPONSE---", 1)[0]
+            state.output_reply_sensitive, state.output_reply_injection = output_screen.screen_text(prose)
+        except Exception:
+            logger.exception("whole-reply screen failed")
     try:
         result = send_reply(
             agentmail_client,
@@ -504,6 +599,13 @@ def _audit_record(state: _RequestState) -> AuditRecord:
         calendar_event_ids=tuple(e.event_id for e in results.calendar_results or ()),
         reply_message_id=state.reply_message_id,
         reply_error=state.reply_error,
+        output_screen_status=state.output.status if state.output else None,
+        output_withheld_count=state.output.withheld_count if state.output else 0,
+        output_withheld_categories=tuple(state.output.categories) if state.output else (),
+        output_max_sensitive=state.output.max_sensitive if state.output else None,
+        output_max_injection=state.output.max_targets_reader if state.output else None,
+        output_reply_sensitive=state.output_reply_sensitive,
+        output_reply_injection=state.output_reply_injection,
         failure_code=state.failure_code,
         failure_stage=state.failure_stage,
         failure_type=state.failure_type,

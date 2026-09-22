@@ -31,8 +31,12 @@ layer:
 
 Every reply is: human-readable prose first, then a fenced
 ---GATEKEEPER-RESPONSE--- YAML block with request_id/status/error_code/
-retryable/result_count -- research/05 section 2's "Design C" hybrid
-protocol. docs/PROTOCOL.md documents every status and error_code.
+retryable/result_count/withheld_count (+ screen) -- research/05 section 2's
+"Design C" hybrid protocol. docs/PROTOCOL.md documents every field.
+
+Point 2's regex redaction and the structural escaping below run on every
+item; on top of them, app/output_screen.py's Jev verdicts decide which
+items' text is withheld outright (ids kept) -- see render_reply's `output`.
 """
 from __future__ import annotations
 
@@ -46,6 +50,16 @@ from app.calendar_window import format_event_range
 from app.config import OWNER_TIMEZONE, REPLY_MAX_CHARS
 from app.drive_executor import DriveFileResult
 from app.gmail_executor import DraftResult, GmailResult
+from app.output_screen import (
+    CREATED_EVENT_KEY,
+    DRAFT_KEY,
+    DRIVE_FILE_KEY,
+    UPDATED_EVENT_KEY,
+    WITHHELD_TEXT,
+    OutputScreenResult,
+    event_key,
+    gmail_key,
+)
 from app.request_parser import ParsedRequest
 
 _REDACTED = "[redacted]"
@@ -124,6 +138,7 @@ def render_reply(
     drive_file_result: DriveFileResult | None = None,
     retryable: bool = False,
     detail: str | None = None,
+    output: OutputScreenResult | None = None,
 ) -> str:
     """Builds the full reply body. Deliberately takes no recipient
     argument at all -- see module docstring point 1. Exactly one of the
@@ -143,6 +158,9 @@ def render_reply(
     )
     prose_lines: list[str] = []
 
+    def withheld(key: str) -> bool:
+        return output is not None and output.is_withheld(key)
+
     if error_code == "rate_limited":
         prose_lines.append("You've hit today's request limit for this inbox. Please try again tomorrow.")
     elif status == "duplicate":
@@ -155,23 +173,30 @@ def render_reply(
     elif status == "completed" and parsed_request.verb == "calendar.list_events":
         if calendar_results:
             prose_lines.append(f"Found {len(calendar_results)} event(s):")
-            for e in calendar_results:
-                title = safe_display(e.summary) or "(no title)"
+            for i, e in enumerate(calendar_results):
+                # The time comes from Google's structured start/end, never free
+                # text, so it's kept even when the item's text is withheld.
                 when = format_event_range(e.start, e.end, e.all_day, OWNER_TIMEZONE)
+                event_id = f"(event_id: {sanitize_output(e.event_id)})"
+                if withheld(event_key(i)):
+                    prose_lines.append(f"- {WITHHELD_TEXT} — {when} {event_id}")
+                    continue
+                title = safe_display(e.summary) or "(no title)"
                 location = f", at {safe_display(e.location)}" if e.location else ""
                 attendees = f", {e.attendee_count} attendee(s)" if e.attendee_count else ""
-                prose_lines.append(f"- {title} — {when}{location}{attendees} (event_id: {sanitize_output(e.event_id)})")
+                prose_lines.append(f"- {title} — {when}{location}{attendees} {event_id}")
         else:
             prose_lines.append("No events found.")
     elif status == "completed" and parsed_request.verb == "calendar.create_event" and created_event:
-        title = safe_display(created_event.summary) or "(no title)"
+        title = WITHHELD_TEXT if withheld(CREATED_EVENT_KEY) else f"'{safe_display(created_event.summary) or '(no title)'}'"
         when = format_event_range(created_event.start, created_event.end, created_event.all_day, OWNER_TIMEZONE)
         attendees = f", invited {created_event.attendee_count} attendee(s)" if created_event.attendee_count else ""
-        prose_lines.append(f"Created event '{title}' — {when}{attendees} (event_id: {sanitize_output(created_event.event_id)}).")
+        prose_lines.append(f"Created event {title} — {when}{attendees} (event_id: {sanitize_output(created_event.event_id)}).")
     elif status == "completed" and parsed_request.verb == "calendar.update_event" and updated_event:
-        title = safe_display(updated_event.summary) or "(no title)"
+        title = WITHHELD_TEXT if withheld(UPDATED_EVENT_KEY) else f"'{safe_display(updated_event.summary) or '(no title)'}'"
         when = format_event_range(updated_event.start, updated_event.end, updated_event.all_day, OWNER_TIMEZONE)
-        prose_lines.append(f"Updated event '{title}' — {when} (event_id: {sanitize_output(updated_event.event_id)}).")
+        attendees = f", {updated_event.attendee_count} attendee(s)" if updated_event.attendee_count else ""
+        prose_lines.append(f"Updated event {title} — {when}{attendees} (event_id: {sanitize_output(updated_event.event_id)}).")
     elif status == "completed" and parsed_request.verb == "calendar.delete_event" and deleted_event_id:
         prose_lines.append(f"Deleted event {sanitize_output(deleted_event_id)}.")
     elif status == "completed" and parsed_request.verb == "gmail.create_draft" and draft_result:
@@ -180,28 +205,40 @@ def render_reply(
             if draft_result.thread_id
             else ""
         )
+        what = (
+            f"a draft {WITHHELD_TEXT}"
+            if withheld(DRAFT_KEY)
+            else f"a draft to {sanitize_output(draft_result.to)}, subject: '{safe_display(draft_result.subject)}'"
+        )
         prose_lines.append(
-            f"Created a draft to {sanitize_output(draft_result.to)}, subject: '{safe_display(draft_result.subject)}'{where}. "
+            f"Created {what}{where}. "
             "Review and send it yourself in Gmail -- this gatekeeper never sends email on your behalf."
         )
     elif status == "completed" and parsed_request.verb == "drive.create_file" and drive_file_result:
-        prose_lines.append(f"Created Drive file '{safe_display(drive_file_result.name)}'.")
+        name = WITHHELD_TEXT if withheld(DRIVE_FILE_KEY) else f"'{safe_display(drive_file_result.name)}'"
+        prose_lines.append(f"Created Drive file {name}.")
     elif status == "completed":
         results = gmail_results or []
         if results:
             prose_lines.append(f"Found {len(results)} matching email(s):")
-            for r in results:
-                subject = safe_display(r.subject) or "(no subject)"
-                snippet = safe_display(r.snippet)
+            for i, r in enumerate(results):
                 # thread_id is an opaque Google token (like a calendar
                 # event_id): structurally escaped only -- never through
                 # redact(), which would mangle its digit runs and break the
                 # ability to reply into the thread. It's what a follow-up
-                # gmail.create_draft copies to file a reply into this thread.
+                # gmail.create_draft copies to file a reply into this thread,
+                # so it's kept even when the item's text is withheld.
                 thread = f" (thread_id: {sanitize_output(r.thread_id)})" if r.thread_id else ""
+                if withheld(gmail_key(i)):
+                    prose_lines.append(f"- {WITHHELD_TEXT}{thread}")
+                    continue
+                subject = safe_display(r.subject) or "(no subject)"
+                snippet = safe_display(r.snippet)
                 # The sender header is attacker-controlled too (display names can carry
                 # URLs or instructions), so it goes through the same redaction.
                 prose_lines.append(f"- {subject} — {safe_display(r.sender)} ({safe_display(r.date)}){thread}\n  {snippet}")
+            if output is not None and output.status == "degraded":
+                prose_lines.append("(Content screening was unavailable for some items, so their text was withheld.)")
         else:
             prose_lines.append("No matching emails found.")
     elif status == "needs_clarification":
@@ -222,6 +259,16 @@ def render_reply(
                 "This request was refused: it looks like it's asking about a verification code, "
                 "password reset, or similarly sensitive content, which this gatekeeper never forwards."
             )
+        elif error_code == "sensitive_content_refused":
+            prose_lines.append(
+                "This request was refused: the event has attendees, and its title was flagged as "
+                "sensitive (or could not be checked), so no invite was sent."
+            )
+        elif error_code == "not_gatekeeper_event":
+            prose_lines.append(
+                "This request was not authorized: the gatekeeper only changes or deletes calendar "
+                "events that it created itself."
+            )
         else:
             prose_lines.append("This request was not authorized.")
     else:  # "unsupported" or any other/unknown status
@@ -229,7 +276,7 @@ def render_reply(
 
     prose = "\n".join(prose_lines)
 
-    yaml_block = _status_block(parsed_request.request_id, status, error_code, result_count, retryable)
+    yaml_block = _status_block(parsed_request.request_id, status, error_code, result_count, retryable, output)
     body = f"{prose}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
 
     if len(body) > REPLY_MAX_CHARS:
@@ -273,14 +320,23 @@ def _error_prose(error_code: str | None, retryable: bool) -> str:
     return base + hint
 
 
-def _status_block(request_id: str, status: str, error_code: str | None, result_count: int, retryable: bool) -> str:
-    block = {
+def _status_block(
+    request_id: str, status: str, error_code: str | None, result_count: int, retryable: bool,
+    output: OutputScreenResult | None = None,
+) -> str:
+    block: dict = {
         "request_id": sanitize_output(request_id),
         "status": sanitize_output(status),
         "error_code": sanitize_output(error_code) if error_code is not None else None,
         "retryable": retryable,
         "result_count": result_count,
+        "withheld_count": output.withheld_count if output is not None else 0,
     }
+    if output is not None:
+        # Only present when there was result content to screen:
+        # ok | degraded (some items unscreenable, withheld) | disabled (no screen configured).
+        # ("off" would be a YAML boolean -- a naive parser would read False.)
+        block["screen"] = output.status
     return yaml.safe_dump(block, sort_keys=False, default_flow_style=False).strip()
 
 
