@@ -28,13 +28,24 @@ the one presented to Google for a given operation, built from a refresh
 token + OAuth client id/secret in env (see app/google_auth_helper.py and
 scripts/google_auth.py).
 
-NOT exercised against a live Gmail API call -- the users.messages.list /
-get(format=metadata) / users.drafts.create request/response shapes below
-come from Google's published REST reference (fetched during this
-build). See the final build report's "could not verify" section.
+Search fetches every result's metadata in ONE batch HTTP round trip
+(added 2026-09-22) instead of up to 30 sequential messages.get calls --
+the main source of multi-second gmail.search latency.
+
+Reply-in-thread drafts (fixed 2026-09-22): a `threadId` alone files the
+draft into the owner's copy of the conversation, but the RECIPIENT's mail
+client threads by the RFC 5322 `In-Reply-To`/`References` headers, which
+the first version never set -- so the reply arrived as a brand-new thread
+on their side. create_draft now reads the thread's last real (non-draft)
+message's Message-ID and References -- metadata only, still never a body --
+and sets both. Those values come from the other party's mail, so they're
+attacker-controlled: only well-formed `<...>` message ids are copied, the
+References chain is capped, and anything malformed is simply left out
+(the draft is still filed into the thread by threadId).
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -48,6 +59,10 @@ GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
 # else (including the body) is never requested from the API in the
 # first place, which is a stronger guarantee than "we don't use it".
 _METADATA_HEADERS = ("From", "Subject", "Date")
+# Headers read from a thread only to thread a reply draft correctly.
+_THREADING_HEADERS = ("Message-ID", "References")
+_MESSAGE_ID_RE = re.compile(r"<[^<>\s]{1,250}>")
+_MAX_REFERENCES = 20
 
 
 @dataclass(frozen=True)
@@ -113,18 +128,7 @@ class GoogleGmailClient:
         message_ids = [m["id"] for m in list_resp.get("messages", [])]
 
         results: list[GmailResult] = []
-        for message_id in message_ids:
-            msg = (
-                service.users()
-                .messages()
-                .get(
-                    userId=self._user,
-                    id=message_id,
-                    format="metadata",
-                    metadataHeaders=list(_METADATA_HEADERS),
-                )
-                .execute()
-            )
+        for message_id, msg in zip(message_ids, self._fetch_metadata(service, message_ids)):
             headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
             results.append(
                 GmailResult(
@@ -141,15 +145,71 @@ class GoogleGmailClient:
             )
         return results
 
+    def _fetch_metadata(self, service, message_ids: list[str]) -> list[dict]:
+        """messages.get(format=metadata) for every id in ONE batch request,
+        results in input order. Any per-message failure is raised, so the
+        pipeline answers with a proper error instead of a silently short
+        result list."""
+        if not message_ids:
+            return []
+        responses: dict[str, dict] = {}
+        errors: list[BaseException] = []
+
+        def _collect(request_id, response, exception):
+            if exception is not None:
+                errors.append(exception)
+            else:
+                responses[request_id] = response
+
+        batch = service.new_batch_http_request(callback=_collect)
+        for index, message_id in enumerate(message_ids):
+            batch.add(
+                service.users().messages().get(
+                    userId=self._user, id=message_id, format="metadata", metadataHeaders=list(_METADATA_HEADERS),
+                ),
+                request_id=str(index),
+            )
+        batch.execute()
+        if errors:
+            raise errors[0]
+        return [responses[str(index)] for index in range(len(message_ids))]
+
+    def _reply_headers(self, thread_id: str) -> tuple[str | None, str | None]:
+        """(In-Reply-To, References) for a reply into `thread_id`, from the
+        thread's last non-draft message -- or (None, None) if there's no
+        well-formed Message-ID to reply to. See the module docstring."""
+        service = self._service([GMAIL_READONLY_SCOPE])
+        thread = (
+            service.users()
+            .threads()
+            .get(userId=self._user, id=thread_id, format="metadata", metadataHeaders=list(_THREADING_HEADERS))
+            .execute()
+        )
+        candidates = [m for m in thread.get("messages", []) if "DRAFT" not in (m.get("labelIds") or [])]
+        if not candidates:
+            return None, None
+        headers = {h["name"].lower(): h["value"] for h in candidates[-1].get("payload", {}).get("headers", [])}
+        in_reply_to = _MESSAGE_ID_RE.fullmatch((headers.get("message-id") or "").strip())
+        if not in_reply_to:
+            return None, None
+        chain = _MESSAGE_ID_RE.findall(headers.get("references") or "")
+        chain = [ref for ref in chain if ref != in_reply_to.group(0)][-(_MAX_REFERENCES - 1):] + [in_reply_to.group(0)]
+        return in_reply_to.group(0), " ".join(chain)
+
     def create_draft(self, to: str, subject: str, body: str, thread_id: str | None = None) -> DraftResult:
         import base64
         from email.mime.text import MIMEText
 
-        service = self._service([GMAIL_COMPOSE_SCOPE])
         message = MIMEText(body)
         message["to"] = to
         message["subject"] = subject
+        if thread_id:
+            in_reply_to, references = self._reply_headers(thread_id)
+            if in_reply_to and references:
+                message["In-Reply-To"] = in_reply_to
+                message["References"] = references
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+        service = self._service([GMAIL_COMPOSE_SCOPE])
 
         # When thread_id is given, the draft is filed into that existing
         # conversation (a reply-in-thread) rather than starting a new one.
