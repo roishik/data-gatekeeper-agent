@@ -732,3 +732,54 @@ def test_no_signal_never_gates_a_write(configured_env, audit_log):
     _, fake_gmail, _ = _call(make_body(text=_BLOCK_DRAFT_WITH_PAYLOAD), injection_screen=FakeInjectionScreen(score=None),
                              audit_log=audit_log)
     assert len(fake_gmail.calls) == 1
+
+
+# ── Calendar write containment (added 2026-09-22) ──────────────────────
+
+
+def _call_calendar(text, calendar, audit_log, output_screen=None, agentmail=None):
+    body = make_body(text=text)
+    svix_id, ts, sig = sign(body)
+    agentmail = agentmail or FakeAgentMailClient()
+    handle_webhook(
+        body, svix_id=svix_id, svix_timestamp=ts, svix_signature=sig,
+        state_store=InMemoryStateStore(), reader_llm=FakeReaderLLM(), injection_screen=FakeInjectionScreen(),
+        gmail_client_factory=FakeGmailClient, calendar_client_factory=lambda: calendar,
+        drive_client_factory=FakeDriveClient, agentmail_client=agentmail, audit_log=audit_log,
+        output_screen=output_screen,
+    )
+    return agentmail.calls[0]["text"]
+
+
+def test_update_or_delete_of_a_non_gatekeeper_event_is_refused(configured_env, audit_log):
+    calendar = FakeCalendarClient(foreign_event_ids={"realmeeting1"})
+    for verb, params in (("calendar.update_event", "  event_id: realmeeting1\n  title: Cancelled lol\n"),
+                         ("calendar.delete_event", "  event_id: realmeeting1\n")):
+        text = f"---GATEKEEPER-REQUEST---\nrequest_id: req_{verb}\nverb: {verb}\nparams:\n{params}---END---\n"
+        reply = _call_calendar(text, calendar, audit_log)
+        assert "status: denied" in reply and "error_code: not_gatekeeper_event" in reply
+        assert "only changes or deletes calendar events that it created" in reply
+    assert calendar.calls == []
+
+
+def test_create_event_is_tagged_with_its_request_id(configured_env, audit_log):
+    calendar = FakeCalendarClient()
+    text = (
+        "---GATEKEEPER-REQUEST---\nrequest_id: req_tag\nverb: calendar.create_event\nparams:\n"
+        "  title: Focus\n  day_offset: 1\n  start_time: '09:00'\n  duration_minutes: 60\n---END---\n"
+    )
+    _call_calendar(text, calendar, audit_log)
+    assert calendar.calls[0]["request_id"] == "req_tag"
+
+
+def test_adding_a_guest_to_an_event_with_a_flagged_title_is_refused(configured_env, audit_log):
+    from tests.fakes import FakeOutputScreen
+
+    calendar = FakeCalendarClient(existing_title="Salary negotiation notes: offer 480k")
+    text = (
+        "---GATEKEEPER-REQUEST---\nrequest_id: req_add\nverb: calendar.update_event\nparams:\n"
+        "  event_id: ownevent1\n  add_attendees: [outsider@example.com]\n---END---\n"
+    )
+    reply = _call_calendar(text, calendar, audit_log, output_screen=FakeOutputScreen(withhold={"invite"}))
+    assert "error_code: sensitive_content_refused" in reply
+    assert calendar.calls == []

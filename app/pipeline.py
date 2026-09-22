@@ -483,12 +483,14 @@ def _execute(
             invite_guard(params.title)
         results.created_event = calendar_client_factory().create_event(
             title=params.title, day_offset=params.day_offset, start_time=params.start_time,
-            duration_minutes=params.duration_minutes, attendees=params.attendees,
+            duration_minutes=params.duration_minutes, attendees=params.attendees, request_id=parsed.request_id,
         )
     elif isinstance(params, CalendarUpdateEventParams):
         results.updated_event = calendar_client_factory().update_event(
             event_id=params.event_id, title=params.title, day_offset=params.day_offset,
-            start_time=params.start_time, duration_minutes=params.duration_minutes, attendees=params.attendees,
+            start_time=params.start_time, duration_minutes=params.duration_minutes,
+            add_attendees=params.add_attendees, remove_attendees=params.remove_attendees,
+            invite_guard=invite_guard,
         )
     elif isinstance(params, CalendarDeleteEventParams):
         calendar_client_factory().delete_event(event_id=params.event_id)

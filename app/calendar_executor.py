@@ -20,8 +20,10 @@ six keys off each raw event dict below, never by trusting a caller not
 to look further (the same discipline as app/gmail_executor.py's
 `_METADATA_HEADERS` allowlist).
 
-Scope: calendar.readonly only, same refresh-token credential plumbing as
-app/gmail_executor.py (see app/google_auth_helper.py).
+Scopes: calendar.readonly for list_events; calendar.events (events only --
+not calendar settings or ACLs) for create/update/delete_event. Same
+refresh-token credential plumbing as app/gmail_executor.py (see
+app/google_auth_helper.py).
 
 The timeMin/timeMax window is computed entirely in Python
 (app/calendar_window.py) from day_offset/days -- Layer 2's LLM never
@@ -37,6 +39,26 @@ confirmed against Google's current Calendar API v3 reference (fetched
 during this build, raw HTML/embedded-JSON, not just an AI-summarized
 pass). NOT exercised against a live Calendar API call. See the final
 build report's "could not verify" section.
+
+Write containment (added 2026-09-22, owner's decision)
+------------------------------------------------------
+Every event create_event makes is tagged with a private extended property
+(`gatekeeper=1`, plus the request_id that created it). update_event and
+delete_event fetch the event first and refuse -- `not_gatekeeper_event` --
+anything without that tag. Before this, both could touch ANY event on the
+primary calendar, so one injected request could cancel a real meeting (with
+a cancellation email to every guest) or add an outsider to it (who'd then
+receive its full invite: description, conferencing link, and all).
+Creating events stays fully autonomous.
+
+Attendee changes are additive: `add_attendees` / `remove_attendees` are
+merged into the event's EXISTING guest list, keeping each existing guest's
+response status. The old `attendees` field replaced the whole list, so "add
+Dana" would silently uninvite everyone else. Adding attendees also runs the
+caller's invite guard on the event's title first (app/output_screen.py):
+an invite sends that title to third parties immediately.
+
+The list-events path below is unchanged.
 
 That last point mattered in practice: a live run showed an all-day event
 from the day before the window start still coming back from
@@ -56,11 +78,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Callable, Protocol
 from zoneinfo import ZoneInfo
 
 from app.calendar_window import EventTimeSpan, resolve_event_datetime
 from app.config import OWNER_TIMEZONE
+from app.failures import GatekeeperDenied
 from app.google_auth_helper import build_google_service
 
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -84,10 +107,18 @@ class CalendarEvent:
     location: str = ""
 
 
+# The private extended property that marks an event as created by this
+# service (see "Write containment" in the module docstring).
+GATEKEEPER_TAG_KEY = "gatekeeper"
+GATEKEEPER_TAG_VALUE = "1"
+GATEKEEPER_REQUEST_ID_KEY = "gatekeeper_request_id"
+
+
 class CalendarClient(Protocol):
     def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]: ...
     def create_event(
-        self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...]
+        self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...],
+        request_id: str,
     ) -> CalendarEvent: ...
     def update_event(
         self,
@@ -96,9 +127,29 @@ class CalendarClient(Protocol):
         day_offset: int | None,
         start_time: str | None,
         duration_minutes: int | None,
-        attendees: tuple[str, ...] | None,
+        add_attendees: tuple[str, ...],
+        remove_attendees: tuple[str, ...],
+        invite_guard: Callable[[str], None],
     ) -> CalendarEvent: ...
     def delete_event(self, event_id: str) -> None: ...
+
+
+def is_gatekeeper_event(event: dict) -> bool:
+    private = ((event.get("extendedProperties") or {}).get("private") or {})
+    return private.get(GATEKEEPER_TAG_KEY) == GATEKEEPER_TAG_VALUE
+
+
+def merge_attendees(existing: list[dict], add: tuple[str, ...], remove: tuple[str, ...]) -> list[dict]:
+    """Existing guests keep their full attendee objects (responseStatus and
+    all); removals and duplicate additions match case-insensitively."""
+    removing = {a.lower() for a in remove}
+    merged = [a for a in existing if (a.get("email") or "").lower() not in removing]
+    present = {(a.get("email") or "").lower() for a in merged}
+    for email in add:
+        if email.lower() not in present:
+            merged.append({"email": email})
+            present.add(email.lower())
+    return merged
 
 
 class GoogleCalendarClient:
@@ -172,7 +223,8 @@ class GoogleCalendarClient:
         return final
 
     def create_event(
-        self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...]
+        self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...],
+        request_id: str,
     ) -> CalendarEvent:
         service = self._service([CALENDAR_EVENTS_SCOPE])
         span = resolve_event_datetime(day_offset, start_time, duration_minutes, OWNER_TIMEZONE)
@@ -181,12 +233,25 @@ class GoogleCalendarClient:
             "start": {"dateTime": span.start, "timeZone": OWNER_TIMEZONE},
             "end": {"dateTime": span.end, "timeZone": OWNER_TIMEZONE},
             "attendees": [{"email": a} for a in attendees],
+            # The containment tag: only events carrying it can later be
+            # updated or deleted through this service.
+            "extendedProperties": {
+                "private": {GATEKEEPER_TAG_KEY: GATEKEEPER_TAG_VALUE, GATEKEEPER_REQUEST_ID_KEY: request_id},
+            },
         }
         # sendUpdates="all": attendees get a real invite email immediately,
         # by the owner's explicit choice (CLAUDE.md) -- there is no
         # approval step for this verb.
         event = service.events().insert(calendarId="primary", body=body, sendUpdates="all").execute()
         return _event_from_raw(event)
+
+    def _get_own_event(self, service, event_id: str) -> dict:
+        """The event, if (and only if) this service created it. A missing
+        event surfaces as Google's own 404/410 (-> `not_found`)."""
+        existing = service.events().get(calendarId="primary", eventId=event_id).execute()
+        if not is_gatekeeper_event(existing):
+            raise GatekeeperDenied("not_gatekeeper_event", "the event was not created by the gatekeeper")
+        return existing
 
     def update_event(
         self,
@@ -195,16 +260,21 @@ class GoogleCalendarClient:
         day_offset: int | None,
         start_time: str | None,
         duration_minutes: int | None,
-        attendees: tuple[str, ...] | None,
+        add_attendees: tuple[str, ...],
+        remove_attendees: tuple[str, ...],
+        invite_guard: Callable[[str], None],
     ) -> CalendarEvent:
         service = self._service([CALENDAR_EVENTS_SCOPE])
+        existing = self._get_own_event(service, event_id)
         body: dict = {}
         if title is not None:
             body["summary"] = title
-        if attendees is not None:
-            body["attendees"] = [{"email": a} for a in attendees]
+        if add_attendees or remove_attendees:
+            if add_attendees:
+                # New guests will receive the (possibly updated) title.
+                invite_guard(title if title is not None else (existing.get("summary") or ""))
+            body["attendees"] = merge_attendees(existing.get("attendees") or [], add_attendees, remove_attendees)
         if day_offset is not None or start_time is not None or duration_minutes is not None:
-            existing = service.events().get(calendarId="primary", eventId=event_id).execute()
             span = _resolve_updated_timing(existing, day_offset, start_time, duration_minutes)
             body["start"] = {"dateTime": span.start, "timeZone": OWNER_TIMEZONE}
             body["end"] = {"dateTime": span.end, "timeZone": OWNER_TIMEZONE}
@@ -218,6 +288,7 @@ class GoogleCalendarClient:
 
     def delete_event(self, event_id: str) -> None:
         service = self._service([CALENDAR_EVENTS_SCOPE])
+        self._get_own_event(service, event_id)
         # sendUpdates="all": attendees (if any) get a real cancellation
         # email immediately, same owner-chosen, no-approval design as
         # create_event above.

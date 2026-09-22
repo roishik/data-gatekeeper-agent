@@ -127,6 +127,10 @@ class LLMExtraction(BaseModel):
     start_time: str | None = None  # "HH:MM", owner's local time -- never a full date/timestamp
     duration_minutes: int | None = None
     attendees: list[str] | None = None
+    # calendar.update_event: guests are added/removed, never replaced
+    # wholesale (app/calendar_executor.py's merge_attendees).
+    add_attendees: list[str] | None = None
+    remove_attendees: list[str] | None = None
     # calendar.update_event / delete_event field -- must be copied
     # verbatim from what the email states (e.g. an event id the
     # gatekeeper itself returned in an earlier reply); never invented.
@@ -189,13 +193,15 @@ class _CalendarCreateFields(BaseModel):
 
 
 class _CalendarUpdateFields(BaseModel):
+    # 7 properties -- the per-stage ceiling (tests/test_request_parser.py).
     model_config = ConfigDict(extra="forbid")
     event_id: str | None = None
     title: str | None = None
     day_offset: int | None = None
     start_time: str | None = None
     duration_minutes: int | None = None
-    attendees: list[str] | None = None
+    add_attendees: list[str] | None = None
+    remove_attendees: list[str] | None = None
 
 
 class _CalendarDeleteFields(BaseModel):
@@ -281,8 +287,10 @@ _STAGE2_CALENDAR_UPDATE_PROMPT = _QUARANTINE_PREAMBLE + (
     "one. Only include the fields the email actually asks to change: "
     "'title'; 'day_offset' as a small integer relative to today "
     "('today'->0, 'tomorrow'->1, ...) never an actual date; 'start_time' "
-    "as 'HH:MM'; 'duration_minutes' as an integer; 'attendees' as exact "
-    "email addresses."
+    "as 'HH:MM'; 'duration_minutes' as an integer; 'add_attendees' for "
+    "exact email addresses the email asks to invite, and 'remove_attendees' "
+    "for exact addresses it asks to uninvite -- never list existing guests "
+    "the email doesn't mention."
 )
 
 _STAGE2_CALENDAR_DELETE_PROMPT = _QUARANTINE_PREAMBLE + (

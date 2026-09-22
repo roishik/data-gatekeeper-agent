@@ -429,11 +429,42 @@ def test_calendar_update_event_invalid_field_value_denied():
     assert decision.status == "denied"
 
 
-def test_calendar_update_event_can_update_attendees_only():
-    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "attendees": ["new@example.com"]})
+def test_calendar_update_event_can_add_or_remove_attendees_only():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "add_attendees": ["new@example.com"]})
     assert decision.status == "allowed"
-    assert decision.params.attendees == ("new@example.com",)
+    assert decision.params.add_attendees == ("new@example.com",)
+    assert decision.params.remove_attendees == ()
     assert decision.params.title is None
+    removal = evaluate_policy("calendar.update_event", {"event_id": "ev1", "remove_attendees": ["old@example.com"]})
+    assert removal.status == "allowed" and removal.params.remove_attendees == ("old@example.com",)
+
+
+def test_calendar_update_event_has_no_replace_the_whole_guest_list_field():
+    """`attendees` used to REPLACE the guest list, so "add Dana" silently
+    uninvited everyone else. It's gone; the denial says what to use."""
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "attendees": ["new@example.com"]})
+    assert (decision.status, decision.error_code) == ("denied", "invalid_params")
+    assert "add_attendees" in decision.reason
+
+
+def test_calendar_update_event_rejects_an_address_in_both_lists():
+    decision = evaluate_policy(
+        "calendar.update_event",
+        {"event_id": "ev1", "add_attendees": ["A@example.com"], "remove_attendees": ["a@example.com"]},
+    )
+    assert decision.status == "denied"
+
+
+def test_calendar_update_event_empty_guest_lists_are_not_a_change():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "add_attendees": [], "remove_attendees": []})
+    assert decision.status == "denied"
+
+
+def test_calendar_update_event_add_attendees_bounded_and_validated():
+    too_many = evaluate_policy("calendar.update_event", {"event_id": "ev1", "add_attendees": [f"u{i}@example.com" for i in range(11)]})
+    assert too_many.status == "denied" and "add_attendees" in too_many.reason
+    bad = evaluate_policy("calendar.update_event", {"event_id": "ev1", "remove_attendees": ["not-an-email"]})
+    assert bad.status == "denied" and "remove_attendees" in bad.reason
 
 
 # ── calendar.delete_event ───────────────────────────────────────────────

@@ -192,7 +192,10 @@ class CalendarUpdateEventParams:
     day_offset: int | None = None
     start_time: str | None = None
     duration_minutes: int | None = None
-    attendees: tuple[str, ...] | None = None
+    # Merged into the event's existing guests (app/calendar_executor.py) --
+    # there is deliberately no "replace the whole list" field any more.
+    add_attendees: tuple[str, ...] = ()
+    remove_attendees: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -627,7 +630,9 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_UPDATE_EVENT
 
     extra = _reject_extra_params(
-        verb, params, frozenset({"event_id", "title", "day_offset", "start_time", "duration_minutes", "attendees"})
+        verb, params,
+        frozenset({"event_id", "title", "day_offset", "start_time", "duration_minutes", "add_attendees", "remove_attendees"}),
+        hint=" (guests are changed with add_attendees / remove_attendees; there is no field that replaces the whole list)",
     )
     if extra:
         return extra
@@ -642,7 +647,6 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
         ("day_offset", _validate_day_offset),
         ("start_time", _validate_start_time),
         ("duration_minutes", _validate_duration),
-        ("attendees", _validate_attendees),
     ):
         if field_name not in params:
             continue
@@ -651,10 +655,23 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
             return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
         updates[field_name] = value
 
+    for field_name in ("add_attendees", "remove_attendees"):
+        if field_name not in params:
+            continue
+        value, err = _validate_attendees(params[field_name])
+        if err:
+            return _deny(verb, err.replace("'attendees'", f"'{field_name}'"))
+        if value:
+            updates[field_name] = value
+
+    both = {a.lower() for a in updates.get("add_attendees", ())} & {a.lower() for a in updates.get("remove_attendees", ())}
+    if both:
+        return _deny(verb, "an address can't be in both add_attendees and remove_attendees")
+
     if not updates:
         return PolicyDecision(
             status="denied", verb=verb, error_code="invalid_params",
-            reason="at least one of title/day_offset/start_time/duration_minutes/attendees must be given",
+            reason="at least one of title/day_offset/start_time/duration_minutes/add_attendees/remove_attendees must be given",
         )
 
     if event_id is None:

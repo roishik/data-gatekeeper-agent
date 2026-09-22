@@ -407,3 +407,12 @@ def test_anthropic_reader_reports_invalid_output(monkeypatch):
     reader = _install_stub_anthropic(monkeypatch, texts=["not json at all"])
     assert reader.extract("anything") is None
     assert reader.last_failure == "invalid_output"
+
+
+def test_llm_extracts_calendar_update_add_and_remove_attendees():
+    reader = FakeReaderLLM(response=LLMExtraction(
+        verb="calendar.update_event", request_id="req_ua", event_id="ev1",
+        add_attendees=["dana@example.com"], remove_attendees=["old@example.com"],
+    ))
+    parsed = parse_request("add dana and drop old from ev1", "msg_1", reader)
+    assert parsed.params == {"event_id": "ev1", "add_attendees": ["dana@example.com"], "remove_attendees": ["old@example.com"]}

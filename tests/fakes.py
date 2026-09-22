@@ -12,6 +12,7 @@ from __future__ import annotations
 from app.agentmail_client import ReplyResult
 from app.calendar_executor import CalendarEvent
 from app.drive_executor import DriveFileResult
+from app.failures import GatekeeperDenied
 from app.injection_screen import InboundScreenResult
 from app.output_screen import ItemVerdict, OutputScreenResult
 from app.gmail_executor import DraftResult, GmailResult
@@ -89,21 +90,27 @@ class FakeCalendarClient:
     given fields back into a CalendarEvent instead of returning a fixed
     result, since tests need to check exactly what was created/changed."""
 
-    def __init__(self, results: list[CalendarEvent] | None = None):
+    def __init__(self, results: list[CalendarEvent] | None = None, foreign_event_ids: set[str] | None = None,
+                 existing_title: str = "(unchanged)"):
         self.results = results if results is not None else []
         self.calls: list[dict] = []
+        # Event ids the fake treats as NOT created by the gatekeeper.
+        self.foreign_event_ids = set(foreign_event_ids or ())
+        self.existing_title = existing_title
 
     def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]:
         self.calls.append({"time_min": time_min, "time_max": time_max, "max_results": max_results})
         return self.results[:max_results]
 
     def create_event(
-        self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...]
+        self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...],
+        request_id: str = "",
     ) -> CalendarEvent:
         self.calls.append(
             {
                 "op": "create_event", "title": title, "day_offset": day_offset,
                 "start_time": start_time, "duration_minutes": duration_minutes, "attendees": attendees,
+                "request_id": request_id,
             }
         )
         return CalendarEvent(
@@ -120,21 +127,31 @@ class FakeCalendarClient:
         day_offset: int | None,
         start_time: str | None,
         duration_minutes: int | None,
-        attendees: tuple[str, ...] | None,
+        add_attendees: tuple[str, ...] = (),
+        remove_attendees: tuple[str, ...] = (),
+        invite_guard=None,
     ) -> CalendarEvent:
+        # Mirrors GoogleCalendarClient's containment check and invite guard.
+        if event_id in self.foreign_event_ids:
+            raise GatekeeperDenied("not_gatekeeper_event")
+        if add_attendees and invite_guard is not None:
+            invite_guard(title if title is not None else self.existing_title)
         self.calls.append(
             {
                 "op": "update_event", "event_id": event_id, "title": title, "day_offset": day_offset,
-                "start_time": start_time, "duration_minutes": duration_minutes, "attendees": attendees,
+                "start_time": start_time, "duration_minutes": duration_minutes,
+                "add_attendees": add_attendees, "remove_attendees": remove_attendees,
             }
         )
         return CalendarEvent(
-            event_id=event_id, summary=title or "(unchanged)",
+            event_id=event_id, summary=title or self.existing_title,
             start="2026-01-01T10:00:00+02:00", end="2026-01-01T10:30:00+02:00",
-            all_day=False, attendee_count=len(attendees) if attendees is not None else 0,
+            all_day=False, attendee_count=len(add_attendees),
         )
 
     def delete_event(self, event_id: str) -> None:
+        if event_id in self.foreign_event_ids:
+            raise GatekeeperDenied("not_gatekeeper_event")
         self.calls.append({"op": "delete_event", "event_id": event_id})
 
 
