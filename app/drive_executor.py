@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from app.config import GOOGLE_DRIVE_FOLDER_ID
-from app.google_auth_helper import build_google_credentials
+from app.google_auth_helper import build_google_service
 
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
@@ -53,10 +53,7 @@ class GoogleDriveClient:
         self._folder_id = folder_id or GOOGLE_DRIVE_FOLDER_ID
 
     def _service(self):
-        from googleapiclient.discovery import build  # lazy: keep this module importable without the package
-
-        creds = build_google_credentials(scopes=[DRIVE_FILE_SCOPE])
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
+        return build_google_service("drive", "v3", scopes=[DRIVE_FILE_SCOPE])
 
     def _resolve_folder_id(self, service) -> str:
         if self._folder_id:

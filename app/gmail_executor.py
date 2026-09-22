@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from app.config import GOOGLE_GMAIL_USER
-from app.google_auth_helper import build_google_credentials
+from app.google_auth_helper import build_google_service
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
@@ -99,10 +99,7 @@ class GoogleGmailClient:
         self._user = user
 
     def _service(self, scopes: list[str]):
-        from googleapiclient.discovery import build  # lazy: keep this module importable without the package
-
-        creds = build_google_credentials(scopes=scopes)
-        return build("gmail", "v1", credentials=creds, cache_discovery=False)
+        return build_google_service("gmail", "v1", scopes=scopes)
 
     def search(self, query: str, max_results: int, newer_than_days: int | None) -> list[GmailResult]:
         service = self._service([GMAIL_READONLY_SCOPE])

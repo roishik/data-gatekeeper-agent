@@ -39,6 +39,7 @@ from app.policy import (
 from app.reader_llm import ReaderLLM
 from app.reply_guard import render_reply, send_reply
 from app.request_parser import ParsedRequest, parse_request
+from app.state_store import REQUEST_COMPLETED, REQUEST_PROCESSING, is_duplicate_request_status
 
 logger = logging.getLogger("gatekeeper.pipeline")
 
@@ -185,14 +186,14 @@ def handle_webhook(
     )
     llm_usage = getattr(reader_llm, "last_usage", None) if parsed.source == "llm" else None
 
-    if state_store.is_duplicate_request(parsed.request_id):
+    if is_duplicate_request_status(state_store.get_request_status(parsed.request_id)):
         _log_audit(
             audit_log, message_id, sender_address, layer0="ok", layer1="duplicate_request",
             parsed=parsed, injection_score=injection_score,
         )
         return WebhookOutcome(200, "duplicate_request")
-    state_store.mark_request_seen(parsed.request_id)
-    state_store.record_request(sender_address)
+    state_store.set_request_status(parsed.request_id, REQUEST_PROCESSING, sender_address)
+    state_store.record_request(sender_address, parsed.request_id)
 
     # ── Layer 3: policy ──────────────────────────────────────────────────
     decision = evaluate_policy(parsed.verb, parsed.params)
@@ -280,6 +281,7 @@ def handle_webhook(
         llm_usage=llm_usage,
         injection_score=injection_score,
     )
+    state_store.set_request_status(parsed.request_id, REQUEST_COMPLETED, sender_address)
     return WebhookOutcome(200, "processed")
 
 

@@ -189,13 +189,12 @@ class SheetsAuditLog:
 
     _RANGE = "audit_log!A:A"  # one JSON blob per row, see append() below
 
-    def __init__(self, spreadsheet_id: str | None = None):
-        from googleapiclient.discovery import build  # lazy: keep this module importable without the package
+    def __init__(self, spreadsheet_id: str | None = None, service=None):
+        if service is None:
+            from app.google_auth_helper import build_google_service
 
-        from app.google_auth_helper import build_google_credentials
-
-        creds = build_google_credentials(scopes=["https://www.googleapis.com/auth/drive.file"])
-        self._service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+            service = build_google_service("sheets", "v4", scopes=["https://www.googleapis.com/auth/drive.file"])
+        self._service = service
         self.spreadsheet_id = spreadsheet_id or self._get_or_create_spreadsheet()
         self._prev_hash = self._load_last_hash()
 

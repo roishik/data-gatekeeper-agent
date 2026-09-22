@@ -61,7 +61,7 @@ from zoneinfo import ZoneInfo
 
 from app.calendar_window import EventTimeSpan, resolve_event_datetime
 from app.config import OWNER_TIMEZONE
-from app.google_auth_helper import build_google_credentials
+from app.google_auth_helper import build_google_service
 
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 # Read/write access to events only (not calendar settings/ACLs/calendar
@@ -106,10 +106,7 @@ class GoogleCalendarClient:
     configured (checked in google_auth_helper.build_google_credentials)."""
 
     def _service(self, scopes: list[str]):
-        from googleapiclient.discovery import build  # lazy: keep this module importable without the package
-
-        creds = build_google_credentials(scopes=scopes)
-        return build("calendar", "v3", credentials=creds, cache_discovery=False)
+        return build_google_service("calendar", "v3", scopes=scopes)
 
     def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]:
         service = self._service([CALENDAR_READONLY_SCOPE])
