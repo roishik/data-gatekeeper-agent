@@ -1,0 +1,26 @@
+# Offline test suite on every push and PR. Every test here runs against
+# fakes behind Protocols -- no network, no credentials, no secrets needed.
+# The live suites (tests/test_e2e_live.py, tests/test_injection_screen_live.py,
+# tests/test_sheets_live.py) skip themselves unless RUN_E2E=1, which is never
+# set here: they send real traffic and are run deliberately, by hand.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Install (exactly what uv.lock pins)
+        run: uv sync --frozen
+      - name: Offline test suite
+        run: uv run pytest -q

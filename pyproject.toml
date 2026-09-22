@@ -16,7 +16,11 @@ dependencies = [
     "typesafe-sdk>=0.6.0",
 ]
 
-[project.optional-dependencies]
+# A dependency *group* (PEP 735), not an optional extra: `uv sync` installs
+# it by default, so a fresh clone's `uv run pytest` uses this venv's pytest
+# rather than silently falling back to whatever pytest is on PATH. The
+# Dockerfile's `uv sync --no-dev` still keeps it out of the image.
+[dependency-groups]
 dev = [
     "pytest>=8.3",
 ]

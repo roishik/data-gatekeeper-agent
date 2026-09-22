@@ -1,0 +1,20 @@
+# Files `gcloud run deploy --source=.` must never upload. Without this file
+# gcloud falls back to .gitignore alone, which let untracked local tooling
+# directories (e.g. .cc10x/) ride along into the Cloud Build source bucket.
+# The Dockerfile only COPYs app/, pyproject.toml and uv.lock anyway -- this
+# keeps the uploaded source archive to the same minimum.
+#!include:.gitignore
+.git/
+.github/
+.cc10x/
+.claude/
+.pytest_cache/
+.venv/
+.env*
+data/
+docs/
+research/
+scripts/
+tests/
+CLAUDE.md
+README.md
