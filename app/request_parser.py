@@ -315,7 +315,7 @@ def _parse_via_llm(email_text: str, fallback_request_id: str, reader_llm: Reader
     for name in (
         "query", "max_results", "newer_than_days", "day_offset", "days", "to", "subject", "body", "thread_id",
         "title", "start_time", "duration_minutes", "attendees", "add_attendees", "remove_attendees", "event_id",
-        "name", "content",
+        "name", "content", "location",
     ):
         value = getattr(extraction, name, None)
         if value is not None:

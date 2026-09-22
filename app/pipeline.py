@@ -414,22 +414,22 @@ def _inbound_screen_parts(subject: str, parts: EmailParts) -> tuple[dict[str, st
     return screen, request_names
 
 
-def _make_invite_guard(output_screen: OutputScreen) -> Callable[[str], None]:
-    """A calendar event with attendees sends its title to third parties the
-    moment it's written, with no human review -- so the title is screened
-    first, and a flagged (or, failing closed, unscreenable) title refuses
-    the write. See app/output_screen.py."""
+def _make_invite_guard(output_screen: OutputScreen) -> Callable[[str, str], None]:
+    """A calendar event with attendees sends its title AND location to
+    third parties the moment it's written, with no human review -- so both
+    are screened first, and a flagged (or, failing closed, unscreenable)
+    title/location refuses the write. See app/output_screen.py."""
 
-    def guard(title: str) -> None:
+    def guard(title: str, location: str) -> None:
         try:
-            result = output_screen.screen_items({INVITE_KEY: {"title": title}})
+            result = output_screen.screen_items({INVITE_KEY: {"title": title, "location": location}})
         except Exception:
-            logger.exception("invite title screen failed")
+            logger.exception("invite title/location screen failed")
             result = all_withheld([INVITE_KEY], fail_closed=OUTPUT_SCREEN_FAIL_MODE != "open")
         if result.is_withheld(INVITE_KEY):
             raise GatekeeperDenied(
                 "sensitive_content_refused",
-                "the event title was flagged as sensitive (or could not be screened) and the event has attendees",
+                "the event title or location was flagged as sensitive (or could not be screened) and the event has attendees",
             )
 
     return guard
@@ -442,9 +442,9 @@ def _output_items(results: ExecutionResults) -> dict[str, dict[str, str]]:
     for i, e in enumerate(results.calendar_results or []):
         items[event_key(i)] = {"title": e.summary, "location": e.location}
     if results.created_event:
-        items[CREATED_EVENT_KEY] = {"title": results.created_event.summary}
+        items[CREATED_EVENT_KEY] = {"title": results.created_event.summary, "location": results.created_event.location}
     if results.updated_event:
-        items[UPDATED_EVENT_KEY] = {"title": results.updated_event.summary}
+        items[UPDATED_EVENT_KEY] = {"title": results.updated_event.summary, "location": results.updated_event.location}
     if results.draft_result:
         items[DRAFT_KEY] = {"to": results.draft_result.to, "subject": results.draft_result.subject}
     if results.drive_file_result:
@@ -470,7 +470,7 @@ def _execute(
     calendar_client_factory: Callable[[], CalendarClient],
     drive_client_factory: Callable[[], DriveClient],
     *,
-    invite_guard: Callable[[str], None],
+    invite_guard: Callable[[str, str], None],
 ) -> ExecutionResults:
     """Layer 4: only for an allowed verb -- exactly one verb, read or
     write, runs per request."""
@@ -493,17 +493,18 @@ def _execute(
         )
     elif isinstance(params, CalendarCreateEventParams):
         if params.attendees:
-            invite_guard(params.title)
+            invite_guard(params.title, params.location)
         results.created_event = calendar_client_factory().create_event(
             title=params.title, day_offset=params.day_offset, start_time=params.start_time,
             duration_minutes=params.duration_minutes, attendees=params.attendees, request_id=parsed.request_id,
+            location=params.location,
         )
     elif isinstance(params, CalendarUpdateEventParams):
         results.updated_event = calendar_client_factory().update_event(
             event_id=params.event_id, title=params.title, day_offset=params.day_offset,
             start_time=params.start_time, duration_minutes=params.duration_minutes,
             add_attendees=params.add_attendees, remove_attendees=params.remove_attendees,
-            invite_guard=invite_guard,
+            invite_guard=invite_guard, location=params.location,
         )
     elif isinstance(params, CalendarDeleteEventParams):
         calendar_client_factory().delete_event(event_id=params.event_id)

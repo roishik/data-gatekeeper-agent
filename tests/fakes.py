@@ -91,12 +91,13 @@ class FakeCalendarClient:
     result, since tests need to check exactly what was created/changed."""
 
     def __init__(self, results: list[CalendarEvent] | None = None, foreign_event_ids: set[str] | None = None,
-                 existing_title: str = "(unchanged)"):
+                 existing_title: str = "(unchanged)", existing_location: str = ""):
         self.results = results if results is not None else []
         self.calls: list[dict] = []
         # Event ids the fake treats as NOT created by the gatekeeper.
         self.foreign_event_ids = set(foreign_event_ids or ())
         self.existing_title = existing_title
+        self.existing_location = existing_location
 
     def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]:
         self.calls.append({"time_min": time_min, "time_max": time_max, "max_results": max_results})
@@ -104,20 +105,20 @@ class FakeCalendarClient:
 
     def create_event(
         self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...],
-        request_id: str = "",
+        request_id: str = "", location: str = "",
     ) -> CalendarEvent:
         self.calls.append(
             {
                 "op": "create_event", "title": title, "day_offset": day_offset,
                 "start_time": start_time, "duration_minutes": duration_minutes, "attendees": attendees,
-                "request_id": request_id,
+                "request_id": request_id, "location": location,
             }
         )
         return CalendarEvent(
             event_id="event_created_1", summary=title,
             start=f"2026-01-0{1 + day_offset}T{start_time}:00+02:00",
             end=f"2026-01-0{1 + day_offset}T{start_time}:00+02:00",
-            all_day=False, attendee_count=len(attendees),
+            all_day=False, attendee_count=len(attendees), location=location,
         )
 
     def update_event(
@@ -130,23 +131,28 @@ class FakeCalendarClient:
         add_attendees: tuple[str, ...] = (),
         remove_attendees: tuple[str, ...] = (),
         invite_guard=None,
+        location: str | None = None,
     ) -> CalendarEvent:
         # Mirrors GoogleCalendarClient's containment check and invite guard.
         if event_id in self.foreign_event_ids:
             raise GatekeeperDenied("not_gatekeeper_event")
         if add_attendees and invite_guard is not None:
-            invite_guard(title if title is not None else self.existing_title)
+            invite_guard(
+                title if title is not None else self.existing_title,
+                location if location is not None else self.existing_location,
+            )
         self.calls.append(
             {
                 "op": "update_event", "event_id": event_id, "title": title, "day_offset": day_offset,
                 "start_time": start_time, "duration_minutes": duration_minutes,
-                "add_attendees": add_attendees, "remove_attendees": remove_attendees,
+                "add_attendees": add_attendees, "remove_attendees": remove_attendees, "location": location,
             }
         )
         return CalendarEvent(
             event_id=event_id, summary=title or self.existing_title,
             start="2026-01-01T10:00:00+02:00", end="2026-01-01T10:30:00+02:00",
             all_day=False, attendee_count=len(add_attendees),
+            location=location if location is not None else self.existing_location,
         )
 
     def delete_event(self, event_id: str) -> None:

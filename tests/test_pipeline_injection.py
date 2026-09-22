@@ -785,6 +785,102 @@ def test_adding_a_guest_to_an_event_with_a_flagged_title_is_refused(configured_e
     assert calendar.calls == []
 
 
+# ── Meeting location (added 2026-09-22, owner's request) ────────────────
+
+
+def test_create_event_with_a_location_sends_it_and_reports_it(configured_env, audit_log):
+    calendar = FakeCalendarClient()
+    text = (
+        "---GATEKEEPER-REQUEST---\nrequest_id: req_loc\nverb: calendar.create_event\nparams:\n"
+        "  title: Coffee\n  day_offset: 1\n  start_time: '09:00'\n  duration_minutes: 30\n"
+        "  location: Room 4B\n---END---\n"
+    )
+    reply = _call_calendar(text, calendar, audit_log)
+    assert calendar.calls[0]["location"] == "Room 4B"
+    assert "status: completed" in reply and ", at Room 4B" in reply
+
+
+def test_create_event_with_attendees_screens_the_location_before_inviting(configured_env, audit_log):
+    from tests.fakes import FakeOutputScreen
+
+    calendar = FakeCalendarClient()
+    screen = FakeOutputScreen()
+    text = (
+        "---GATEKEEPER-REQUEST---\nrequest_id: req_loc2\nverb: calendar.create_event\nparams:\n"
+        "  title: Coffee\n  day_offset: 1\n  start_time: '09:00'\n  duration_minutes: 30\n"
+        "  location: Room 4B\n  attendees: [dana@example.com]\n---END---\n"
+    )
+    _call_calendar(text, calendar, audit_log, output_screen=screen)
+    assert screen.item_calls[0]["invite"] == {"title": "Coffee", "location": "Room 4B"}
+    assert calendar.calls[0]["location"] == "Room 4B"
+
+
+def test_adding_a_guest_to_an_event_with_a_flagged_location_is_refused(configured_env, audit_log):
+    """The invite guard covers location, not just title -- a malicious
+    location string (e.g. a phishing address) reaches real attendees via
+    the Calendar invite exactly like a malicious title would."""
+    from tests.fakes import FakeOutputScreen
+
+    calendar = FakeCalendarClient(existing_title="Planning", existing_location="Card 4111 1111 1111 1111")
+    text = (
+        "---GATEKEEPER-REQUEST---\nrequest_id: req_loc3\nverb: calendar.update_event\nparams:\n"
+        "  event_id: ownevent1\n  add_attendees: [outsider@example.com]\n---END---\n"
+    )
+    reply = _call_calendar(text, calendar, audit_log, output_screen=FakeOutputScreen(withhold={"invite"}))
+    assert "error_code: sensitive_content_refused" in reply
+    assert calendar.calls == []
+
+
+def test_update_event_location_none_leaves_it_untouched_empty_string_clears_it_end_to_end(configured_env, audit_log):
+    calendar = FakeCalendarClient(existing_location="Old room")
+
+    retitle = (
+        "---GATEKEEPER-REQUEST---\nrequest_id: req_loc4\nverb: calendar.update_event\nparams:\n"
+        "  event_id: ownevent1\n  title: Renamed\n---END---\n"
+    )
+    _call_calendar(retitle, calendar, audit_log)
+    assert calendar.calls[0]["location"] is None  # omitted entirely -- untouched
+
+    clear = (
+        "---GATEKEEPER-REQUEST---\nrequest_id: req_loc5\nverb: calendar.update_event\nparams:\n"
+        "  event_id: ownevent1\n  location: ''\n---END---\n"
+    )
+    _call_calendar(clear, calendar, audit_log)
+    assert calendar.calls[1]["location"] == ""
+
+
+def test_freeform_update_event_cannot_set_a_location_only_create_event_can(configured_env, audit_log):
+    """A plain-text calendar.create_event request can extract a location
+    (owner's request); the same is deliberately NOT wired for
+    calendar.update_event's freeform path, to stay under the reader LLM's
+    per-stage schema-size ceiling that a real production outage was caused
+    by exceeding once (see app/reader_llm.py's _CalendarUpdateFields)."""
+    reader = FakeReaderLLM(response=LLMExtraction(
+        verb="calendar.create_event", request_id="req_free_loc",
+        title="Coffee", day_offset=1, start_time="09:00", duration_minutes=30, location="Room 4B",
+    ))
+    calendar = FakeCalendarClient()
+    body = make_body(text="Set up coffee tomorrow at 9am in Room 4B, request_id req_free_loc")
+    svix_id, ts, sig = sign(body)
+    agentmail = FakeAgentMailClient()
+    handle_webhook(
+        body, svix_id=svix_id, svix_timestamp=ts, svix_signature=sig,
+        state_store=InMemoryStateStore(), reader_llm=reader, injection_screen=FakeInjectionScreen(),
+        gmail_client_factory=FakeGmailClient, calendar_client_factory=lambda: calendar,
+        drive_client_factory=FakeDriveClient, agentmail_client=agentmail, audit_log=audit_log,
+    )
+    assert calendar.calls[0]["location"] == "Room 4B"
+
+    # LLMExtraction itself HAS a location field (shared across create/update
+    # in the assembled result type) -- but request_parser only ever gets one
+    # from the LLM when the verb selected was create_event, because
+    # _CalendarUpdateFields (the schema Anthropic is actually asked to fill
+    # for calendar.update_event) has no location property to fill it from.
+    from app.reader_llm import _CalendarUpdateFields
+
+    assert "location" not in _CalendarUpdateFields.model_fields
+
+
 
 # ── Extra parameters (owner's rule, 2026-09-22) ─────────────────────────
 

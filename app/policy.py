@@ -141,6 +141,10 @@ DRAFT_THREAD_ID_MAX_CHARS = 512
 # in count.
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 EVENT_TITLE_MAX_CHARS = 200
+# A location is often a full address, room name, or video-call link --
+# longer than a title, but still one line (added 2026-09-22, owner's
+# request: Instinct couldn't send a meeting location at all before this).
+EVENT_LOCATION_MAX_CHARS = 500
 EVENT_DAY_OFFSET_MIN = 0
 EVENT_DAY_OFFSET_MAX = 365
 EVENT_DURATION_MIN_MINUTES = 5
@@ -188,6 +192,7 @@ class CalendarCreateEventParams:
     start_time: str  # "HH:MM", owner's local time
     duration_minutes: int
     attendees: tuple[str, ...] = ()
+    location: str = ""
 
 
 @dataclass(frozen=True)
@@ -197,6 +202,8 @@ class CalendarUpdateEventParams:
     day_offset: int | None = None
     start_time: str | None = None
     duration_minutes: int | None = None
+    # None = leave the location alone; "" = clear it; anything else = set it.
+    location: str | None = None
     # Merged into the event's existing guests (app/calendar_executor.py) --
     # there is deliberately no "replace the whole list" field any more.
     add_attendees: tuple[str, ...] = ()
@@ -265,9 +272,9 @@ VERB_PARAMS: dict[Verb, frozenset[str]] = {
     Verb.GMAIL_SEARCH: frozenset({"query", "max_results", "newer_than_days"}),
     Verb.GMAIL_CREATE_DRAFT: frozenset({"to", "subject", "body", "thread_id"}),
     Verb.CALENDAR_LIST_EVENTS: frozenset({"day_offset", "days", "max_results"}),
-    Verb.CALENDAR_CREATE_EVENT: frozenset({"title", "day_offset", "start_time", "duration_minutes", "attendees"}),
+    Verb.CALENDAR_CREATE_EVENT: frozenset({"title", "day_offset", "start_time", "duration_minutes", "attendees", "location"}),
     Verb.CALENDAR_UPDATE_EVENT: frozenset({
-        "event_id", "title", "day_offset", "start_time", "duration_minutes", "add_attendees", "remove_attendees",
+        "event_id", "title", "day_offset", "start_time", "duration_minutes", "location", "add_attendees", "remove_attendees",
     }),
     Verb.CALENDAR_DELETE_EVENT: frozenset({"event_id"}),
     Verb.DRIVE_CREATE_FILE: frozenset({"name", "content"}),
@@ -621,6 +628,22 @@ def _validate_attendees(value: Any) -> tuple[tuple[str, ...] | None, str | None]
     return tuple(cleaned), None
 
 
+def _validate_location(value: Any) -> tuple[str | None, str | None]:
+    """Unlike title, an empty string is valid here: it means "no location"
+    on create, and "clear the location" on update. Reaches real attendees
+    verbatim via the Calendar invite once written (not through
+    app/reply_guard.py's redaction, which only applies to what THIS
+    service tells Instinct) -- app/pipeline.py's invite guard screens it
+    the same way it screens the title before any invite goes out."""
+    if not isinstance(value, str):
+        return None, "'location' must be a string"
+    if len(value) > EVENT_LOCATION_MAX_CHARS:
+        return None, f"'location' exceeds {EVENT_LOCATION_MAX_CHARS} characters"
+    if not _is_single_line(value):
+        return None, "'location' must be a single line with no control characters"
+    return value.strip(), None
+
+
 def _validate_event_id(value: Any) -> tuple[str | None, str | None]:
     if not isinstance(value, str) or not value.strip():
         return None, "'event_id' is required and must be a non-empty string"
@@ -656,10 +679,14 @@ def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
     if err:
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
 
+    location, err = _validate_location(params.get("location", ""))
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
     # Each validator's (value, err) contract guarantees value is not None
     # here; checked explicitly rather than with `assert`, which `python -O`
     # strips -- deny-by-default must not depend on interpreter flags.
-    if title is None or day_offset is None or start_time is None or duration_minutes is None:
+    if title is None or day_offset is None or start_time is None or duration_minutes is None or location is None:
         return _deny(verb, "validated value missing")
 
     return PolicyDecision(
@@ -667,7 +694,7 @@ def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
         verb=verb,
         params=CalendarCreateEventParams(
             title=title, day_offset=day_offset, start_time=start_time,
-            duration_minutes=duration_minutes, attendees=attendees or (),
+            duration_minutes=duration_minutes, attendees=attendees or (), location=location,
         ),
     )
 
@@ -686,6 +713,7 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
         ("day_offset", _validate_day_offset),
         ("start_time", _validate_start_time),
         ("duration_minutes", _validate_duration),
+        ("location", _validate_location),
     ):
         if field_name not in params:
             continue
@@ -710,7 +738,7 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
     if not updates:
         return PolicyDecision(
             status="denied", verb=verb, error_code="invalid_params",
-            reason="at least one of title/day_offset/start_time/duration_minutes/add_attendees/remove_attendees must be given",
+            reason="at least one of title/day_offset/start_time/duration_minutes/location/add_attendees/remove_attendees must be given",
         )
 
     if event_id is None:

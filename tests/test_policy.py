@@ -413,6 +413,38 @@ def test_calendar_create_event_no_attendee_allowlist_by_design():
     assert decision.status == "allowed"
 
 
+def test_calendar_create_event_location_is_optional_and_defaults_to_empty():
+    decision = evaluate_policy(
+        "calendar.create_event", {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30}
+    )
+    assert decision.status == "allowed" and decision.params.location == ""
+
+
+def test_calendar_create_event_location_is_accepted():
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30, "location": "Room 4B"},
+    )
+    assert decision.status == "allowed" and decision.params.location == "Room 4B"
+
+
+@pytest.mark.parametrize("location", ["a" * 501, "line one\nline two", "tab\there", 123, ["not", "a", "string"]])
+def test_calendar_create_event_invalid_location_denied(location):
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30, "location": location},
+    )
+    assert decision.status == "denied" and decision.error_code == "invalid_params"
+
+
+def test_calendar_create_event_location_at_the_char_limit_is_allowed():
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30, "location": "a" * 500},
+    )
+    assert decision.status == "allowed"
+
+
 # ── calendar.update_event ───────────────────────────────────────────────
 
 
@@ -475,6 +507,24 @@ def test_calendar_update_event_add_attendees_bounded_and_validated():
     assert too_many.status == "denied" and "add_attendees" in too_many.reason
     bad = evaluate_policy("calendar.update_event", {"event_id": "ev1", "remove_attendees": ["not-an-email"]})
     assert bad.status == "denied" and "remove_attendees" in bad.reason
+
+
+def test_calendar_update_event_location_omitted_is_untouched_not_cleared():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "title": "New title"})
+    assert decision.status == "allowed" and decision.params.location is None
+
+
+def test_calendar_update_event_location_can_be_set_or_cleared():
+    set_it = evaluate_policy("calendar.update_event", {"event_id": "ev1", "location": "New room"})
+    assert set_it.status == "allowed" and set_it.params.location == "New room"
+
+    clear_it = evaluate_policy("calendar.update_event", {"event_id": "ev1", "location": ""})
+    assert clear_it.status == "allowed" and clear_it.params.location == ""  # an explicit "" IS a change
+
+
+def test_calendar_update_event_invalid_location_denied():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "location": "line one\nline two"})
+    assert decision.status == "denied" and decision.error_code == "invalid_params"
 
 
 # ── calendar.delete_event ───────────────────────────────────────────────

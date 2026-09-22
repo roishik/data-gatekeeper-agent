@@ -54,6 +54,19 @@ What the refactor changes (one commit per phase on the branch):
 - **Calendar containment** (my decision). `update_event`/`delete_event` only touch events the
   gatekeeper created (private `gatekeeper=1` property). Guests are changed with
   `add_attendees`/`remove_attendees`; the old `attendees` field replaced the whole list.
+- **Meeting location** (my request, 2026-09-22). Instinct couldn't send a location at all
+  before this. `calendar.create_event`/`update_event` now take an optional `location`
+  (≤500 chars, one line; `""` on update clears it, omitted leaves it alone). It reaches
+  attendees verbatim via the real Calendar invite, so it goes through the same invite guard
+  as the title (screened by Jev, refused together if either is flagged) before a write with
+  attendees happens — never through `reply_guard.py`'s redaction, which only covers what
+  this service tells Instinct back. Deliberately **not** wired into `calendar.update_event`'s
+  freeform (plain-text) extraction: that schema is already at the reader LLM's 7-field
+  per-stage ceiling (see "Reader LLM" above and `app/reader_llm.py`'s
+  `_CalendarUpdateFields`), which is the exact thing that caused the 2026-09-16 production
+  outage once already — I chose not to re-test that boundary without a live check backing it.
+  A location change on an existing event still works, just only via the request block.
+  `calendar.create_event`'s freeform path DOES support it (its schema had headroom, 5→6).
 - **Other changes:**
   - Output framing: forged `---GATEKEEPER-*---` markers and role tags are stripped from
     Google-derived text (ported from the old branch).
@@ -80,7 +93,7 @@ Facts about production (verified 2026-09-22 with `scripts/verify_audit_chain.py`
 - **Never run live yet:** `calendar.create_event`/`update_event`/`delete_event` and
   `drive.create_file` have still never run live; the new e2e cases cover them.
 
-Tests: `uv run pytest -q`, 396 passing, fully offline (fakes behind Protocols), and run in CI.
+Tests: `uv run pytest -q`, 419 passing, fully offline (fakes behind Protocols), and run in CI.
 There are three live suites, all skipped unless `RUN_E2E=1`; they send real traffic, so run
 them deliberately:
 - `tests/test_e2e_live.py` sends real email through the deployed service. It now also covers:
@@ -88,7 +101,8 @@ them deliberately:
   - duplicate request_id;
   - the calendar lifecycle, including containment and a freeform update;
   - the injection write gate;
-  - a withheld code-bearing email.
+  - a withheld code-bearing email;
+  - a meeting location set freeform then cleared via a block update.
 - `tests/test_injection_screen_live.py` calls the real TypeSafe API.
 - `tests/test_sheets_live.py` uses the real Sheets API on scratch spreadsheets.
 

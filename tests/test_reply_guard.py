@@ -6,6 +6,7 @@ from app.calendar_executor import CalendarEvent
 from app.config import REPLY_MAX_CHARS
 from app.drive_executor import DriveFileResult
 from app.gmail_executor import DraftResult, GmailResult
+from app.output_screen import CREATED_EVENT_KEY, ItemVerdict, OutputScreenResult
 from app.request_parser import ParsedRequest
 from app.reply_guard import redact, render_reply, send_reply
 from tests.fakes import FakeAgentMailClient
@@ -276,6 +277,26 @@ def test_render_reply_calendar_create_event_completed():
     assert "result_count: 1" in body
 
 
+def test_render_reply_calendar_create_event_with_location():
+    parsed = ParsedRequest(request_id="req_ce2", verb="calendar.create_event", params={}, source="block")
+    created = CalendarEvent(
+        event_id="e2", summary="Coffee", start="2026-09-16T14:00:00+03:00", end="2026-09-16T14:30:00+03:00",
+        all_day=False, attendee_count=0, location="Room 4B",
+    )
+    body = render_reply(parsed, "completed", None, created_event=created)
+    assert "Created event 'Coffee' — " in body and ", at Room 4B" in body
+
+
+def test_render_reply_calendar_create_event_without_a_location_omits_the_at_clause():
+    parsed = ParsedRequest(request_id="req_ce3", verb="calendar.create_event", params={}, source="block")
+    created = CalendarEvent(
+        event_id="e3", summary="Coffee", start="2026-09-16T14:00:00+03:00", end="2026-09-16T14:30:00+03:00",
+        all_day=False, attendee_count=0,
+    )
+    body = render_reply(parsed, "completed", None, created_event=created)
+    assert ", at " not in body.split("---GATEKEEPER-RESPONSE---")[0]
+
+
 def test_render_reply_calendar_update_event_completed():
     parsed = ParsedRequest(request_id="req_ue", verb="calendar.update_event", params={}, source="block")
     updated = CalendarEvent(
@@ -285,6 +306,32 @@ def test_render_reply_calendar_update_event_completed():
     body = render_reply(parsed, "completed", None, updated_event=updated)
     assert "Updated event 'Coffee (moved)'" in body
     assert "event_id: e1" in body
+
+
+def test_render_reply_calendar_update_event_with_location():
+    parsed = ParsedRequest(request_id="req_ue2", verb="calendar.update_event", params={}, source="block")
+    updated = CalendarEvent(
+        event_id="e4", summary="Coffee", start="2026-09-16T15:00:00+03:00", end="2026-09-16T15:30:00+03:00",
+        all_day=False, attendee_count=0, location="New room",
+    )
+    body = render_reply(parsed, "completed", None, updated_event=updated)
+    assert ", at New room" in body
+
+
+def test_render_reply_created_event_withheld_hides_title_and_location_but_keeps_event_id_and_time():
+    parsed = ParsedRequest(request_id="req_ce4", verb="calendar.create_event", params={}, source="block")
+    created = CalendarEvent(
+        event_id="e5", summary="1:1 salary review", start="2026-09-16T14:00:00+03:00", end="2026-09-16T14:30:00+03:00",
+        all_day=False, attendee_count=0, location="CFO's office, card 4111 1111 1111 1111",
+    )
+    output = OutputScreenResult(
+        verdicts={CREATED_EVENT_KEY: ItemVerdict(sensitive=0.9, targets_reader=0.0, category="card_number", withheld=True, screened=True)},
+        status="ok",
+    )
+    body = render_reply(parsed, "completed", None, created_event=created, output=output)
+    assert "1:1 salary review" not in body and "CFO's office" not in body and "4111" not in body
+    assert "[withheld: flagged as sensitive]" in body
+    assert "event_id: e5" in body and "14:00" in body  # id and time survive
 
 
 def test_render_reply_calendar_delete_event_completed():

@@ -54,8 +54,16 @@ Attendee changes are additive: `add_attendees` / `remove_attendees` are
 merged into the event's EXISTING guest list, keeping each existing guest's
 response status. The old `attendees` field replaced the whole list, so "add
 Dana" would silently uninvite everyone else. Adding attendees also runs the
-caller's invite guard on the event's title first (app/output_screen.py):
-an invite sends that title to third parties immediately.
+caller's invite guard on the event's title AND location first
+(app/output_screen.py): an invite sends both to third parties immediately.
+
+`location` (added 2026-09-22, owner's request) is a plain string on both
+create_event and update_event -- a room, address, or video-call link.
+Google delivers it to attendees verbatim, so it goes through the same
+invite guard as the title, not through app/reply_guard.py's redaction
+(that only applies to what THIS service tells Instinct back, never to
+what Google itself sends out). On update_event, `None` leaves the
+location untouched and `""` clears it.
 
 The list-events path below is unchanged.
 
@@ -117,7 +125,7 @@ class CalendarClient(Protocol):
     def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]: ...
     def create_event(
         self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...],
-        request_id: str,
+        request_id: str, location: str = "",
     ) -> CalendarEvent: ...
     def update_event(
         self,
@@ -128,7 +136,8 @@ class CalendarClient(Protocol):
         duration_minutes: int | None,
         add_attendees: tuple[str, ...],
         remove_attendees: tuple[str, ...],
-        invite_guard: Callable[[str], None],
+        invite_guard: Callable[[str, str], None],
+        location: str | None = None,
     ) -> CalendarEvent: ...
     def delete_event(self, event_id: str) -> None: ...
 
@@ -223,12 +232,13 @@ class GoogleCalendarClient:
 
     def create_event(
         self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...],
-        request_id: str,
+        request_id: str, location: str = "",
     ) -> CalendarEvent:
         service = self._service([CALENDAR_EVENTS_SCOPE])
         span = resolve_event_datetime(day_offset, start_time, duration_minutes, OWNER_TIMEZONE)
         body = {
             "summary": title,
+            "location": location,
             "start": {"dateTime": span.start, "timeZone": OWNER_TIMEZONE},
             "end": {"dateTime": span.end, "timeZone": OWNER_TIMEZONE},
             "attendees": [{"email": a} for a in attendees],
@@ -261,17 +271,25 @@ class GoogleCalendarClient:
         duration_minutes: int | None,
         add_attendees: tuple[str, ...],
         remove_attendees: tuple[str, ...],
-        invite_guard: Callable[[str], None],
+        invite_guard: Callable[[str, str], None],
+        location: str | None = None,
     ) -> CalendarEvent:
         service = self._service([CALENDAR_EVENTS_SCOPE])
         existing = self._get_own_event(service, event_id)
         body: dict = {}
         if title is not None:
             body["summary"] = title
+        if location is not None:
+            body["location"] = location
         if add_attendees or remove_attendees:
             if add_attendees:
-                # New guests will receive the (possibly updated) title.
-                invite_guard(title if title is not None else (existing.get("summary") or ""))
+                # New guests will receive the (possibly updated) title and
+                # location -- both go through the invite guard before the
+                # patch, same reasoning as create_event.
+                invite_guard(
+                    title if title is not None else (existing.get("summary") or ""),
+                    location if location is not None else (existing.get("location") or ""),
+                )
             body["attendees"] = merge_attendees(existing.get("attendees") or [], add_attendees, remove_attendees)
         if day_offset is not None or start_time is not None or duration_minutes is not None:
             span = _resolve_updated_timing(existing, day_offset, start_time, duration_minutes)

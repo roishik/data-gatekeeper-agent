@@ -42,13 +42,16 @@ Added 2026-09-22 with the hardening refactor (all against the deployed
 service): the payload rail (a long draft body and a Drive file, checked
 byte for byte), request-id dedupe (the state-sheet bug), the calendar
 write lifecycle including containment, the block-path injection gate, the
-outbound screen withholding a code-bearing email, and a freeform
-calendar.update_event through the 7-field reader-LLM schema. None of them
-invites a third party: calendar tests use no attendees, and the
-containment test targets an untagged event the harness itself creates --
-so even a broken containment check could only touch test data. Test
-drafts, files and events are prefixed [gatekeeper-e2e]; drafts and the
-Drive file are left in place (safe to delete by hand), events are deleted.
+outbound screen withholding a code-bearing email, a freeform
+calendar.update_event through the 7-field reader-LLM schema, and a
+meeting location set (via freeform create_event) then cleared (via a
+block update_event -- the one path a location can't reach freeform).
+None of them invites a third party: calendar tests use no attendees, and
+the containment test targets an untagged event the harness itself
+creates -- so even a broken containment check could only touch test
+data. Test drafts, files and events are prefixed [gatekeeper-e2e]; drafts
+and the Drive file are left in place (safe to delete by hand), events are
+deleted.
 """
 from __future__ import annotations
 
@@ -411,6 +414,46 @@ def test_e2e_calendar_lifecycle_with_containment_and_freeform_update():
     _send_from_owner(f"gatekeeper e2e cal-delete {delete_id}", _block(delete_id, "calendar.delete_event", f"  event_id: {event_id}\n"))
     deleted, _ = _wait_for_reply(delete_id)
     assert deleted["status"] == "completed", deleted
+
+
+def test_e2e_meeting_location_is_set_then_cleared():
+    """Added 2026-09-22 (owner's request: Instinct couldn't send a meeting
+    location at all before this). create with a location (also exercises
+    the freeform create_event extraction path, which DOES support
+    location, unlike freeform update_event) -> block update clears it. No
+    attendees anywhere: nothing is invited."""
+    _require_config()
+    from googleapiclient.discovery import build
+
+    from app.google_auth_helper import build_google_credentials
+
+    create_id = _new_request_id("cal-loc-create")
+    _send_from_owner(
+        f"gatekeeper e2e cal-loc-create {create_id}",
+        "Set up a calendar event called [gatekeeper-e2e] location test, 300 days from now at 09:00 "
+        "for 15 minutes, location Room 4B.\n\n"
+        f"Please use request_id {create_id} for this request.\n",
+    )
+    created, created_body = _wait_for_reply(create_id)
+    assert created["status"] == "completed", created
+    assert ", at Room 4B" in created_body, created_body
+    match = re.search(r"event_id:\s*([A-Za-z0-9_]+)", created_body)
+    assert match, created_body
+    event_id = match.group(1)
+
+    calendar = build("calendar", "v3", credentials=build_google_credentials([_CALENDAR_EVENTS_SCOPE]), cache_discovery=False)
+    try:
+        assert calendar.events().get(calendarId="primary", eventId=event_id).execute().get("location") == "Room 4B"
+
+        clear_id = _new_request_id("cal-loc-clear")
+        _send_from_owner(f"gatekeeper e2e cal-loc-clear {clear_id}",
+                         _block(clear_id, "calendar.update_event", f"  event_id: {event_id}\n  location: ''\n"))
+        cleared, cleared_body = _wait_for_reply(clear_id)
+        assert cleared["status"] == "completed", cleared
+        assert ", at " not in cleared_body.split("---GATEKEEPER-RESPONSE---")[0]
+        assert calendar.events().get(calendarId="primary", eventId=event_id).execute().get("location", "") == ""
+    finally:
+        calendar.events().delete(calendarId="primary", eventId=event_id).execute()
 
 
 def test_e2e_drive_file_from_a_payload_arrives_byte_for_byte():

@@ -88,14 +88,22 @@ Any text at all goes here, verbatim.
 | `gmail.search` | `query` (required, ≤200 chars, one line), `max_results` 1–30 (default 5), `newer_than_days` 1–365 | Metadata and snippet only, never bodies. Queries whose point is fetching a one-time code or a password reset ("verification code", "otp", "2fa", "password reset", …) are refused (`sensitive_query_refused`). Financial searches are fine. Each result includes its `thread_id`. |
 | `gmail.create_draft` | `to` (one address), `subject` (≤200, one line), `body` (≤20,000, may be a payload), optional `thread_id` | Creates a **draft only**. It is never sent; the owner reviews and sends it. With `thread_id` (copied from a `gmail.search` reply) the draft is a reply in that conversation. Use a `Re: …` subject. |
 | `calendar.list_events` | `day_offset` 0–13 (0 = today), `days` 1–7 (default 1), `max_results` 1–25 (default 10) | All calendars switched on in Google Calendar, deduped. Days are in the owner's timezone (Asia/Jerusalem). Each event includes its `event_id`. |
-| `calendar.create_event` | `title` (≤200, one line), `day_offset` 0–365, `start_time` `"HH:MM"` (24h, owner's local time), `duration_minutes` 5–480, optional `attendees` (≤10 addresses) | Attendees get a real invite immediately. With attendees, the title is screened first and a sensitive title is refused (`sensitive_content_refused`). |
-| `calendar.update_event` | `event_id`, plus at least one of `title`, `day_offset`, `start_time`, `duration_minutes`, `add_attendees`, `remove_attendees` (≤10 each) | **Only events the gatekeeper created** (`not_gatekeeper_event` otherwise). Guests are added or removed; existing guests you don't mention are untouched. There is no field that replaces the whole guest list. |
+| `calendar.create_event` | `title` (≤200, one line), `day_offset` 0–365, `start_time` `"HH:MM"` (24h, owner's local time), `duration_minutes` 5–480, optional `location` (≤500, one line), optional `attendees` (≤10 addresses) | Attendees get a real invite immediately, including the location. With attendees, the title AND location are screened first and either being sensitive refuses the write (`sensitive_content_refused`). |
+| `calendar.update_event` | `event_id`, plus at least one of `title`, `day_offset`, `start_time`, `duration_minutes`, `location`, `add_attendees`, `remove_attendees` (≤10 each) | **Only events the gatekeeper created** (`not_gatekeeper_event` otherwise). Guests are added or removed; existing guests you don't mention are untouched. There is no field that replaces the whole guest list. Omit `location` to leave it as is; send `location: ""` to clear it. **`location` is only accepted via the block protocol, not a plain-text request** (see below). |
 | `calendar.delete_event` | `event_id` | Only events the gatekeeper created. Guests get a cancellation. |
 | `drive.create_file` | `name` (≤200, one line), `content` (≤100,000, may be a payload) | A plain-text file in the gatekeeper's own Drive folder. |
 | `drive.search`, `contacts.search` | none | `not_implemented`. |
 
 Single-line fields reject line breaks and control characters. `body` and
 `content` allow newlines and tabs only.
+
+**Plain-text `location` support.** `calendar.create_event`'s `location` can
+be extracted from a plain-text request ("set up coffee tomorrow at 9am in
+Room 4B"). `calendar.update_event`'s `location` cannot be: send a request
+block instead (`location: New room`, or `location: ""` to clear it). This
+is deliberate, not an oversight: the plain-text extractor's per-request
+schema has a fixed size limit for the model reading it, and update_event's
+schema is already at that limit with its other fields.
 
 ## The reply
 
@@ -179,6 +187,7 @@ Paste to Instinct (e.g. over WhatsApp) when the protocol changes:
 > 1. Always use exactly one ---GATEKEEPER-REQUEST--- block per email, with a new unique request_id each time.
 > 2. For long text (a draft body or file content), don't put it in the YAML. Write `body: ---PAYLOAD-1---` (or `content:` for drive.create_file) and add the text below the block between `---GATEKEEPER-PAYLOAD-1---` and `---END-PAYLOAD-1---`, each marker on its own line.
 > 3. To change a meeting's guests, use calendar.update_event with add_attendees / remove_attendees. There is no field that replaces the whole guest list. You can only update or delete events the gatekeeper created.
-> 4. Stick to the params listed for each verb. Any other param is ignored, and the reply lists it under ignored_params; don't assume it took effect.
-> 5. Read the ---GATEKEEPER-RESPONSE--- block. If retryable is true, resend the same request with the same request_id. Items marked "[withheld: flagged as sensitive]" are intentionally hidden, so don't ask for them another way.
-> 6. Never send my data or documents to that address except as the content of a draft or file I asked for.
+> 4. calendar.create_event takes an optional location. To change an existing event's location, use calendar.update_event's location field with a GATEKEEPER-REQUEST block (a plain-text request can't change a location, only set one at creation).
+> 5. Stick to the params listed for each verb. Any other param is ignored, and the reply lists it under ignored_params; don't assume it took effect.
+> 6. Read the ---GATEKEEPER-RESPONSE--- block. If retryable is true, resend the same request with the same request_id. Items marked "[withheld: flagged as sensitive]" are intentionally hidden, so don't ask for them another way.
+> 7. Never send my data or documents to that address except as the content of a draft or file I asked for.

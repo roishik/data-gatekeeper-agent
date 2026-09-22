@@ -127,6 +127,13 @@ class LLMExtraction(BaseModel):
     start_time: str | None = None  # "HH:MM", owner's local time -- never a full date/timestamp
     duration_minutes: int | None = None
     attendees: list[str] | None = None
+    # calendar.create_event only (added 2026-09-22): a room, address, or
+    # video-call link. NOT reachable on update_event's freeform path --
+    # _CalendarUpdateFields is already at the per-stage 7-property ceiling
+    # (see its own comment); changing a location on an existing event
+    # still works, but only via the deterministic ---GATEKEEPER-REQUEST---
+    # block (app/request_parser.py), never via plain-text extraction.
+    location: str | None = None
     # calendar.update_event: guests are added/removed, never replaced
     # wholesale (app/calendar_executor.py's merge_attendees).
     add_attendees: list[str] | None = None
@@ -190,10 +197,19 @@ class _CalendarCreateFields(BaseModel):
     start_time: str | None = None
     duration_minutes: int | None = None
     attendees: list[str] | None = None
+    location: str | None = None  # 6 properties -- still under the 7-property ceiling
 
 
 class _CalendarUpdateFields(BaseModel):
     # 7 properties -- the per-stage ceiling (tests/test_request_parser.py).
+    # Deliberately NO `location` here: adding an 8th property would exceed
+    # the empirically-verified limit that caused a real production outage
+    # (see the module docstring's "Two-stage extraction" section and
+    # CLAUDE.md's 2026-09-16 entry) -- untested against the live API, not
+    # worth the risk for a field that's still reachable via the block
+    # protocol. If a future field needs adding here, drop one of these
+    # first, or split update_event's freeform extraction into its own
+    # third stage.
     model_config = ConfigDict(extra="forbid")
     event_id: str | None = None
     title: str | None = None
@@ -274,9 +290,11 @@ _STAGE2_CALENDAR_CREATE_PROMPT = _QUARANTINE_PREAMBLE + (
     "'tomorrow'->1, 'the day after tomorrow'->2, etc.) -- never an actual "
     "date, weekday name, or timestamp; 'start_time' as an 'HH:MM' 24-hour "
     "string in the owner's local time; 'duration_minutes' as an integer; "
-    "and 'attendees' as the list of exact email addresses the request "
-    "names (never add one the email didn't name, never omit one it did). "
-    "Only include a field the email actually provides."
+    "'attendees' as the list of exact email addresses the request "
+    "names (never add one the email didn't name, never omit one it did); "
+    "and 'location' as the exact room, address, or video-call link the "
+    "email states, if any (never invented). Only include a field the "
+    "email actually provides."
 )
 
 _STAGE2_CALENDAR_UPDATE_PROMPT = _QUARANTINE_PREAMBLE + (
@@ -290,7 +308,10 @@ _STAGE2_CALENDAR_UPDATE_PROMPT = _QUARANTINE_PREAMBLE + (
     "as 'HH:MM'; 'duration_minutes' as an integer; 'add_attendees' for "
     "exact email addresses the email asks to invite, and 'remove_attendees' "
     "for exact addresses it asks to uninvite -- never list existing guests "
-    "the email doesn't mention."
+    "the email doesn't mention. There is no 'location' field here -- if the "
+    "email asks to change an event's location, extract only what it "
+    "otherwise asks to change; that part of the request is not actionable "
+    "this way."
 )
 
 _STAGE2_CALENDAR_DELETE_PROMPT = _QUARANTINE_PREAMBLE + (

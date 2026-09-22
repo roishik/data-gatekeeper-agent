@@ -245,15 +245,26 @@ def render_reply(
         else:
             prose_lines.append("No events found.")
     elif status == "completed" and parsed_request.verb == "calendar.create_event" and created_event:
-        title = WITHHELD_TEXT if withheld(CREATED_EVENT_KEY) else f"'{safe_display(created_event.summary) or '(no title)'}'"
+        # Title and location are screened as ONE item (app/pipeline.py's
+        # _output_items), so a flagged event hides both together rather
+        # than exposing whichever field wasn't the sensitive one.
+        if withheld(CREATED_EVENT_KEY):
+            title, location = WITHHELD_TEXT, ""
+        else:
+            title = f"'{safe_display(created_event.summary) or '(no title)'}'"
+            location = f", at {safe_display(created_event.location)}" if created_event.location else ""
         when = format_event_range(created_event.start, created_event.end, created_event.all_day, OWNER_TIMEZONE)
         attendees = f", invited {created_event.attendee_count} attendee(s)" if created_event.attendee_count else ""
-        prose_lines.append(f"Created event {title} — {when}{attendees} (event_id: {sanitize_output(created_event.event_id)}).")
+        prose_lines.append(f"Created event {title} — {when}{location}{attendees} (event_id: {sanitize_output(created_event.event_id)}).")
     elif status == "completed" and parsed_request.verb == "calendar.update_event" and updated_event:
-        title = WITHHELD_TEXT if withheld(UPDATED_EVENT_KEY) else f"'{safe_display(updated_event.summary) or '(no title)'}'"
+        if withheld(UPDATED_EVENT_KEY):
+            title, location = WITHHELD_TEXT, ""
+        else:
+            title = f"'{safe_display(updated_event.summary) or '(no title)'}'"
+            location = f", at {safe_display(updated_event.location)}" if updated_event.location else ""
         when = format_event_range(updated_event.start, updated_event.end, updated_event.all_day, OWNER_TIMEZONE)
         attendees = f", {updated_event.attendee_count} attendee(s)" if updated_event.attendee_count else ""
-        prose_lines.append(f"Updated event {title} — {when}{attendees} (event_id: {sanitize_output(updated_event.event_id)}).")
+        prose_lines.append(f"Updated event {title} — {when}{location}{attendees} (event_id: {sanitize_output(updated_event.event_id)}).")
     elif status == "completed" and parsed_request.verb == "calendar.delete_event" and deleted_event_id:
         prose_lines.append(f"Deleted event {sanitize_output(deleted_event_id)}.")
     elif status == "completed" and parsed_request.verb == "gmail.create_draft" and draft_result:
