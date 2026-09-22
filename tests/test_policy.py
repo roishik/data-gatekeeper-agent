@@ -183,14 +183,13 @@ def test_calendar_params_has_no_recipient_or_date_string_field():
     assert field_names == {"day_offset", "days", "max_results"}
 
 
-def test_calendar_extra_params_keys_are_ignored_not_propagated():
+def test_calendar_extra_params_keys_are_rejected():
     decision = evaluate_policy(
         "calendar.list_events",
         {"day_offset": 1, "to": "attacker@evil.com", "verb": "calendar.delete_event"},
     )
-    assert decision.status == "allowed"
-    assert not hasattr(decision.params, "to")
-    assert not hasattr(decision.params, "verb")
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
 
 
 def test_unknown_verb_is_unsupported():
@@ -215,17 +214,15 @@ def test_gmail_search_params_has_no_recipient_style_field():
     assert field_names == {"query", "max_results", "newer_than_days"}
 
 
-def test_extra_params_keys_are_ignored_not_propagated():
-    """An injected extra key (e.g. 'to', mirroring the brief's own
-    example threat) is simply never read -- deny-by-default via
-    allowlisted field extraction, not by pattern-matching the key name."""
+def test_extra_params_keys_are_rejected():
+    """An injected extra key (e.g. 'to', mirroring the brief's own example
+    threat) fails closed rather than being silently ignored."""
     decision = evaluate_policy(
         "gmail.search",
         {"query": "invoice", "to": "attacker@evil.com", "verb": "gmail.send"},
     )
-    assert decision.status == "allowed"
-    assert not hasattr(decision.params, "to")
-    assert not hasattr(decision.params, "verb")
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
 
 
 # ── gmail.create_draft ──────────────────────────────────────────────────
@@ -505,3 +502,61 @@ def test_write_verbs_are_recognized_as_implemented(verb):
     from app.policy import IMPLEMENTED_VERBS, Verb
 
     assert Verb(verb) in IMPLEMENTED_VERBS
+
+
+def test_every_implemented_verb_rejects_unknown_parameters():
+    valid = {
+        "gmail.search": {"query": "invoice"},
+        "gmail.create_draft": {"to": "a@example.com", "subject": "Hi", "body": "Hello"},
+        "calendar.list_events": {},
+        "calendar.create_event": {"title": "Meet", "day_offset": 1, "start_time": "10:00", "duration_minutes": 30},
+        "calendar.update_event": {"event_id": "e1", "title": "Moved"},
+        "calendar.delete_event": {"event_id": "e1"},
+        "drive.create_file": {"name": "notes.txt", "content": "hello"},
+    }
+    for verb, params in valid.items():
+        assert evaluate_policy(verb, params).status == "allowed", verb
+        decision = evaluate_policy(verb, {**params, "unexpected": "injected"})
+        assert decision.status == "denied", verb
+        assert decision.error_code == "invalid_params", verb
+        assert "unexpected" in (decision.reason or ""), verb
+
+
+@pytest.mark.parametrize(
+    "verb, params",
+    [
+        ("gmail.search", {"query": "invoice\nfrom:boss"}),
+        ("gmail.create_draft", {"to": "a@example.com", "subject": "Hello\nBcc: attacker@evil.com", "body": "x"}),
+        ("gmail.create_draft", {"to": "a@example.com\r\nBcc: x@evil.com", "subject": "Hi", "body": "x"}),
+        ("gmail.create_draft", {"to": "a@example.com", "subject": "Hi", "body": "null byte\x00here"}),
+        ("calendar.create_event", {"title": "Meet\u2028ing", "day_offset": 1, "start_time": "10:00", "duration_minutes": 30}),
+        ("calendar.create_event", {"title": "Meet", "day_offset": 1, "start_time": "10:00", "duration_minutes": 30,
+                                   "attendees": ["a@example.com\n"]}),
+        ("drive.create_file", {"name": "notes\n.txt", "content": "x"}),
+        ("drive.create_file", {"name": "notes.txt", "content": "bell\x07"}),
+    ],
+)
+def test_control_characters_are_denied(verb, params):
+    """A newline in a draft subject used to crash Python's email library
+    mid-request (HeaderParseError); control characters never get that far now."""
+    decision = evaluate_policy(verb, params)
+    assert decision.status == "denied" and decision.error_code == "invalid_params"
+
+
+def test_multi_line_fields_still_allow_newlines_and_tabs():
+    draft = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "Hi", "body": "line 1\n\tline 2\r\n"})
+    assert draft.status == "allowed"
+    drive = evaluate_policy("drive.create_file", {"name": "notes.txt", "content": "a\n\tb"})
+    assert drive.status == "allowed"
+
+
+@pytest.mark.parametrize("event_id, ok", [
+    ("abc123def456", True),
+    ("abc123_20260922T100000Z", True),  # a recurring event's instance id
+    ("abc/../other", False),
+    ("abc 123", False),
+    ("abc123?sendUpdates=none", False),
+])
+def test_event_id_must_look_like_a_google_event_id(event_id, ok):
+    decision = evaluate_policy("calendar.delete_event", {"event_id": event_id})
+    assert (decision.status == "allowed") is ok

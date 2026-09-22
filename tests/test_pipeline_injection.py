@@ -220,7 +220,8 @@ def test_injection_in_request_block_cannot_add_recipient_or_verb(configured_env,
     assert len(agentmail.calls) == 1
     assert agentmail.calls[0]["to"] == configured_env["sender"]  # never x@evil.com
     assert "x@evil.com" not in agentmail.calls[0]["text"]
-    assert fake_gmail.calls[0]["query"] == "invoice"  # only the allowed field was read
+    assert fake_gmail.calls == []  # the injected extra field fails the whole request closed
+    assert "status: denied" in agentmail.calls[0]["text"]
 
 
 def test_injection_via_llm_fallback_cannot_smuggle_extra_fields(configured_env, audit_log):

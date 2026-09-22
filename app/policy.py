@@ -2,7 +2,7 @@
 policy.py — Layer 3: plain Python, deny-by-default authorization.
 
 This is where "the request passed Layer 0/1/2" becomes "and it's still
-only allowed to do this narrow thing" (research/03 section 4). Two rules
+only allowed to do this narrow thing" (research/03 section 4). Three rules
 hold everywhere in this file:
 
   1. Deny-by-default. Every code path that doesn't explicitly reach
@@ -11,17 +11,24 @@ hold everywhere in this file:
      simply extra is a DENIAL, never silently dropped, clamped, or
      truncated into something that would pass. The only exception is the
      documented default for `max_results`, which is a real default (used
-     when the field is absent), not a repair of a bad value.
+     when the field is absent), not a repair of a bad value. (Extra keys
+     were silently ignored until 2026-09-22; they are now denied, so a
+     requester can never believe it set a field -- a timezone, a cc, a
+     description -- that was quietly dropped.)
+  3. Single-line fields (addresses, subjects, titles, names, queries)
+     never contain a line break or other control character, and
+     multi-line fields (a draft body, a file's content) never contain a
+     control character other than tab/newline. A newline in a draft
+     subject used to crash Python's email library mid-request.
 
 The verb enum is the Action-Selector pattern from research/03 section
 2.3 made concrete: a small, closed, versioned set of operations, each
 with its own strictly-typed param dataclass. `params` arriving from
 Layer 2 is a plain dict that may contain anything (including an injected
 "to"/"recipients" key, per the brief's own example threat) -- this layer
-only ever reads the handful of keys a given verb defines and constructs
-a fresh, narrow dataclass from them. Anything else in the dict is never
-looked at again, which is what actually stops "add a recipient" from
-working: there is no field to put it in.
+denies any key a verb doesn't define, then constructs a fresh, narrow
+dataclass from the ones it does. There is no field to put "add a
+recipient" into, and an attempt to is refused outright.
 """
 from __future__ import annotations
 
@@ -123,7 +130,11 @@ EVENT_DAY_OFFSET_MAX = 365
 EVENT_DURATION_MIN_MINUTES = 5
 EVENT_DURATION_MAX_MINUTES = 480  # 8 hours
 EVENT_ATTENDEES_MAX = 10
-EVENT_ID_MAX_CHARS = 512  # Google event ids are short in practice; this only bounds pathological input
+EVENT_ID_MAX_CHARS = 1024  # Google's documented maximum
+# Google event ids are base32hex (a-v, 0-9); a recurring event's instance
+# id appends `_<timestamp>` (e.g. `abc123_20260922T100000Z`). Nothing else
+# is ever a valid id, so nothing else is ever passed to the API.
+_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 # drive.create_file bounds. Always written into one fixed, app-owned
 # folder (GOOGLE_DRIVE_FOLDER_ID, resolved in app/drive_executor.py) --
@@ -206,6 +217,41 @@ class PolicyDecision:
     ) = None
 
 
+# ── Shared validators ─────────────────────────────────────────────────────
+
+_SINGLE_LINE_FORBIDDEN_RE = re.compile(r"[\x00-\x1f\x7f\u0085\u2028\u2029]")
+_MULTI_LINE_FORBIDDEN_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _is_single_line(value: str) -> bool:
+    return not _SINGLE_LINE_FORBIDDEN_RE.search(value)
+
+
+def _is_clean_multi_line(value: str) -> bool:
+    return not _MULTI_LINE_FORBIDDEN_RE.search(value)
+
+
+def _is_email(value: str) -> bool:
+    return bool(_EMAIL_RE.match(value)) and _is_single_line(value)
+
+
+def _reject_extra_params(verb: "Verb", params: dict[str, Any], allowed: frozenset[str], hint: str = "") -> "PolicyDecision | None":
+    """Rule 2 (ported 2026-09-22 from the fix/durable-agentmail-webhook
+    branch): any key a verb doesn't define is a denial, not something to
+    skip over."""
+    extras = sorted(set(params) - allowed)
+    if not extras:
+        return None
+    return PolicyDecision(
+        status="denied", verb=verb, error_code="invalid_params",
+        reason=f"unexpected parameter(s): {', '.join(extras)}{hint}",
+    )
+
+
+def _deny(verb: "Verb", reason: str) -> "PolicyDecision":
+    return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=reason)
+
+
 def _contains_sensitive_term(query: str) -> str | None:
     lowered = query.lower()
     for term in SENSITIVE_QUERY_TERMS:
@@ -275,12 +321,18 @@ def evaluate_policy(verb_raw: str, params: dict[str, Any]) -> PolicyDecision:
 def _evaluate_gmail_search(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.GMAIL_SEARCH
 
+    extra = _reject_extra_params(verb, params, frozenset({"query", "max_results", "newer_than_days"}))
+    if extra:
+        return extra
+
     query = params.get("query")
     if not isinstance(query, str) or not query.strip():
         return PolicyDecision(
             status="denied", verb=verb, error_code="invalid_params",
             reason="'query' is required and must be a non-empty string",
         )
+    if not _is_single_line(query):
+        return _deny(verb, "'query' must be a single line with no control characters")
     if len(query) > QUERY_MAX_CHARS:
         return PolicyDecision(
             status="denied", verb=verb, error_code="invalid_params",
@@ -327,11 +379,17 @@ def _evaluate_gmail_search(params: dict[str, Any]) -> PolicyDecision:
 def _evaluate_gmail_create_draft(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.GMAIL_CREATE_DRAFT
 
+    extra = _reject_extra_params(verb, params, frozenset({"to", "subject", "body", "thread_id"}))
+    if extra:
+        return extra
+
     to = params.get("to")
     if not isinstance(to, str) or not to.strip():
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'to' is required and must be a non-empty string")
+    if not _is_single_line(to):
+        return _deny(verb, "'to' must be a single line with no control characters")
     to = to.strip()
-    if len(to) > DRAFT_TO_MAX_CHARS or not _EMAIL_RE.match(to):
+    if len(to) > DRAFT_TO_MAX_CHARS or not _is_email(to):
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'to' must be a valid email address")
 
     subject = params.get("subject")
@@ -342,6 +400,8 @@ def _evaluate_gmail_create_draft(params: dict[str, Any]) -> PolicyDecision:
             status="denied", verb=verb, error_code="invalid_params",
             reason=f"'subject' exceeds {DRAFT_SUBJECT_MAX_CHARS} characters",
         )
+    if not _is_single_line(subject):
+        return _deny(verb, "'subject' must be a single line with no control characters")
 
     body = params.get("body")
     if not isinstance(body, str) or not body.strip():
@@ -351,6 +411,8 @@ def _evaluate_gmail_create_draft(params: dict[str, Any]) -> PolicyDecision:
             status="denied", verb=verb, error_code="invalid_params",
             reason=f"'body' exceeds {DRAFT_BODY_MAX_CHARS} characters",
         )
+    if not _is_clean_multi_line(body):
+        return _deny(verb, "'body' may not contain control characters other than tab and newline")
 
     # Optional: file the draft into an existing thread (reply-in-thread).
     # Absent -> a new-email draft, exactly as before.
@@ -370,6 +432,10 @@ def _evaluate_gmail_create_draft(params: dict[str, Any]) -> PolicyDecision:
 
 def _evaluate_calendar_list_events(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_LIST_EVENTS
+
+    extra = _reject_extra_params(verb, params, frozenset({"day_offset", "days", "max_results"}))
+    if extra:
+        return extra
 
     day_offset = params.get("day_offset", CAL_DAY_OFFSET_DEFAULT)
     if not isinstance(day_offset, int) or isinstance(day_offset, bool):
@@ -417,6 +483,8 @@ def _validate_title(value: Any) -> tuple[str | None, str | None]:
         return None, "'title' is required and must be a non-empty string"
     if len(value) > EVENT_TITLE_MAX_CHARS:
         return None, f"'title' exceeds {EVENT_TITLE_MAX_CHARS} characters"
+    if not _is_single_line(value):
+        return None, "'title' must be a single line with no control characters"
     return value.strip(), None
 
 
@@ -449,7 +517,9 @@ def _validate_attendees(value: Any) -> tuple[tuple[str, ...] | None, str | None]
         return None, f"'attendees' exceeds {EVENT_ATTENDEES_MAX} entries"
     cleaned: list[str] = []
     for entry in value:
-        if not isinstance(entry, str) or not _EMAIL_RE.match(entry.strip()):
+        # Control characters are checked on the RAW value, before strip():
+        # rule 3 is about what was sent, not what's left after cleanup.
+        if not isinstance(entry, str) or not _is_single_line(entry) or not _is_email(entry.strip()):
             return None, f"'attendees' contains a value that is not a valid email address: {entry!r}"
         cleaned.append(entry.strip())
     return tuple(cleaned), None
@@ -460,11 +530,17 @@ def _validate_event_id(value: Any) -> tuple[str | None, str | None]:
         return None, "'event_id' is required and must be a non-empty string"
     if len(value) > EVENT_ID_MAX_CHARS:
         return None, f"'event_id' exceeds {EVENT_ID_MAX_CHARS} characters"
+    if not _EVENT_ID_RE.match(value.strip()):
+        return None, "'event_id' is not a valid event id"
     return value.strip(), None
 
 
 def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_CREATE_EVENT
+
+    extra = _reject_extra_params(verb, params, frozenset({"title", "day_offset", "start_time", "duration_minutes", "attendees"}))
+    if extra:
+        return extra
 
     title, err = _validate_title(params.get("title"))
     if err:
@@ -488,8 +564,10 @@ def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
 
     # Each validator's (value, err) contract guarantees value is not None
-    # here -- every branch above already returned on a non-None err.
-    assert title is not None and day_offset is not None and start_time is not None and duration_minutes is not None
+    # here; checked explicitly rather than with `assert`, which `python -O`
+    # strips -- deny-by-default must not depend on interpreter flags.
+    if title is None or day_offset is None or start_time is None or duration_minutes is None:
+        return _deny(verb, "validated value missing")
 
     return PolicyDecision(
         status="allowed",
@@ -503,6 +581,12 @@ def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
 
 def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_UPDATE_EVENT
+
+    extra = _reject_extra_params(
+        verb, params, frozenset({"event_id", "title", "day_offset", "start_time", "duration_minutes", "attendees"})
+    )
+    if extra:
+        return extra
 
     event_id, err = _validate_event_id(params.get("event_id"))
     if err:
@@ -529,29 +613,41 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
             reason="at least one of title/day_offset/start_time/duration_minutes/attendees must be given",
         )
 
-    assert event_id is not None
+    if event_id is None:
+        return _deny(verb, "validated event_id missing")
     return PolicyDecision(status="allowed", verb=verb, params=CalendarUpdateEventParams(event_id=event_id, **updates))
 
 
 def _evaluate_calendar_delete_event(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_DELETE_EVENT
 
+    extra = _reject_extra_params(verb, params, frozenset({"event_id"}))
+    if extra:
+        return extra
+
     event_id, err = _validate_event_id(params.get("event_id"))
     if err:
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
 
-    assert event_id is not None
+    if event_id is None:
+        return _deny(verb, "validated event_id missing")
     return PolicyDecision(status="allowed", verb=verb, params=CalendarDeleteEventParams(event_id=event_id))
 
 
 def _evaluate_drive_create_file(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.DRIVE_CREATE_FILE
 
+    extra = _reject_extra_params(verb, params, frozenset({"name", "content"}))
+    if extra:
+        return extra
+
     name = params.get("name")
     if not isinstance(name, str) or not name.strip():
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason="'name' is required and must be a non-empty string")
     if len(name) > DRIVE_NAME_MAX_CHARS:
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=f"'name' exceeds {DRIVE_NAME_MAX_CHARS} characters")
+    if not _is_single_line(name):
+        return _deny(verb, "'name' must be a single line with no control characters")
 
     content = params.get("content")
     if not isinstance(content, str):
@@ -561,5 +657,7 @@ def _evaluate_drive_create_file(params: dict[str, Any]) -> PolicyDecision:
             status="denied", verb=verb, error_code="invalid_params",
             reason=f"'content' exceeds {DRIVE_CONTENT_MAX_CHARS} characters",
         )
+    if not _is_clean_multi_line(content):
+        return _deny(verb, "'content' may not contain control characters other than tab and newline")
 
     return PolicyDecision(status="allowed", verb=verb, params=DriveCreateFileParams(name=name.strip(), content=content))

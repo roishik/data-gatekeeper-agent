@@ -63,6 +63,45 @@ _VERIFICATION_PHRASE_RE = re.compile(
 )
 
 
+# Structural escaping (ported 2026-09-22 from the fix/durable-agentmail-webhook
+# branch): separate from the secrecy redaction above. Every Google- or
+# attacker-derived display value is flattened to ONE printable line that
+# cannot forge protocol framing or a chat-role boundary. Before this, an
+# email subject or calendar title containing a newline plus
+# `---GATEKEEPER-RESPONSE---` could plant a fake status block in a reply --
+# a real concern, since Instinct (an LLM) parses these replies.
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_LINE_SEPARATORS_RE = re.compile(r"[\r\n\u0085\u2028\u2029]+")
+# Every marker the protocol uses, including the payload rail's (docs/PROTOCOL.md).
+_RESERVED_MARKER_RE = re.compile(
+    r"---(?:GATEKEEPER-[A-Z0-9_-]+|END(?:-PAYLOAD-[A-Za-z0-9_-]+)?|PAYLOAD-[A-Za-z0-9_-]+)---", re.I
+)
+_ROLE_TAG_RE = re.compile(r"</?\s*(?:system|assistant|developer|tool|user)(?:\s+[^>]*)?>", re.I)
+_ROLE_LABEL_RE = re.compile(r"^\s*(?:system|assistant|developer|tool|user)\s*:", re.I)
+
+
+def sanitize_output(text: str) -> str:
+    """Make provider-controlled text safe inside the line protocol: one
+    printable line, no ANSI/control characters, no protocol markers, no
+    chat-role tags or leading role labels. Used alone for opaque ids (so
+    their digit runs survive), and via safe_display() for everything else."""
+    value = str(text)
+    value = _ANSI_RE.sub("", value)
+    value = _LINE_SEPARATORS_RE.sub(" ", value)
+    value = _CONTROL_RE.sub("", value)
+    value = _RESERVED_MARKER_RE.sub("[reserved marker removed]", value)
+    value = _ROLE_TAG_RE.sub("[role tag removed]", value)
+    value = _ROLE_LABEL_RE.sub("[role label removed] ", value)
+    return " ".join(value.split())
+
+
+def safe_display(text: str) -> str:
+    """Secrecy redaction, then structural escaping -- for every display
+    value that isn't an opaque id."""
+    return sanitize_output(redact(str(text)))
+
+
 def redact(text: str) -> str:
     """Pure function, unit-tested in isolation."""
     text = _URL_RE.sub(_REDACTED, text)
@@ -116,58 +155,58 @@ def render_reply(
         if calendar_results:
             prose_lines.append(f"Found {len(calendar_results)} event(s):")
             for e in calendar_results:
-                title = redact(e.summary) or "(no title)"
+                title = safe_display(e.summary) or "(no title)"
                 when = format_event_range(e.start, e.end, e.all_day, OWNER_TIMEZONE)
-                location = f", at {redact(e.location)}" if e.location else ""
+                location = f", at {safe_display(e.location)}" if e.location else ""
                 attendees = f", {e.attendee_count} attendee(s)" if e.attendee_count else ""
-                prose_lines.append(f"- {title} — {when}{location}{attendees} (event_id: {e.event_id})")
+                prose_lines.append(f"- {title} — {when}{location}{attendees} (event_id: {sanitize_output(e.event_id)})")
         else:
             prose_lines.append("No events found.")
     elif status == "completed" and parsed_request.verb == "calendar.create_event" and created_event:
-        title = redact(created_event.summary) or "(no title)"
+        title = safe_display(created_event.summary) or "(no title)"
         when = format_event_range(created_event.start, created_event.end, created_event.all_day, OWNER_TIMEZONE)
         attendees = f", invited {created_event.attendee_count} attendee(s)" if created_event.attendee_count else ""
-        prose_lines.append(f"Created event '{title}' — {when}{attendees} (event_id: {created_event.event_id}).")
+        prose_lines.append(f"Created event '{title}' — {when}{attendees} (event_id: {sanitize_output(created_event.event_id)}).")
     elif status == "completed" and parsed_request.verb == "calendar.update_event" and updated_event:
-        title = redact(updated_event.summary) or "(no title)"
+        title = safe_display(updated_event.summary) or "(no title)"
         when = format_event_range(updated_event.start, updated_event.end, updated_event.all_day, OWNER_TIMEZONE)
-        prose_lines.append(f"Updated event '{title}' — {when} (event_id: {updated_event.event_id}).")
+        prose_lines.append(f"Updated event '{title}' — {when} (event_id: {sanitize_output(updated_event.event_id)}).")
     elif status == "completed" and parsed_request.verb == "calendar.delete_event" and deleted_event_id:
-        prose_lines.append(f"Deleted event {deleted_event_id}.")
+        prose_lines.append(f"Deleted event {sanitize_output(deleted_event_id)}.")
     elif status == "completed" and parsed_request.verb == "gmail.create_draft" and draft_result:
         where = (
-            f" (as a reply in thread {draft_result.thread_id})"
+            f" (as a reply in thread {sanitize_output(draft_result.thread_id)})"
             if draft_result.thread_id
             else ""
         )
         prose_lines.append(
-            f"Created a draft to {draft_result.to}, subject: '{redact(draft_result.subject)}'{where}. "
+            f"Created a draft to {sanitize_output(draft_result.to)}, subject: '{safe_display(draft_result.subject)}'{where}. "
             "Review and send it yourself in Gmail -- this gatekeeper never sends email on your behalf."
         )
     elif status == "completed" and parsed_request.verb == "drive.create_file" and drive_file_result:
-        prose_lines.append(f"Created Drive file '{redact(drive_file_result.name)}'.")
+        prose_lines.append(f"Created Drive file '{safe_display(drive_file_result.name)}'.")
     elif status == "completed":
         results = gmail_results or []
         if results:
             prose_lines.append(f"Found {len(results)} matching email(s):")
             for r in results:
-                subject = redact(r.subject) or "(no subject)"
-                snippet = redact(r.snippet)
+                subject = safe_display(r.subject) or "(no subject)"
+                snippet = safe_display(r.snippet)
                 # thread_id is an opaque Google token (like a calendar
-                # event_id), so it's appended RAW -- never through redact(),
-                # which would mangle its digit runs and break the ability to
-                # reply into the thread. It's what a follow-up
+                # event_id): structurally escaped only -- never through
+                # redact(), which would mangle its digit runs and break the
+                # ability to reply into the thread. It's what a follow-up
                 # gmail.create_draft copies to file a reply into this thread.
-                thread = f" (thread_id: {r.thread_id})" if r.thread_id else ""
+                thread = f" (thread_id: {sanitize_output(r.thread_id)})" if r.thread_id else ""
                 # The sender header is attacker-controlled too (display names can carry
                 # URLs or instructions), so it goes through the same redaction.
-                prose_lines.append(f"- {subject} — {redact(r.sender)} ({r.date}){thread}\n  {snippet}")
+                prose_lines.append(f"- {subject} — {safe_display(r.sender)} ({safe_display(r.date)}){thread}\n  {snippet}")
         else:
             prose_lines.append("No matching emails found.")
     elif status == "needs_clarification":
-        prose_lines.append(clarification_question or "Could you clarify this request?")
+        prose_lines.append(safe_display(clarification_question) if clarification_question else "Could you clarify this request?")
     elif status == "not_implemented":
-        prose_lines.append(f"'{parsed_request.verb}' is a recognized request type but isn't implemented yet.")
+        prose_lines.append(f"'{sanitize_output(parsed_request.verb)}' is a recognized request type but isn't implemented yet.")
     elif status == "denied":
         if error_code == "sensitive_query_refused":
             prose_lines.append(
@@ -216,9 +255,9 @@ def _error_prose(error_code: str | None, retryable: bool) -> str:
 
 def _status_block(request_id: str, status: str, error_code: str | None, result_count: int, retryable: bool) -> str:
     block = {
-        "request_id": request_id,
-        "status": status,
-        "error_code": error_code,
+        "request_id": sanitize_output(request_id),
+        "status": sanitize_output(status),
+        "error_code": sanitize_output(error_code) if error_code is not None else None,
         "retryable": retryable,
         "result_count": result_count,
     }
