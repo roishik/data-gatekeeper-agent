@@ -282,9 +282,19 @@ def handle_webhook(
         failure = classify_failure(exc)
         stage = getattr(exc, "_gatekeeper_stage", stage)
         logger.exception("request %s failed at %s (%s)", state.parsed.request_id, stage, failure.code)
-        state.reply_status, state.error_code, state.retryable = "error", failure.code, failure.retryable
         state.failure_code, state.failure_stage, state.failure_type = failure.code, stage, failure.type_name
         state.outcome_reason = "failed"
+        if state.results.wrote and state.decision is not None:
+            # The side effect already happened (the failure came after it,
+            # e.g. recording `effect_done`). Report what was done -- an
+            # "error, retryable" reply would invite a resend of a write that
+            # succeeded. The failure itself is still on the audit record.
+            state.reply_status, state.error_code = _status_for_decision(state.decision)
+            state.retryable = False
+            if state.output is None:
+                state.output = _screen_output(output_screen, state.results)
+        else:
+            state.reply_status, state.error_code, state.retryable = "error", failure.code, failure.retryable
 
     # ── Layer 5: reply ───────────────────────────────────────────────────
     _send(state, agentmail_client, output_screen)

@@ -226,3 +226,30 @@ def test_state_store_failure_before_marking_seen_propagates_so_agentmail_retries
 
     with pytest.raises(OSError):
         _call(make_body(text=SEARCH.format(rid="req_down")), store=_DownStore(), audit_log=audit_log)
+
+
+def test_failure_after_a_write_still_reports_the_write_as_done(configured_env, audit_log):
+    """If something breaks AFTER the side effect (here: recording
+    effect_done), the reply must say what was done -- never "error,
+    retryable", which would invite a resend of a write that succeeded."""
+    from app.state_store import REQUEST_EFFECT_DONE
+
+    class _FlakyStore(InMemoryStateStore):
+        def set_request_status(self, request_id, status, sender=""):
+            if status == REQUEST_EFFECT_DONE:
+                raise OSError("sheets hiccup")
+            super().set_request_status(request_id, status, sender)
+
+    gmail = FakeGmailClient()
+    agentmail = FakeAgentMailClient()
+    store = _FlakyStore()
+    outcome = _call(make_body(text=DRAFT.format(rid="req_after")), store=store, gmail=gmail, agentmail=agentmail, audit_log=audit_log)
+
+    assert outcome.reason == "failed"
+    text = agentmail.calls[0]["text"]
+    assert "status: completed" in text and "retryable: false" in text and "Created a draft" in text
+    record = audit_log.all_entries()[0]["record"]
+    assert (record["failure_code"], record["failure_stage"]) == ("upstream_unavailable", "layer1")
+    assert record["draft_id"]
+    # The final status write succeeded, so a resend is a duplicate, not a second draft.
+    assert store.get_request_status("req_after") == "completed"
