@@ -12,6 +12,7 @@ from __future__ import annotations
 from app.agentmail_client import ReplyResult
 from app.calendar_executor import CalendarEvent
 from app.drive_executor import DriveFileResult
+from app.injection_screen import InboundScreenResult
 from app.gmail_executor import DraftResult, GmailResult
 from app.reader_llm import LLMExtraction
 
@@ -38,17 +39,27 @@ class FakeReaderLLM:
 
 
 class FakeInjectionScreen:
-    """Scripted TypeSafe/Jev stand-in. Returns a fixed `score` (or None,
-    simulating "no signal" -- see app/injection_screen.py) regardless of
-    what `text` says. Records every call for assertions."""
+    """Scripted TypeSafe/Jev stand-in. Every part scores the fixed `score`
+    (or None, simulating "no signal" -- see app/injection_screen.py)
+    regardless of what it says, unless `part_scores` names a part
+    explicitly. Records every call for assertions: `calls` gets one entry
+    per screened part text, `part_calls` one dict per screen_parts() call."""
 
-    def __init__(self, score: float | None = None):
+    def __init__(self, score: float | None = None, part_scores: dict[str, float | None] | None = None):
         self.score = score
+        self.part_scores = part_scores or {}
         self.calls: list[str] = []
+        self.part_calls: list[dict[str, str]] = []
 
     def screen(self, text: str) -> float | None:
         self.calls.append(text)
         return self.score
+
+    def screen_parts(self, parts: dict[str, str]) -> InboundScreenResult:
+        self.part_calls.append(dict(parts))
+        self.calls.extend(parts.values())
+        scores = {name: self.part_scores.get(name, self.score) for name in parts}
+        return InboundScreenResult(scores=scores, status="ok")
 
 
 class FakeGmailClient:

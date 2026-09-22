@@ -136,6 +136,15 @@ TYPESAFE_MODEL = _env_str("TYPESAFE_MODEL", "jev-1.13.0")
 # positive here should be rare, not merely unlikely.
 INJECTION_DENY_THRESHOLD = _env_float("INJECTION_DENY_THRESHOLD", 0.85)
 
+# Shared Jev call plumbing (app/jev.py, added 2026-09-22). Long text is
+# chunked with overlap rather than truncated (Jev calls are cheap; see the
+# owner's cost principle in app/jev.py), chunks run concurrently, and every
+# call has a hard timeout.
+JEV_CHUNK_CHARS = _env_int("JEV_CHUNK_CHARS", 4000)
+JEV_CHUNK_OVERLAP = _env_int("JEV_CHUNK_OVERLAP", 200)
+JEV_MAX_WORKERS = _env_int("JEV_MAX_WORKERS", 8)
+JEV_TIMEOUT_SECONDS = _env_float("JEV_TIMEOUT_SECONDS", 10.0)
+
 # ── Policy (Layer 3) ─────────────────────────────────────────────────────
 # Query terms that make a gmail.search request refuse to run, regardless
 # of who's asking or how politely. Configurable, not hardcoded, per the

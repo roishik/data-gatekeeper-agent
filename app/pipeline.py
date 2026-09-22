@@ -57,12 +57,13 @@ from app.policy import (
     GmailCreateDraftParams,
     GmailSearchParams,
     PolicyDecision,
+    apply_screen_gate,
     evaluate_policy,
     parse_error_decision,
 )
 from app.reader_llm import ReaderLLM
 from app.reply_guard import render_minimal_reply, render_reply, send_reply
-from app.request_parser import ParsedRequest, fallback_request_id_for, parse_request
+from app.request_parser import EmailParts, ParsedRequest, fallback_request_id_for, parse_request, split_email
 from app.state_store import (
     REQUEST_COMPLETED,
     REQUEST_EFFECT_DONE,
@@ -120,7 +121,9 @@ class _RequestState:
     sender: str
     parsed: ParsedRequest
     layer1: str = "ok"
-    injection_score: float | None = None
+    injection_score: float | None = None  # the REQUEST score: subject + request block (or body)
+    payload_injection_score: float | None = None
+    injection_screen_status: str | None = None
     llm_usage: dict[str, int] | None = None
     decision: PolicyDecision | None = None
     results: ExecutionResults = field(default_factory=ExecutionResults)
@@ -290,17 +293,24 @@ def _run_request(
             state.outcome_reason = "rate_limited"
             return stage
 
-        # ── Injection screen (additive tripwire -- app/injection_screen.py).
-        # Subject + body together: the subject line is just as
-        # attacker-influenced as the body (research/03's OpenClaw lesson).
+        # ── Deterministic split, then the injection screen, part by part
+        # (app/injection_screen.py). The subject counts toward the request
+        # score: it's just as attacker-influenced as the body (research/03's
+        # OpenClaw lesson).
+        stage = "layer2"
+        parts = split_email(fields["text"])
         stage = "screen"
-        state.injection_score = injection_screen.screen(f"Subject: {fields['subject']}\n\n{fields['text']}")
+        screen_parts, request_part_names = _inbound_screen_parts(fields["subject"], parts)
+        inbound = injection_screen.screen_parts(screen_parts)
+        state.injection_score = inbound.max_of(request_part_names)
+        state.payload_injection_score = inbound.max_of([name for name in screen_parts if name.startswith("payload:")])
+        state.injection_screen_status = inbound.status
 
         # ── Layer 2: parse ───────────────────────────────────────────────
         stage = "layer2"
         state.parsed = parse_request(
             fields["text"], state.message_id, reader_llm,
-            injection_score=state.injection_score, injection_deny_threshold=INJECTION_DENY_THRESHOLD,
+            injection_score=state.injection_score, injection_deny_threshold=INJECTION_DENY_THRESHOLD, parts=parts,
         )
         if state.parsed.source == "llm":
             state.llm_usage = getattr(reader_llm, "last_usage", None)
@@ -323,6 +333,7 @@ def _run_request(
             state.decision = parse_error_decision(state.parsed.verb, state.parsed.parse_error, state.parsed.parse_error_detail)
         else:
             state.decision = evaluate_policy(state.parsed.verb, state.parsed.params)
+            state.decision = apply_screen_gate(state.decision, state.injection_score, INJECTION_DENY_THRESHOLD)
 
         # ── Layer 4: executor ────────────────────────────────────────────
         stage = "layer4"
@@ -337,6 +348,25 @@ def _run_request(
     except Exception as exc:
         exc._gatekeeper_stage = stage  # type: ignore[attr-defined]
         raise
+
+
+def _inbound_screen_parts(subject: str, parts: EmailParts) -> tuple[dict[str, str], list[str]]:
+    """What the injection screen scores, part by part, plus which parts make
+    up the request score (the parts that can steer what the gatekeeper
+    does). Payload parts are only ever data -- scored and logged, never
+    part of the request score."""
+    screen: dict[str, str] = {}
+    if subject.strip():
+        screen["subject"] = subject
+    if parts.remainder.strip():
+        screen["body"] = parts.remainder
+    block_names = ["request_block"] if len(parts.block_texts) == 1 else [f"request_block:{i + 1}" for i in range(len(parts.block_texts))]
+    for name, text in zip(block_names, parts.block_texts):
+        screen[name] = text
+    for name, text in parts.payloads.items():
+        screen[f"payload:{name}"] = text
+    request_names = ["subject"] + (block_names if parts.block_texts else ["body"])
+    return screen, request_names
 
 
 def _execute(
@@ -458,6 +488,8 @@ def _audit_record(state: _RequestState) -> AuditRecord:
         payload_count=parsed.payload_count if parsed else 0,
         payload_chars=parsed.payload_chars if parsed else 0,
         injection_score=state.injection_score,
+        payload_injection_score=state.payload_injection_score,
+        injection_screen_status=state.injection_screen_status,
         policy_status=state.decision.status if state.decision else None,
         policy_error_code=state.decision.error_code if state.decision else None,
         reply_status=state.reply_status,

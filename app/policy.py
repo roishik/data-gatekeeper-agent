@@ -71,6 +71,15 @@ IMPLEMENTED_VERBS = frozenset({
     Verb.DRIVE_CREATE_FILE,
 })
 NOT_IMPLEMENTED_VERBS = frozenset({Verb.DRIVE_SEARCH, Verb.CONTACTS_SEARCH})
+# Verbs with a side effect outside this service. The injection-screen gate
+# (apply_screen_gate) applies to these only.
+WRITE_VERBS = frozenset({
+    Verb.GMAIL_CREATE_DRAFT,
+    Verb.CALENDAR_CREATE_EVENT,
+    Verb.CALENDAR_UPDATE_EVENT,
+    Verb.CALENDAR_DELETE_EVENT,
+    Verb.DRIVE_CREATE_FILE,
+})
 
 QUERY_MAX_CHARS = 200
 MAX_RESULTS_DEFAULT = 5
@@ -260,6 +269,27 @@ def _contains_sensitive_term(query: str) -> str | None:
         if term.lower() in lowered:
             return term
     return None
+
+
+def apply_screen_gate(decision: PolicyDecision, injection_score: float | None, threshold: float | None) -> PolicyDecision:
+    """The block-path injection gate (owner's decision, 2026-09-22): an
+    ALLOWED write verb is denied when the request's injection score (subject
+    + request block -- app/injection_screen.py) is at or above the
+    threshold. Reads are never gated here: they stay log-only, and
+    everything they return is screened on the way out (app/output_screen.py).
+
+    This only ever adds a denial on top of a decision that was already
+    allowed -- it can never allow anything. And "no signal" (a None score:
+    screen off, or TypeSafe unreachable) never denies, so TypeSafe's
+    availability can't become a denial-of-service against real requests."""
+    if decision.status != "allowed" or decision.verb not in WRITE_VERBS:
+        return decision
+    if injection_score is None or threshold is None or injection_score < threshold:
+        return decision
+    return PolicyDecision(
+        status="denied", verb=decision.verb, error_code="screened",
+        reason="request content was flagged as a likely prompt-injection attempt",
+    )
 
 
 def parse_error_decision(verb_raw: str, error_code: str, reason: str | None) -> PolicyDecision:

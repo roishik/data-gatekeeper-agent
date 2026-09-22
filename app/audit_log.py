@@ -54,7 +54,7 @@ _FIELD_ORDER = [
     "parsed_request_id", "parsed_verb", "parsed_source",
     # Payload rail (added 2026-09-22): counts only, never payload text.
     "payload_count", "payload_chars",
-    "injection_score",
+    "injection_score", "payload_injection_score", "injection_screen_status",
     "policy_status", "policy_error_code",
     # What the requester was actually told (added 2026-09-22): the policy
     # verdict alone can't show a duplicate, an error, or a rate limit.
@@ -96,6 +96,11 @@ class AuditRecord:
     # authorizes or denies anything downstream of app/request_parser.py's
     # "screened" short-circuit -- see that module's docstring.
     injection_score: float | None = None
+    # Added 2026-09-22 with per-part screening: `injection_score` is now the
+    # REQUEST score (subject + request block, or body on the freeform
+    # path); payload text is scored separately and never gates.
+    payload_injection_score: float | None = None
+    injection_screen_status: str | None = None  # "ok" | "degraded" | "off"
     policy_status: str | None = None
     policy_error_code: str | None = None
     reply_status: str | None = None
