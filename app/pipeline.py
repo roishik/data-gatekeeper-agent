@@ -162,7 +162,8 @@ class _RequestState:
 def extract_message_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
     """Pulls the fields this pipeline needs out of an AgentMail webhook
     JSON body (`event_type` at the top level, fields nested under
-    `"message"`). A couple of plausible key-name variants (`type` alongside
+    `"message"` -- the shape every live delivery since 2026-09-15 has had).
+    A couple of plausible key-name variants (`type` alongside
     `event_type`, `id` alongside `message_id`) are accepted defensively;
     returns None if the payload doesn't look like a message event at all,
     which the caller treats as an ignored (never a trusted) event."""

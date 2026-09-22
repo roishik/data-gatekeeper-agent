@@ -198,8 +198,7 @@ GOOGLE_DRIVE_FOLDER_ID = _env("GOOGLE_DRIVE_FOLDER_ID")
 # from the original 4000 to 25000 (2026-09-17, owner request, after
 # raising gmail.search's own max_results made 4000 too tight for a full
 # 30-result reply). Not the same limit as AgentMail's own message size
-# cap, if it has one -- unverified either way (see agentmail_client.py's
-# "NOT exercised against a live AgentMail API call" caveat).
+# cap, if it has one -- unverified either way.
 REPLY_MAX_CHARS = _env_int("REPLY_MAX_CHARS", 25000)
 
 # ── Audit log ─────────────────────────────────────────────────────────────

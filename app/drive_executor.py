@@ -17,9 +17,11 @@ files/folders this app itself creates, never the owner's existing Drive
 content -- this executor can create files, but structurally cannot read
 or touch anything it didn't create itself.
 
-NOT exercised against a live Drive API call -- the files.create request
-shape below comes from Google's published REST reference. See the final
-build report's "could not verify" section.
+As of 2026-09-22 no drive.create_file has run in prod yet -- the files.create
+request shape below comes from Google's published REST reference, and the
+live suite (tests/test_e2e_live.py) is what exercises it for real. The first
+live call creates the folder and logs its id; see docs/RUNBOOK.md for pinning
+GOOGLE_DRIVE_FOLDER_ID afterwards.
 """
 from __future__ import annotations
 

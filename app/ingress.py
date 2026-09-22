@@ -44,8 +44,8 @@ from app.config import (
     WEBHOOK_TOLERANCE_SECONDS,
 )
 
-# AgentMail's docs (fetched during this build, raw markdown, not just an
-# AI-summarized pass -- see the final build report) confirm `event_type`
+# AgentMail's docs (fetched during the original build, raw markdown, not
+# just an AI-summarized pass) confirm `event_type`
 # is dot-notation and that "message.received" has three siblings this
 # service must NOT treat as a normal inbound request:
 # "message.received.spam", "message.received.blocked",

@@ -15,13 +15,9 @@ has exactly one documented shape to be wrong about (the REST endpoint)
 instead of two (the endpoint AND an SDK wrapper's mapping onto it).
 
 The endpoint path, method, and field names above were confirmed against
-AgentMail's current published API reference (raw markdown fetched during
-this build, not just an AI-summarized pass). NOT exercised against a
-live AgentMail API call, though -- no network call this service would
-make has actually been made. See the final build report's "could not
-verify" section for what that leaves open (live delivery timing/retry
-behavior, and the exact `agentmail` SDK's own wrapper, which this file
-deliberately avoids depending on).
+AgentMail's published API reference, and every reply this service has sent
+since 2026-09-15 went through this code (tests/test_e2e_live.py exercises
+it end to end).
 """
 from __future__ import annotations
 

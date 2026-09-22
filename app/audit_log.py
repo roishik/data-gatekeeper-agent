@@ -20,8 +20,9 @@ Two backends behind the AuditLog Protocol:
     in dev and by every test in this repo -- no network, no credentials.
   - SheetsAuditLog: creates its own spreadsheet on first use (scope
     drive.file -- research/07 section 4) and appends one JSON-blob row
-    per record. Used in prod. NOT exercised against a live Sheets API
-    call -- see the final build report's "could not verify" section.
+    per record. Used in prod since 2026-09-15; tests/test_sheets_live.py
+    covers it against the real API, and scripts/verify_audit_chain.py
+    checks the prod chain.
     Per research/07 section 4's own finding, a Sheets log alone is NOT
     strong tamper-evidence on its own (the same credential that appends
     can also rewrite/delete rows) -- the hash chain here makes tampering
@@ -220,10 +221,7 @@ class JSONLAuditLog:
 
 class SheetsAuditLog:
     """Google-Sheets-backed AuditLog for prod. See the module docstring
-    for the backend comparison and JSONLAuditLog for the dev/test one.
-
-    NOT exercised against a live Sheets API call -- see the final build
-    report's "could not verify" section."""
+    for the backend comparison and JSONLAuditLog for the dev/test one."""
 
     _RANGE = "audit_log!A:A"  # one JSON blob per row, see append() below
 

@@ -35,10 +35,9 @@ exclusive), `singleEvents`/`orderBy="startTime"` to expand recurring
 events into flat instances in chronological order, and each event's
 `start`/`end` objects carrying EITHER `date` (all-day) OR
 `dateTime`+`timeZone` (timed), plus `attendees` as a list -- were
-confirmed against Google's current Calendar API v3 reference (fetched
-during this build, raw HTML/embedded-JSON, not just an AI-summarized
-pass). NOT exercised against a live Calendar API call. See the final
-build report's "could not verify" section.
+confirmed against Google's Calendar API v3 reference. list_events has run
+in prod since 2026-09-15; as of 2026-09-22 the three write methods had not
+yet run live (tests/test_e2e_live.py is what exercises them for real).
 
 Write containment (added 2026-09-22, owner's decision)
 ------------------------------------------------------
