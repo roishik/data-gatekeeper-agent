@@ -111,6 +111,12 @@ ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY")
 # Pinned, dated snapshot on purpose — see research/03 and research/05: a
 # model swap should be a deliberate, tested change, never a silent float.
 ANTHROPIC_MODEL = _env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+# A plain-text (no GATEKEEPER-REQUEST block) email longer than this skips
+# the reader LLM entirely and is answered with `too_long_for_freeform`,
+# pointing at the payload rail (docs/PROTOCOL.md). Anthropic tokens are the
+# ones worth saving; long content belongs in a payload section, which no
+# LLM ever reads. Added 2026-09-22.
+READER_LLM_MAX_INPUT_CHARS = _env_int("READER_LLM_MAX_INPUT_CHARS", 20000)
 
 # ── TypeSafe (additive injection-screening tripwire, between Layers 1/2) ───
 # Added 2026-09-17. NOT the security boundary -- see app/injection_screen.py's

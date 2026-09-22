@@ -52,6 +52,8 @@ _FIELD_ORDER = [
     "event_id", "timestamp", "agentmail_message_id", "sender",
     "layer0_verdict", "layer1_verdict",
     "parsed_request_id", "parsed_verb", "parsed_source",
+    # Payload rail (added 2026-09-22): counts only, never payload text.
+    "payload_count", "payload_chars",
     "injection_score",
     "policy_status", "policy_error_code",
     # What the requester was actually told (added 2026-09-22): the policy
@@ -85,7 +87,9 @@ class AuditRecord:
     layer1_verdict: str
     parsed_request_id: str | None = None
     parsed_verb: str | None = None
-    parsed_source: str | None = None  # "block" | "llm" | "screened" | None
+    parsed_source: str | None = None  # "block" | "llm" | "screened" | "llm_skipped" | None
+    payload_count: int = 0
+    payload_chars: int = 0
     # TypeSafe/Jev Noul probability that this email attempts a prompt
     # injection (app/injection_screen.py) -- None if the screen wasn't
     # configured or its call failed. Visibility only; never itself

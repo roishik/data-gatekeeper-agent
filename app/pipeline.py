@@ -58,6 +58,7 @@ from app.policy import (
     GmailSearchParams,
     PolicyDecision,
     evaluate_policy,
+    parse_error_decision,
 )
 from app.reader_llm import ReaderLLM
 from app.reply_guard import render_minimal_reply, render_reply, send_reply
@@ -318,7 +319,10 @@ def _run_request(
 
         # ── Layer 3: policy ──────────────────────────────────────────────
         stage = "layer3"
-        state.decision = evaluate_policy(state.parsed.verb, state.parsed.params)
+        if state.parsed.parse_error:
+            state.decision = parse_error_decision(state.parsed.verb, state.parsed.parse_error, state.parsed.parse_error_detail)
+        else:
+            state.decision = evaluate_policy(state.parsed.verb, state.parsed.params)
 
         # ── Layer 4: executor ────────────────────────────────────────────
         stage = "layer4"
@@ -399,7 +403,8 @@ def _send(state: _RequestState, agentmail_client: AgentMailClient) -> None:
     try:
         body = render_reply(
             state.parsed, state.reply_status, state.error_code,
-            retryable=state.retryable, **state.results.render_kwargs(),
+            retryable=state.retryable, detail=state.decision.reason if state.decision else None,
+            **state.results.render_kwargs(),
         )
     except Exception:
         logger.exception("rendering the reply for %s failed; sending a minimal reply", state.parsed.request_id)
@@ -450,6 +455,8 @@ def _audit_record(state: _RequestState) -> AuditRecord:
         parsed_request_id=parsed.request_id if parsed else None,
         parsed_verb=parsed.verb if parsed else None,
         parsed_source=parsed.source if parsed else None,
+        payload_count=parsed.payload_count if parsed else 0,
+        payload_chars=parsed.payload_chars if parsed else 0,
         injection_score=state.injection_score,
         policy_status=state.decision.status if state.decision else None,
         policy_error_code=state.decision.error_code if state.decision else None,

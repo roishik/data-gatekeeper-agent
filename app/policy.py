@@ -104,7 +104,9 @@ CAL_MAX_RESULTS_MAX = 25
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DRAFT_TO_MAX_CHARS = 254  # RFC 5321 max mailbox length
 DRAFT_SUBJECT_MAX_CHARS = 200
-DRAFT_BODY_MAX_CHARS = 5000
+# Raised from 5,000 on 2026-09-22 with the payload rail (app/request_parser.py),
+# which carries long bodies verbatim without any LLM re-emitting them.
+DRAFT_BODY_MAX_CHARS = 20000
 # Optional thread_id: a value the requester copied from a prior
 # gmail.search reply so a draft can be filed into that conversation. It's
 # passed to Gmail's API in a JSON body (never a mail header), but we still
@@ -140,7 +142,7 @@ _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 # folder (GOOGLE_DRIVE_FOLDER_ID, resolved in app/drive_executor.py) --
 # there is no `folder` field here for a request to redirect into.
 DRIVE_NAME_MAX_CHARS = 200
-DRIVE_CONTENT_MAX_CHARS = 20000
+DRIVE_CONTENT_MAX_CHARS = 100000  # raised from 20,000 with the payload rail (2026-09-22)
 
 
 @dataclass(frozen=True)
@@ -258,6 +260,18 @@ def _contains_sensitive_term(query: str) -> str | None:
         if term.lower() in lowered:
             return term
     return None
+
+
+def parse_error_decision(verb_raw: str, error_code: str, reason: str | None) -> PolicyDecision:
+    """Layer 2 couldn't turn the email into a verb + params at all (a
+    broken or ambiguous block, a bad payload, plain text too long to
+    extract -- see app/request_parser.py). That's a denial like any other,
+    decided here so every denial still comes out of Layer 3."""
+    try:
+        verb = Verb(verb_raw)
+    except ValueError:
+        verb = Verb.UNSUPPORTED
+    return PolicyDecision(status="denied", verb=verb, error_code=error_code, reason=reason)
 
 
 def evaluate_policy(verb_raw: str, params: dict[str, Any]) -> PolicyDecision:

@@ -258,7 +258,11 @@ def test_gmail_create_draft_subject_too_long_denied():
 
 
 def test_gmail_create_draft_body_too_long_denied():
-    decision = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "hi", "body": "x" * 5001})
+    from app.policy import DRAFT_BODY_MAX_CHARS
+
+    at_cap = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "hi", "body": "x" * DRAFT_BODY_MAX_CHARS})
+    assert at_cap.status == "allowed"
+    decision = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "hi", "body": "x" * (DRAFT_BODY_MAX_CHARS + 1)})
     assert decision.status == "denied"
 
 
@@ -471,7 +475,10 @@ def test_drive_create_file_name_too_long_denied():
 
 
 def test_drive_create_file_content_too_long_denied():
-    decision = evaluate_policy("drive.create_file", {"name": "x", "content": "y" * 20001})
+    from app.policy import DRIVE_CONTENT_MAX_CHARS
+
+    assert evaluate_policy("drive.create_file", {"name": "x", "content": "y" * DRIVE_CONTENT_MAX_CHARS}).status == "allowed"
+    decision = evaluate_policy("drive.create_file", {"name": "x", "content": "y" * (DRIVE_CONTENT_MAX_CHARS + 1)})
     assert decision.status == "denied"
 
 

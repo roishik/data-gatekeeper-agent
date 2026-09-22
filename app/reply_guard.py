@@ -123,6 +123,7 @@ def render_reply(
     deleted_event_id: str | None = None,
     drive_file_result: DriveFileResult | None = None,
     retryable: bool = False,
+    detail: str | None = None,
 ) -> str:
     """Builds the full reply body. Deliberately takes no recipient
     argument at all -- see module docstring point 1. Exactly one of the
@@ -207,6 +208,14 @@ def render_reply(
         prose_lines.append(safe_display(clarification_question) if clarification_question else "Could you clarify this request?")
     elif status == "not_implemented":
         prose_lines.append(f"'{sanitize_output(parsed_request.verb)}' is a recognized request type but isn't implemented yet.")
+    elif status == "denied" and error_code in _EXPLAINED_DENIALS:
+        # Denials the requester can fix get the policy's own reason (our
+        # words, sanitized -- a reason may quote a requester-supplied value).
+        # Security denials below deliberately stay generic.
+        prose = _EXPLAINED_DENIALS[error_code]
+        if detail:
+            prose += f" Detail: {sanitize_output(detail)}."
+        prose_lines.append(prose)
     elif status == "denied":
         if error_code == "sensitive_query_refused":
             prose_lines.append(
@@ -233,6 +242,17 @@ def render_reply(
 
     return body
 
+
+_EXPLAINED_DENIALS = {
+    "invalid_params": "This request's parameters were not valid.",
+    "invalid_request_block": "The GATEKEEPER-REQUEST block could not be parsed.",
+    "ambiguous_request": "This email contains more than one GATEKEEPER-REQUEST block; send exactly one request per email.",
+    "invalid_payload": "This request's GATEKEEPER-PAYLOAD section(s) were not valid.",
+    "too_long_for_freeform": (
+        "This request is too long to handle as plain text. Resend it as a GATEKEEPER-REQUEST block, "
+        "with the long text in a GATEKEEPER-PAYLOAD section."
+    ),
+}
 
 _ERROR_PROSE = {
     "not_found": "The item this request refers to was not found.",

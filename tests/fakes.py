@@ -26,10 +26,11 @@ class FakeReaderLLM:
     response, because ReaderLLM.extract()'s return type has no room for
     anything else. Records every call for assertions."""
 
-    def __init__(self, response: LLMExtraction | None = None):
+    def __init__(self, response: LLMExtraction | None = None, failure: str | None = None):
         self.response = response
         self.calls: list[str] = []
         self.last_usage: dict[str, int] | None = {"input_tokens": 42, "output_tokens": 7}
+        self.last_failure: str | None = failure
 
     def extract(self, email_text: str) -> LLMExtraction | None:
         self.calls.append(email_text)
