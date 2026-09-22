@@ -161,12 +161,15 @@ if OUTPUT_SCREEN_FAIL_MODE not in {"closed", "open"}:
 # ── Policy (Layer 3) ─────────────────────────────────────────────────────
 # Query terms that make a gmail.search request refuse to run, regardless
 # of who's asking or how politely. Configurable, not hardcoded, per the
-# brief. Defaults cover the brief's own example threat.
+# brief. Narrowed 2026-09-22 (owner's rule) to the one-time-code and
+# password-reset searches whose whole point would be to fetch a secret.
+# Financial searches ("credit card statement", "bank account") are allowed:
+# the owner shares that information with Instinct on purpose, and card
+# numbers in the results are still redacted on the way out.
 SENSITIVE_QUERY_TERMS = _env_list(
     "SENSITIVE_QUERY_TERMS",
-    "otp,one-time code,one time code,verification code,password reset,"
-    "reset your password,2fa,two-factor,two factor,security alert,"
-    "bank account,credit card,routing number,account number,wire transfer",
+    "otp,one-time code,one time code,verification code,login code,sign-in code,"
+    "security code,password reset,reset your password,2fa,two-factor,two factor",
 )
 
 # ── Calendar window resolution (Layer 3/4/5, calendar.list_events) ─────────

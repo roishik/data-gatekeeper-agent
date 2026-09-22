@@ -783,3 +783,46 @@ def test_adding_a_guest_to_an_event_with_a_flagged_title_is_refused(configured_e
     reply = _call_calendar(text, calendar, audit_log, output_screen=FakeOutputScreen(withhold={"invite"}))
     assert "error_code: sensitive_content_refused" in reply
     assert calendar.calls == []
+
+
+
+# ── Extra parameters (owner's rule, 2026-09-22) ─────────────────────────
+
+_SEARCH_WITH_EXTRAS = (
+    "---GATEKEEPER-REQUEST---\nrequest_id: req_extra\nverb: gmail.search\nparams:\n"
+    "  query: invoice\n  timezone: Asia/Jerusalem\n  include_attachments: true\n---END---\n"
+)
+
+
+def test_extra_params_are_ignored_and_reported_when_the_request_passes_jev(configured_env, audit_log):
+    agentmail = FakeAgentMailClient()
+    outcome, fake_gmail, _ = _call(make_body(text=_SEARCH_WITH_EXTRAS), injection_screen=FakeInjectionScreen(score=0.02),
+                                   agentmail_client=agentmail, audit_log=audit_log)
+    assert outcome.reason == "processed"
+    assert fake_gmail.calls == [{"query": "invoice", "max_results": 5, "newer_than_days": None}]  # extras never passed on
+    text = agentmail.calls[0]["text"]
+    assert "status: completed" in text
+    assert "ignored parameter(s) that gmail.search doesn't use: include_attachments, timezone" in text
+    assert "ignored_params:\n- include_attachments\n- timezone" in text
+    assert audit_log.all_entries()[0]["record"]["ignored_params"] == ["include_attachments", "timezone"]
+
+
+def test_extra_params_are_denied_when_jev_flags_the_request_or_is_unavailable(configured_env, audit_log):
+    for score in (0.95, None):
+        agentmail = FakeAgentMailClient()
+        _, fake_gmail, _ = _call(make_body(message_id=f"msg_{score}", text=_SEARCH_WITH_EXTRAS),
+                                 injection_screen=FakeInjectionScreen(score=score), agentmail_client=agentmail,
+                                 audit_log=audit_log)
+        assert fake_gmail.calls == [], score
+        text = agentmail.calls[0]["text"]
+        assert "status: denied" in text and "error_code: invalid_params" in text and "timezone" in text
+
+
+def test_update_event_attendees_is_refused_even_when_jev_passes(configured_env, audit_log):
+    text = ("---GATEKEEPER-REQUEST---\nrequest_id: req_att\nverb: calendar.update_event\nparams:\n"
+            "  event_id: ev1\n  attendees: [new@example.com]\n---END---\n")
+    agentmail = FakeAgentMailClient()
+    _, _, fake_calendar = _call(make_body(text=text), injection_screen=FakeInjectionScreen(score=0.01),
+                                agentmail_client=agentmail, audit_log=audit_log)
+    assert fake_calendar.calls == []
+    assert "error_code: invalid_params" in agentmail.calls[0]["text"] and "add_attendees" in agentmail.calls[0]["text"]

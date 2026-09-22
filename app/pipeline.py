@@ -74,6 +74,7 @@ from app.policy import (
     GmailCreateDraftParams,
     GmailSearchParams,
     PolicyDecision,
+    apply_extra_params_gate,
     apply_screen_gate,
     evaluate_policy,
     parse_error_decision,
@@ -369,6 +370,7 @@ def _run_request(
         else:
             state.decision = evaluate_policy(state.parsed.verb, state.parsed.params)
             state.decision = apply_screen_gate(state.decision, state.injection_score, INJECTION_DENY_THRESHOLD)
+            state.decision = apply_extra_params_gate(state.decision, state.injection_score, INJECTION_DENY_THRESHOLD)
 
         # ── Layer 4: executor ────────────────────────────────────────────
         stage = "layer4"
@@ -533,6 +535,7 @@ def _send(state: _RequestState, agentmail_client: AgentMailClient, output_screen
             state.parsed, state.reply_status, state.error_code,
             retryable=state.retryable, detail=state.decision.reason if state.decision else None,
             output=state.output,
+            ignored_params=state.decision.ignored_params if state.decision and state.reply_status == "completed" else (),
             **state.results.render_kwargs(),
         )
     except Exception:
@@ -599,6 +602,7 @@ def _audit_record(state: _RequestState) -> AuditRecord:
         payload_injection_score=state.payload_injection_score,
         injection_screen_status=state.injection_screen_status,
         policy_status=state.decision.status if state.decision else None,
+        ignored_params=state.decision.ignored_params if state.decision else (),
         policy_error_code=state.decision.error_code if state.decision else None,
         reply_status=state.reply_status,
         reply_error_code=state.error_code,

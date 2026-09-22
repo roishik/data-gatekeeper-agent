@@ -7,14 +7,18 @@ hold everywhere in this file:
 
   1. Deny-by-default. Every code path that doesn't explicitly reach
      status="allowed" denies. There is no catch-all "otherwise allow".
-  2. Never coerce. A param that's the wrong type, out of range, or
-     simply extra is a DENIAL, never silently dropped, clamped, or
-     truncated into something that would pass. The only exception is the
-     documented default for `max_results`, which is a real default (used
-     when the field is absent), not a repair of a bad value. (Extra keys
-     were silently ignored until 2026-09-22; they are now denied, so a
-     requester can never believe it set a field -- a timezone, a cc, a
-     description -- that was quietly dropped.)
+  2. Never coerce. A param that's the wrong type or out of range is a
+     DENIAL, never silently clamped or truncated into something that
+     would pass. The only exception is the documented default for
+     `max_results`, which is a real default (used when the field is
+     absent), not a repair of a bad value. A parameter a verb doesn't
+     define at all is never read or passed on; whether the request still
+     runs is the owner's rule (2026-09-22): yes, with the extras listed
+     back in the reply as ignored, if the request passed the injection
+     screen (apply_extra_params_gate) -- so a requester never believes a
+     field it sent (a timezone, a cc) took effect -- and denied otherwise.
+     A few extras whose meaning changed are refused outright
+     (_REFUSED_EXTRA_PARAMS).
   3. Single-line fields (addresses, subjects, titles, names, queries)
      never contain a line break or other control character, and
      multi-line fields (a draft body, a file's content) never contain a
@@ -26,14 +30,15 @@ The verb enum is the Action-Selector pattern from research/03 section
 with its own strictly-typed param dataclass. `params` arriving from
 Layer 2 is a plain dict that may contain anything (including an injected
 "to"/"recipients" key, per the brief's own example threat) -- this layer
-denies any key a verb doesn't define, then constructs a fresh, narrow
-dataclass from the ones it does. There is no field to put "add a
-recipient" into, and an attempt to is refused outright.
+reads only the keys a verb defines and constructs a fresh, narrow
+dataclass from them. There is no field to put "add a recipient" into:
+an extra key never reaches an executor, whatever rule 2 decides about
+the rest of the request.
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -229,6 +234,10 @@ class PolicyDecision:
         | DriveCreateFileParams
         | None
     ) = None
+    # Extra parameters this verb doesn't define, which were NOT read or
+    # passed on. Only ever set on an allowed decision; the reply lists them
+    # so the requester knows they had no effect. See apply_extra_params_gate.
+    ignored_params: tuple[str, ...] = ()
 
 
 # ── Shared validators ─────────────────────────────────────────────────────
@@ -249,17 +258,32 @@ def _is_email(value: str) -> bool:
     return bool(_EMAIL_RE.match(value)) and _is_single_line(value)
 
 
-def _reject_extra_params(verb: "Verb", params: dict[str, Any], allowed: frozenset[str], hint: str = "") -> "PolicyDecision | None":
-    """Rule 2 (ported 2026-09-22 from the fix/durable-agentmail-webhook
-    branch): any key a verb doesn't define is a denial, not something to
-    skip over."""
-    extras = sorted(set(params) - allowed)
-    if not extras:
-        return None
-    return PolicyDecision(
-        status="denied", verb=verb, error_code="invalid_params",
-        reason=f"unexpected parameter(s): {', '.join(extras)}{hint}",
-    )
+# Every parameter each verb defines. Anything else in a request is an
+# "extra" parameter: never read, never passed on, and handled centrally in
+# evaluate_policy() -- see rule 2 in the module docstring.
+VERB_PARAMS: dict[Verb, frozenset[str]] = {
+    Verb.GMAIL_SEARCH: frozenset({"query", "max_results", "newer_than_days"}),
+    Verb.GMAIL_CREATE_DRAFT: frozenset({"to", "subject", "body", "thread_id"}),
+    Verb.CALENDAR_LIST_EVENTS: frozenset({"day_offset", "days", "max_results"}),
+    Verb.CALENDAR_CREATE_EVENT: frozenset({"title", "day_offset", "start_time", "duration_minutes", "attendees"}),
+    Verb.CALENDAR_UPDATE_EVENT: frozenset({
+        "event_id", "title", "day_offset", "start_time", "duration_minutes", "add_attendees", "remove_attendees",
+    }),
+    Verb.CALENDAR_DELETE_EVENT: frozenset({"event_id"}),
+    Verb.DRIVE_CREATE_FILE: frozenset({"name", "content"}),
+}
+# Extra parameters that are REFUSED instead of ignored, because ignoring
+# them would silently do something different from what was asked: the old
+# `attendees` on update_event meant "replace the guest list", so a request
+# using it clearly wants a guest change that ignoring it would not make.
+_REFUSED_EXTRA_PARAMS: dict[Verb, dict[str, str]] = {
+    Verb.CALENDAR_UPDATE_EVENT: {
+        "attendees": "'attendees' is not accepted here: guests are changed with add_attendees / "
+                     "remove_attendees (there is no field that replaces the whole list)",
+    },
+}
+_IGNORED_PARAMS_MAX = 20
+_IGNORED_PARAM_NAME_MAX_CHARS = 64
 
 
 def _deny(verb: "Verb", reason: str) -> "PolicyDecision":
@@ -292,6 +316,27 @@ def apply_screen_gate(decision: PolicyDecision, injection_score: float | None, t
     return PolicyDecision(
         status="denied", verb=decision.verb, error_code="screened",
         reason="request content was flagged as a likely prompt-injection attempt",
+    )
+
+
+def apply_extra_params_gate(decision: PolicyDecision, injection_score: float | None, threshold: float | None) -> PolicyDecision:
+    """Extra parameters are tolerated -- ignored, and listed in the reply --
+    only when the request PASSED the injection screen: a request score
+    below the threshold (owner's decision, 2026-09-22: a new kind of
+    request should still get a useful answer). A score at/above the
+    threshold, or no score at all (TypeSafe unreachable or not
+    configured), denies a request that carries extras. This gate can only
+    add a denial; it never allows anything."""
+    if decision.status != "allowed" or not decision.ignored_params:
+        return decision
+    if injection_score is not None and threshold is not None and injection_score < threshold:
+        return decision
+    return PolicyDecision(
+        status="denied", verb=decision.verb, error_code="invalid_params",
+        reason=(
+            f"unexpected parameter(s): {', '.join(decision.ignored_params)} -- extra parameters are only "
+            "accepted when the request passes the injection screen"
+        ),
     )
 
 
@@ -338,6 +383,19 @@ def evaluate_policy(verb_raw: str, params: dict[str, Any]) -> PolicyDecision:
             reason=f"'{verb.value}' is a recognized verb but has no executor yet",
         )
 
+    refused = _REFUSED_EXTRA_PARAMS.get(verb, {})
+    for key in params:
+        if key in refused:
+            return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=refused[key])
+    allowed_keys = VERB_PARAMS.get(verb, frozenset())
+    extras = tuple(sorted(str(key)[:_IGNORED_PARAM_NAME_MAX_CHARS] for key in params if key not in allowed_keys))
+    decision = _evaluate_known_params(verb, {k: v for k, v in params.items() if k in allowed_keys})
+    if extras and decision.status == "allowed":
+        decision = replace(decision, ignored_params=extras[:_IGNORED_PARAMS_MAX])
+    return decision
+
+
+def _evaluate_known_params(verb: Verb, params: dict[str, Any]) -> PolicyDecision:
     if verb == Verb.GMAIL_SEARCH:
         return _evaluate_gmail_search(params)
 
@@ -368,9 +426,6 @@ def evaluate_policy(verb_raw: str, params: dict[str, Any]) -> PolicyDecision:
 def _evaluate_gmail_search(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.GMAIL_SEARCH
 
-    extra = _reject_extra_params(verb, params, frozenset({"query", "max_results", "newer_than_days"}))
-    if extra:
-        return extra
 
     query = params.get("query")
     if not isinstance(query, str) or not query.strip():
@@ -426,9 +481,6 @@ def _evaluate_gmail_search(params: dict[str, Any]) -> PolicyDecision:
 def _evaluate_gmail_create_draft(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.GMAIL_CREATE_DRAFT
 
-    extra = _reject_extra_params(verb, params, frozenset({"to", "subject", "body", "thread_id"}))
-    if extra:
-        return extra
 
     to = params.get("to")
     if not isinstance(to, str) or not to.strip():
@@ -480,9 +532,6 @@ def _evaluate_gmail_create_draft(params: dict[str, Any]) -> PolicyDecision:
 def _evaluate_calendar_list_events(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_LIST_EVENTS
 
-    extra = _reject_extra_params(verb, params, frozenset({"day_offset", "days", "max_results"}))
-    if extra:
-        return extra
 
     day_offset = params.get("day_offset", CAL_DAY_OFFSET_DEFAULT)
     if not isinstance(day_offset, int) or isinstance(day_offset, bool):
@@ -585,9 +634,6 @@ def _validate_event_id(value: Any) -> tuple[str | None, str | None]:
 def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_CREATE_EVENT
 
-    extra = _reject_extra_params(verb, params, frozenset({"title", "day_offset", "start_time", "duration_minutes", "attendees"}))
-    if extra:
-        return extra
 
     title, err = _validate_title(params.get("title"))
     if err:
@@ -629,13 +675,6 @@ def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
 def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_UPDATE_EVENT
 
-    extra = _reject_extra_params(
-        verb, params,
-        frozenset({"event_id", "title", "day_offset", "start_time", "duration_minutes", "add_attendees", "remove_attendees"}),
-        hint=" (guests are changed with add_attendees / remove_attendees; there is no field that replaces the whole list)",
-    )
-    if extra:
-        return extra
 
     event_id, err = _validate_event_id(params.get("event_id"))
     if err:
@@ -682,9 +721,6 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
 def _evaluate_calendar_delete_event(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_DELETE_EVENT
 
-    extra = _reject_extra_params(verb, params, frozenset({"event_id"}))
-    if extra:
-        return extra
 
     event_id, err = _validate_event_id(params.get("event_id"))
     if err:
@@ -698,9 +734,6 @@ def _evaluate_calendar_delete_event(params: dict[str, Any]) -> PolicyDecision:
 def _evaluate_drive_create_file(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.DRIVE_CREATE_FILE
 
-    extra = _reject_extra_params(verb, params, frozenset({"name", "content"}))
-    if extra:
-        return extra
 
     name = params.get("name")
     if not isinstance(name, str) or not name.strip():

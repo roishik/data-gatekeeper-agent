@@ -92,13 +92,13 @@ def test_each_item_is_screened_with_all_three_questions(stub_sdk):
 
 
 def test_sensitive_items_are_withheld_and_categorized(stub_sdk):
-    stub_sdk.rules = {"482913": (0.97, 0.05, "security_codes_or_credentials")}
+    stub_sdk.rules = {"482913": (0.97, 0.05, "one_time_code")}
     result = TypeSafeOutputScreen().screen_items({
         "gmail:0": {"subject": "Your code", "snippet": "Your verification code is 482913"},
         "gmail:1": {"subject": "Team offsite", "snippet": "See you Thursday"},
     })
     assert result.is_withheld("gmail:0") and not result.is_withheld("gmail:1")
-    assert result.categories == ["security_codes_or_credentials"]
+    assert result.categories == ["one_time_code"]
     assert result.max_sensitive == 0.97
 
 
@@ -112,7 +112,7 @@ def test_text_aimed_at_the_reading_ai_is_withheld(stub_sdk):
 
 
 def test_thresholds_are_inclusive_and_configurable(stub_sdk):
-    stub_sdk.rules = {"borderline": (0.5, 0.0, "other_highly_private")}
+    stub_sdk.rules = {"borderline": (0.5, 0.0, "password")}
     assert TypeSafeOutputScreen(sensitive_threshold=0.5).screen_items({"x": {"t": "borderline"}}).is_withheld("x")
     assert not TypeSafeOutputScreen(sensitive_threshold=0.6).screen_items({"x": {"t": "borderline"}}).is_withheld("x")
 
@@ -126,8 +126,8 @@ def test_unscreenable_items_are_withheld_when_failing_closed(stub_sdk):
 
 
 def test_long_items_are_chunked_and_one_flagged_chunk_withholds_the_item(stub_sdk):
-    stub_sdk.rules = {"IBAN IL62": (0.9, 0.0, "financial_account_details")}
-    long_snippet = "filler " * 1200 + "IBAN IL62 0108 0000 0009 9999 999"
+    stub_sdk.rules = {"4580 1234": (0.9, 0.0, "card_number")}
+    long_snippet = "filler " * 1200 + "card 4580 1234 5678 9012"
     result = TypeSafeOutputScreen().screen_items({"event:0": {"location": long_snippet}})
     assert len(stub_sdk.calls) > 1
     assert result.is_withheld("event:0")
@@ -139,7 +139,7 @@ def test_empty_items_need_no_call(stub_sdk):
 
 
 def test_screen_text_returns_max_scores(stub_sdk):
-    stub_sdk.rules = {"secret": (0.8, 0.1, "security_codes_or_credentials")}
+    stub_sdk.rules = {"secret": (0.8, 0.1, "password")}
     assert TypeSafeOutputScreen().screen_text("benign reply with a secret inside") == (0.8, 0.1)
 
 
@@ -197,7 +197,7 @@ def test_withheld_gmail_item_keeps_its_thread_id_and_nothing_else(configured_env
     assert screen.item_calls[0]["gmail:0"]["snippet"] == "Use 482913 to sign in"
     record = audit_log.all_entries()[0]["record"]
     assert record["output_withheld_count"] == 1
-    assert record["output_withheld_categories"] == ["security_codes_or_credentials"]
+    assert record["output_withheld_categories"] == ["one_time_code"]
     assert record["output_screen_status"] == "ok"
     assert record["output_reply_sensitive"] == 0.05  # the whole-reply backstop ran
 

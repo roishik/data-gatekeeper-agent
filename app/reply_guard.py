@@ -15,8 +15,10 @@ layer:
      2026-09-22 every reply was BCC'd to the owner; the owner dropped that
      in favor of AgentMail's own thread history.
   2. Gmail result text (subject, snippet, sender) and Calendar result
-     text (event summary, location) are redacted for OTP-like codes,
-     URLs, and email-verification phrasing BEFORE they can appear in a
+     text (event summary, location) are redacted -- deterministically,
+     and deliberately narrowly -- for written-out passwords, full payment
+     card numbers (Luhn-checked), one-time codes (digits in code/login/
+     verification context), and URLs BEFORE they can appear in a
      reply -- the last line of defense against a poisoned Gmail snippet
      OR a poisoned calendar event title/location trying to phish or
      exfiltrate via the reply itself, even though Layer 3 already
@@ -64,17 +66,68 @@ from app.request_parser import ParsedRequest
 
 _REDACTED = "[redacted]"
 
-# Deliberately aggressive: over-redacting a price or a year in a subject
-# line costs nothing; under-redacting an OTP costs a lot (see module
-# docstring point 2). Order matters -- URLs first, so a URL containing a
-# digit run isn't partially mangled by _OTP_RE before _URL_RE gets to it.
+# Secrecy redaction is NARROW on purpose (owner's rule, 2026-09-22): the
+# owner shares personal, financial and business information with Instinct
+# deliberately. Exactly three things must never leak -- written-out
+# passwords, full payment card numbers, one-time codes -- the same three
+# app/output_screen.py asks Jev about. (Until then every 4-8 digit number
+# was redacted: years in dates, amounts, order numbers.) URLs are the one
+# other thing removed, for a different reason: see module docstring point 3.
+#
+# Order matters: URLs first (so a digit run inside a URL isn't half-
+# redacted), then passwords, then card numbers, then one-time codes (so a
+# card number isn't chopped into "codes" first).
 _URL_RE = re.compile(r"https?://\S+", re.I)
-_OTP_RE = re.compile(r"\b\d{4,8}\b")
-_VERIFICATION_PHRASE_RE = re.compile(
-    r"(verification code|verify your (email|account|identity)|confirm your (email|account)"
-    r"|one[- ]?time (code|password)|security code|login code|sign-?in code|password reset)",
+# A value written right after a password label: "password: hunter2",
+# "password is hunter2", "סיסמה: ...". Only redacted when the value looks
+# like a secret (see _looks_like_secret), so "password is required" stays.
+_PASSWORD_RE = re.compile(
+    r"(?P<label>\b(?:password|passwd|pwd|passcode|passphrase)\b|סיסמה|סיסמא)"
+    r"(?P<sep>\s*[:=]\s*|\s+is\s+|\s+היא\s+)(?P<value>[^\s,;]+)",
     re.I,
 )
+# 13-19 digits, optionally grouped by spaces or dashes; redacted only if
+# the digits pass the Luhn checksum every real card number passes.
+_CARD_CANDIDATE_RE = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
+# One-time codes: a 4-8 digit number, but only in text that also talks
+# about a code, login or verification -- a bare "2026" or "4999" is not one.
+_OTP_CONTEXT_RE = re.compile(
+    r"\b(?:code|otp|one[- ]?time|passcode|pin|verif\w*|2fa|mfa|two[- ]factor|sign[- ]?in|"
+    r"log[- ]?in|authenticat\w*)\b|קוד|אימות",
+    re.I,
+)
+_OTP_RE = re.compile(r"(?<![\d.,/:])\b\d{4,8}\b(?![.,/:]\d)")
+
+
+def _luhn_ok(digits: str) -> bool:
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        value = int(char)
+        if index % 2 == 1:
+            value = value * 2 - 9 if value > 4 else value * 2
+        total += value
+    return total % 10 == 0
+
+
+def _redact_card(match: re.Match) -> str:
+    digits = re.sub(r"\D", "", match.group(0))
+    return _REDACTED if 13 <= len(digits) <= 19 and _luhn_ok(digits) else match.group(0)
+
+
+def _looks_like_secret(value: str) -> bool:
+    value = value.strip(".!?)\"'")
+    if len(value) < 4:
+        return False
+    has_digit = any(c.isdigit() for c in value)
+    has_symbol = any(not c.isalnum() for c in value)
+    mixed_case = any(c.isupper() for c in value) and any(c.islower() for c in value)
+    return has_digit or has_symbol or mixed_case or not value.isascii()
+
+
+def _redact_password(match: re.Match) -> str:
+    if not _looks_like_secret(match.group("value")):
+        return match.group(0)
+    return f"{match.group('label')}{match.group('sep')}{_REDACTED}"
 
 
 # Structural escaping (ported 2026-09-22 from the fix/durable-agentmail-webhook
@@ -117,10 +170,13 @@ def safe_display(text: str) -> str:
 
 
 def redact(text: str) -> str:
-    """Pure function, unit-tested in isolation."""
+    """Pure function, unit-tested in isolation. See the comment above
+    _URL_RE for exactly what is -- and deliberately isn't -- removed."""
     text = _URL_RE.sub(_REDACTED, text)
-    text = _OTP_RE.sub(_REDACTED, text)
-    text = _VERIFICATION_PHRASE_RE.sub(_REDACTED, text)
+    text = _PASSWORD_RE.sub(_redact_password, text)
+    text = _CARD_CANDIDATE_RE.sub(_redact_card, text)
+    if _OTP_CONTEXT_RE.search(text):
+        text = _OTP_RE.sub(_REDACTED, text)
     return text
 
 
@@ -139,6 +195,7 @@ def render_reply(
     retryable: bool = False,
     detail: str | None = None,
     output: OutputScreenResult | None = None,
+    ignored_params: tuple[str, ...] = (),
 ) -> str:
     """Builds the full reply body. Deliberately takes no recipient
     argument at all -- see module docstring point 1. Exactly one of the
@@ -274,9 +331,21 @@ def render_reply(
     else:  # "unsupported" or any other/unknown status
         prose_lines.append("This request could not be understood or completed.")
 
+    ignored = [sanitize_output(name) for name in ignored_params]
+    if status == "completed" and ignored:
+        # Extra parameters are tolerated only after passing the injection
+        # screen (app/policy.py) -- and never silently: the requester must
+        # not believe a field it sent took effect.
+        prose_lines.append(
+            f"Note: ignored parameter(s) that {sanitize_output(parsed_request.verb)} doesn't use: {', '.join(ignored)}."
+        )
+
     prose = "\n".join(prose_lines)
 
-    yaml_block = _status_block(parsed_request.request_id, status, error_code, result_count, retryable, output)
+    yaml_block = _status_block(
+        parsed_request.request_id, status, error_code, result_count, retryable, output,
+        ignored if status == "completed" else [],
+    )
     body = f"{prose}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
 
     if len(body) > REPLY_MAX_CHARS:
@@ -322,7 +391,7 @@ def _error_prose(error_code: str | None, retryable: bool) -> str:
 
 def _status_block(
     request_id: str, status: str, error_code: str | None, result_count: int, retryable: bool,
-    output: OutputScreenResult | None = None,
+    output: OutputScreenResult | None = None, ignored_params: list[str] | None = None,
 ) -> str:
     block: dict = {
         "request_id": sanitize_output(request_id),
@@ -337,6 +406,8 @@ def _status_block(
         # ok | degraded (some items unscreenable, withheld) | disabled (no screen configured).
         # ("off" would be a YAML boolean -- a naive parser would read False.)
         block["screen"] = output.status
+    if ignored_params:
+        block["ignored_params"] = list(ignored_params)
     return yaml.safe_dump(block, sort_keys=False, default_flow_style=False).strip()
 
 

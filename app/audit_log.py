@@ -57,6 +57,9 @@ _FIELD_ORDER = [
     "payload_count", "payload_chars",
     "injection_score", "payload_injection_score", "injection_screen_status",
     "policy_status", "policy_error_code",
+    # Extra parameter NAMES a request carried that its verb doesn't define
+    # (added 2026-09-22, app/policy.py rule 2) -- names only, never values.
+    "ignored_params",
     # What the requester was actually told (added 2026-09-22): the policy
     # verdict alone can't show a duplicate, an error, or a rate limit.
     "reply_status", "reply_error_code",
@@ -108,6 +111,7 @@ class AuditRecord:
     injection_screen_status: str | None = None  # "ok" | "degraded" | "disabled"
     policy_status: str | None = None
     policy_error_code: str | None = None
+    ignored_params: tuple[str, ...] = field(default_factory=tuple)
     reply_status: str | None = None
     reply_error_code: str | None = None
     result_count: int = 0

@@ -40,17 +40,26 @@ What the refactor changes (one commit per phase on the branch):
   - **Inbound:** every part is scored separately (subject, body, request block, each payload).
     A high subject+block score **denies block-path write verbs** (`screened`); reads stay
     log-only. Fails open.
-  - **Outbound** (`app/output_screen.py`): every item a reply carries is screened for sensitive
-    material and for text aimed at the reading AI. Flagged items' text is withheld, ids kept.
-    Fails **closed**. Calendar invites with attendees have their title screened before
-    sending.
+  - **Outbound** (`app/output_screen.py`): every item a reply carries is screened for text
+    aimed at the reading AI, and for **exactly three secrets**: written-out passwords, full
+    payment card numbers and one-time codes (my rule, 2026-09-22). I share personal,
+    financial, medical and business information with Instinct on purpose, so nothing else
+    counts. Flagged items' text is withheld, ids kept. Fails **closed**. Calendar invites
+    with attendees have their title screened before sending.
+  - **Regex layer and query refusals narrowed to match.** The deterministic redaction
+    removes only Luhn-valid card numbers, codes in code/login context, and written-out
+    passwords (plus URLs). It used to redact every 4–8 digit number, including years in
+    dates. gmail.search refuses only one-time-code and password-reset searches; financial
+    searches are allowed.
 - **Calendar containment** (my decision). `update_event`/`delete_event` only touch events the
   gatekeeper created (private `gatekeeper=1` property). Guests are changed with
   `add_attendees`/`remove_attendees`; the old `attendees` field replaced the whole list.
 - **Other changes:**
   - Output framing: forged `---GATEKEEPER-*---` markers and role tags are stripped from
     Google-derived text (ported from the old branch).
-  - Unknown params are denied.
+  - Unknown params are never used. The request still runs, with the extras listed back as
+    `ignored_params`, only if it passed Jev; otherwise it's `invalid_params` (my rule,
+    2026-09-22).
   - Control characters are refused in single-line fields.
   - `event_id` charset is checked.
   - gmail.search fetches metadata in one batch.
@@ -71,7 +80,7 @@ Facts about production (verified 2026-09-22 with `scripts/verify_audit_chain.py`
 - **Never run live yet:** `calendar.create_event`/`update_event`/`delete_event` and
   `drive.create_file` have still never run live; the new e2e cases cover them.
 
-Tests: `uv run pytest -q`, 385 passing, fully offline (fakes behind Protocols), and run in CI.
+Tests: `uv run pytest -q`, 396 passing, fully offline (fakes behind Protocols), and run in CI.
 There are three live suites, all skipped unless `RUN_E2E=1`; they send real traffic, so run
 them deliberately:
 - `tests/test_e2e_live.py` sends real email through the deployed service. It now also covers:
@@ -122,7 +131,8 @@ decisions, all mine, all deliberate:
      audit log before trusting them;
    - pin `GOOGLE_DRIVE_FOLDER_ID` once the first live `drive.create_file` logs it.
 2. **Send Instinct the updated standing rule** (docs/PROTOCOL.md, last section): payload
-   sections, add/remove attendees, unknown params refused, `retryable`, withheld items.
+   sections, add/remove attendees, unknown params ignored (listed in `ignored_params`),
+   `retryable`, withheld items.
 3. Remove `roishik10@gmail.com` from `ALLOWED_SENDERS` (it was added for testing), and revoke
    Instinct's own Google access at myaccount.google.com/connections. The catch: the live e2e
    suite sends from that address, so it needs another sender first (or stays, knowingly).
@@ -164,9 +174,13 @@ under one process-wide lock) → `pipeline.handle_webhook`:
 
    `injection_screen.py` (Jev) scores each part in between; see `jev.py` for the shared call
    plumbing.
-3. `policy.py`: deny by default, unknown params denied, bounded params, sensitive Gmail queries
-   refused, `apply_screen_gate` for injected writes, `parse_error_decision` for Layer 2
-   failures.
+3. `policy.py`:
+   - deny by default, bounded params;
+   - unknown params are never read, and are tolerated only if Jev passes
+     (`apply_extra_params_gate`);
+   - one-time-code and password-reset Gmail queries are refused;
+   - `apply_screen_gate` for injected writes;
+   - `parse_error_decision` for Layer 2 failures.
 4. Executors, one verb per request:
    - `gmail_executor.py`: search (metadata only, batched) and create_draft (drafts only, never
      sends; threading headers);

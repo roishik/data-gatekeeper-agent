@@ -88,9 +88,7 @@ def test_gmail_search_newer_than_days_in_bounds_allowed(days):
         "find the verification code",
         "password reset email",
         "any 2fa codes",
-        "security alert from bank",
-        "my credit card statement",
-        "CREDIT CARD",  # case-insensitive
+        "latest LOGIN CODE",  # case-insensitive
     ],
 )
 def test_sensitive_queries_refused(query):
@@ -99,8 +97,16 @@ def test_sensitive_queries_refused(query):
     assert decision.error_code == "sensitive_query_refused"
 
 
-def test_non_sensitive_query_allowed():
-    decision = evaluate_policy("gmail.search", {"query": "dinner reservation confirmation"})
+@pytest.mark.parametrize("query", [
+    "dinner reservation confirmation",
+    # Narrowed 2026-09-22: financial searches are the owner's own business;
+    # only the secrets inside results (card numbers, codes) are redacted.
+    "my credit card statement",
+    "security alert from bank",
+    "wire transfer confirmation",
+])
+def test_non_sensitive_query_allowed(query):
+    decision = evaluate_policy("gmail.search", {"query": query})
     assert decision.status == "allowed"
 
 
@@ -183,13 +189,14 @@ def test_calendar_params_has_no_recipient_or_date_string_field():
     assert field_names == {"day_offset", "days", "max_results"}
 
 
-def test_calendar_extra_params_keys_are_rejected():
+def test_calendar_extra_params_are_never_read_only_listed():
     decision = evaluate_policy(
         "calendar.list_events",
         {"day_offset": 1, "to": "attacker@evil.com", "verb": "calendar.delete_event"},
     )
-    assert decision.status == "denied"
-    assert decision.error_code == "invalid_params"
+    assert decision.status == "allowed"  # the Jev gate decides the rest (apply_extra_params_gate)
+    assert decision.ignored_params == ("to", "verb")
+    assert not hasattr(decision.params, "to") and not hasattr(decision.params, "verb")
 
 
 def test_unknown_verb_is_unsupported():
@@ -214,15 +221,18 @@ def test_gmail_search_params_has_no_recipient_style_field():
     assert field_names == {"query", "max_results", "newer_than_days"}
 
 
-def test_extra_params_keys_are_rejected():
+def test_extra_params_keys_are_never_read_and_are_listed_as_ignored():
     """An injected extra key (e.g. 'to', mirroring the brief's own example
-    threat) fails closed rather than being silently ignored."""
+    threat) never reaches the params object; it's recorded so the reply can
+    say it was ignored, and apply_extra_params_gate decides whether the
+    request may run at all."""
     decision = evaluate_policy(
         "gmail.search",
         {"query": "invoice", "to": "attacker@evil.com", "verb": "gmail.send"},
     )
-    assert decision.status == "denied"
-    assert decision.error_code == "invalid_params"
+    assert decision.status == "allowed"
+    assert decision.ignored_params == ("to", "verb")
+    assert not hasattr(decision.params, "to")
 
 
 # ── gmail.create_draft ──────────────────────────────────────────────────
@@ -542,7 +552,7 @@ def test_write_verbs_are_recognized_as_implemented(verb):
     assert Verb(verb) in IMPLEMENTED_VERBS
 
 
-def test_every_implemented_verb_rejects_unknown_parameters():
+def test_every_implemented_verb_ignores_unknown_parameters():
     valid = {
         "gmail.search": {"query": "invoice"},
         "gmail.create_draft": {"to": "a@example.com", "subject": "Hi", "body": "Hello"},
@@ -555,9 +565,34 @@ def test_every_implemented_verb_rejects_unknown_parameters():
     for verb, params in valid.items():
         assert evaluate_policy(verb, params).status == "allowed", verb
         decision = evaluate_policy(verb, {**params, "unexpected": "injected"})
-        assert decision.status == "denied", verb
-        assert decision.error_code == "invalid_params", verb
-        assert "unexpected" in (decision.reason or ""), verb
+        assert decision.status == "allowed", verb
+        assert decision.ignored_params == ("unexpected",), verb
+        assert evaluate_policy(verb, params).ignored_params == (), verb
+
+
+def test_extras_on_a_denied_request_change_nothing():
+    decision = evaluate_policy("gmail.search", {"query": "", "timezone": "UTC"})
+    assert decision.status == "denied" and decision.ignored_params == ()
+
+
+def test_extra_params_gate_follows_the_injection_screen():
+    from app.policy import apply_extra_params_gate
+
+    with_extras = evaluate_policy("gmail.search", {"query": "invoice", "timezone": "UTC"})
+    assert apply_extra_params_gate(with_extras, 0.02, 0.85) is with_extras  # passed Jev: runs, extras ignored
+    for score in (0.85, 0.97, None):  # flagged, or no signal at all
+        gated = apply_extra_params_gate(with_extras, score, 0.85)
+        assert (gated.status, gated.error_code) == ("denied", "invalid_params"), score
+        assert "timezone" in gated.reason
+    clean = evaluate_policy("gmail.search", {"query": "invoice"})
+    assert apply_extra_params_gate(clean, None, 0.85) is clean  # no extras: the gate never applies
+
+
+def test_ignored_param_names_are_bounded():
+    params = {"query": "invoice", **{f"k{i:02d}" + "x" * 100: 1 for i in range(30)}}
+    decision = evaluate_policy("gmail.search", params)
+    assert len(decision.ignored_params) == 20
+    assert all(len(name) <= 64 for name in decision.ignored_params)
 
 
 @pytest.mark.parametrize(

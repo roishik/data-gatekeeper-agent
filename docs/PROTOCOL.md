@@ -35,8 +35,12 @@ params:
   `. _ : -`, starting with a letter or digit. Use a new one for every
   logically new request.
 - `verb` is required, and `params` is a YAML mapping.
-- **Any parameter a verb doesn't define is refused** (`invalid_params`);
-  it's never silently ignored.
+- **A parameter a verb doesn't define is never used.** If the request
+  passes the injection screen, it still runs: the reply lists the extras
+  under `ignored_params`, so you can tell they had no effect. If the
+  request is flagged, or the screen is unavailable, extras make it
+  `invalid_params`. One exception is refused outright: `attendees` on
+  `calendar.update_event` (use `add_attendees` / `remove_attendees`).
 - A block that is present but broken (bad YAML, missing `request_id`) gets
   `invalid_request_block` with a reason. It is never guessed at.
 
@@ -81,7 +85,7 @@ Any text at all goes here, verbatim.
 
 | verb | params | notes |
 |---|---|---|
-| `gmail.search` | `query` (required, ≤200 chars, one line), `max_results` 1–30 (default 5), `newer_than_days` 1–365 | Metadata and snippet only, never bodies. Queries about verification codes, password resets, bank or card details are refused (`sensitive_query_refused`). Each result includes its `thread_id`. |
+| `gmail.search` | `query` (required, ≤200 chars, one line), `max_results` 1–30 (default 5), `newer_than_days` 1–365 | Metadata and snippet only, never bodies. Queries whose point is fetching a one-time code or a password reset ("verification code", "otp", "2fa", "password reset", …) are refused (`sensitive_query_refused`). Financial searches are fine. Each result includes its `thread_id`. |
 | `gmail.create_draft` | `to` (one address), `subject` (≤200, one line), `body` (≤20,000, may be a payload), optional `thread_id` | Creates a **draft only**. It is never sent; the owner reviews and sends it. With `thread_id` (copied from a `gmail.search` reply) the draft is a reply in that conversation. Use a `Re: …` subject. |
 | `calendar.list_events` | `day_offset` 0–13 (0 = today), `days` 1–7 (default 1), `max_results` 1–25 (default 10) | All calendars switched on in Google Calendar, deduped. Days are in the owner's timezone (Asia/Jerusalem). Each event includes its `event_id`. |
 | `calendar.create_event` | `title` (≤200, one line), `day_offset` 0–365, `start_time` `"HH:MM"` (24h, owner's local time), `duration_minutes` 5–480, optional `attendees` (≤10 addresses) | Attendees get a real invite immediately. With attendees, the title is screened first and a sensitive title is refused (`sensitive_content_refused`). |
@@ -123,13 +127,17 @@ screen: ok
 | `result_count` | Items returned or written. |
 | `withheld_count` | Items whose text was withheld by the content screen. |
 | `screen` | Present when results were screened: `ok`, `degraded` (the screen was unavailable for some items, so their text was withheld) or `disabled`. |
+| `ignored_params` | Present when the request carried parameters its verb doesn't use. They had no effect. |
 
 ### Withheld items
 
 Every email and calendar item in a reply is checked before it's sent. An
-item is withheld when it looks like it carries sensitive material (codes,
-credentials, reset links, account or card numbers, ID numbers, health
-details) or text aimed at steering an AI reader. A withheld item shows
+item's text is withheld when it contains a written-out **password**, a full
+**payment card number**, or a **one-time code** (verification, login, 2FA,
+OTP), or text aimed at steering an AI reader. Nothing else counts as
+sensitive: personal, financial, medical and business details come through
+as they are. The same three secrets are also blanked to `[redacted]` inside
+text that isn't withheld, and so are links (URLs). A withheld item shows
 `[withheld: flagged as sensitive]`. Its `thread_id` or `event_id` (and an
 event's time) are kept, so it can still be referenced. Don't try to
 work around this.
@@ -138,7 +146,7 @@ work around this.
 
 | error_code | status | meaning and what to do |
 |---|---|---|
-| `invalid_params` | denied | A parameter is missing, out of range, malformed, or unknown. The reply says which. Fix it and send a **new** request_id. |
+| `invalid_params` | denied | A parameter is missing, out of range or malformed, or the request carried extra parameters and didn't pass the injection screen. The reply says which. Fix it and send a **new** request_id. |
 | `invalid_request_block` | denied | The block couldn't be parsed. The reply says why. |
 | `ambiguous_request` | denied | More than one request block. Send one per email. |
 | `invalid_payload` | denied | A payload problem. The reply says which. |
@@ -171,6 +179,6 @@ Paste to Instinct (e.g. over WhatsApp) when the protocol changes:
 > 1. Always use exactly one ---GATEKEEPER-REQUEST--- block per email, with a new unique request_id each time.
 > 2. For long text (a draft body or file content), don't put it in the YAML. Write `body: ---PAYLOAD-1---` (or `content:` for drive.create_file) and add the text below the block between `---GATEKEEPER-PAYLOAD-1---` and `---END-PAYLOAD-1---`, each marker on its own line.
 > 3. To change a meeting's guests, use calendar.update_event with add_attendees / remove_attendees. There is no field that replaces the whole guest list. You can only update or delete events the gatekeeper created.
-> 4. Only send the params listed for a verb. Unknown params are refused.
+> 4. Stick to the params listed for each verb. Any other param is ignored, and the reply lists it under ignored_params; don't assume it took effect.
 > 5. Read the ---GATEKEEPER-RESPONSE--- block. If retryable is true, resend the same request with the same request_id. Items marked "[withheld: flagged as sensitive]" are intentionally hidden, so don't ask for them another way.
 > 6. Never send my data or documents to that address except as the content of a draft or file I asked for.

@@ -8,8 +8,9 @@
 >   `calendar.list_events`/`create_event`/`update_event`/`delete_event`, `drive.create_file`.
 > - Calendar writes are autonomous by the owner's choice, contained to events the gatekeeper
 >   created itself.
-> - TypeSafe's Jev classifier screens every inbound part for prompt injection and every
->   outbound item for sensitive material.
+> - TypeSafe's Jev classifier screens every inbound part for prompt injection, and every
+>   outbound item for passwords, card numbers and one-time codes (only those: I share other
+>   personal information with Instinct on purpose).
 >
 > Request/response format: [`docs/PROTOCOL.md`](docs/PROTOCOL.md). Operations:
 > [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Current state, infrastructure ids and next steps:
@@ -176,8 +177,11 @@ Inbound email ─► [0] Mail gate: secret sub-address, sender allowlist, DKIM/D
 - **2026-09-22 — Hardening refactor** after a full quality review:
   - **No BCC to me.** AgentMail's thread history is the human-readable record, and the hash
     chain is the tamper-evident one.
-  - **Jev screens every outbound item.** Flagged text is withheld and ids are kept. This fails
-    closed. It means Google content now reaches a *classifier*, never a generative LLM.
+  - **Jev screens every outbound item** for exactly three secrets (passwords, full card
+    numbers, one-time codes) and for text aimed at the reading AI. Flagged text is withheld
+    and ids are kept. This fails closed. It means Google content now reaches a *classifier*,
+    never a generative LLM.
+  - **Unknown request params are ignored**, and listed back, when the request passes Jev.
   - **Injected block-path writes are denied**; reads stay log-only.
   - **Calendar update/delete only touch events the gatekeeper created**, and guests are
     added or removed rather than replaced.

@@ -25,9 +25,39 @@ def test_redact_short_and_long_digit_runs_are_left_alone():
     assert redact("only 3 items, order 123456789") == "only 3 items, order 123456789"
 
 
-def test_redact_verification_phrase():
-    assert redact("Please verify your email to continue") == "Please [redacted] to continue"
-    assert redact("Use this password reset link") == "Use this [redacted] link"
+def test_ordinary_words_and_numbers_are_left_alone():
+    """Narrowed 2026-09-22: only passwords, card numbers and one-time codes
+    are secrets. Phrases, years, amounts and phone numbers are not."""
+    for text in (
+        "Please verify your email to continue",
+        "Use this password reset link",
+        "Invoice 2026-09, total 4999 NIS",
+        "Mon, 22 Sep 2026 10:00:00 +0300",
+        "call 054-123-4567",
+        "Your password is required",
+        "Visa ending in 1111",
+    ):
+        assert redact(text) == text, text
+
+
+def test_one_time_codes_are_redacted_only_in_code_context():
+    assert redact("Use 482913 to sign in") == "Use [redacted] to sign in"
+    assert redact("G-482913 is your Google verification code") == "G-[redacted] is your Google verification code"
+    assert redact("קוד האימות שלך: 482913") == "קוד האימות שלך: [redacted]"
+    assert redact("Order 482913 has shipped") == "Order 482913 has shipped"
+
+
+def test_card_numbers_are_redacted_only_when_luhn_valid():
+    assert redact("Card 4111 1111 1111 1111 exp 09/29") == "Card [redacted] exp 09/29"
+    assert redact("mastercard 5555-5555-5555-4444") == "mastercard [redacted]"
+    assert redact("amex 378282246310005 on file") == "amex [redacted] on file"
+    assert redact("tracking 4111111111111112") == "tracking 4111111111111112"  # fails Luhn: not a card
+
+
+def test_written_out_passwords_are_redacted():
+    assert redact("password: Hunter2!") == "password: [redacted]"
+    assert redact("Your new password is Tr0ub4dor&3, change it later") == "Your new password is [redacted], change it later"
+    assert redact("הסיסמה: אבג123") == "הסיסמה: [redacted]"
 
 
 def test_redact_is_idempotent_on_clean_text():

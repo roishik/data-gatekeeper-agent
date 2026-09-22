@@ -208,7 +208,7 @@ class FakeOutputScreen:
             key: ItemVerdict(
                 sensitive=0.95 if key in self.withhold else 0.05,
                 targets_reader=0.05,
-                category="security_codes_or_credentials" if key in self.withhold else "none",
+                category="one_time_code" if key in self.withhold else "none",
                 withheld=key in self.withhold,
                 screened=True,
             )
