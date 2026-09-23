@@ -255,8 +255,8 @@ decisions, all mine, all deliberate:
 ## Open items (next steps, in order)
 
 1. **Finish the post-deploy checks.** Done on 2026-09-23: the deploy, the quota bump, the
-   Drive folder pin, the audit chain, the Sheets suite and the e2e suite. Still to do:
-   - run `tests/test_injection_screen_live.py` (real TypeSafe API);
+   Drive folder pin, the audit chain, and all three live suites (Sheets, e2e, injection screen).
+   Still to do:
    - **calibrate the Jev thresholds** (`OUTPUT_SENSITIVE_THRESHOLD` 0.5,
      `OUTPUT_INJECTION_THRESHOLD` 0.7, `INJECTION_DENY_THRESHOLD` 0.85) from real scores in the
      audit log before trusting them. The e2e run gave the first data points: ordinary requests
