@@ -91,13 +91,18 @@ class FakeCalendarClient:
     result, since tests need to check exactly what was created/changed."""
 
     def __init__(self, results: list[CalendarEvent] | None = None, foreign_event_ids: set[str] | None = None,
-                 existing_title: str = "(unchanged)", existing_location: str = ""):
+                 existing_title: str = "(unchanged)", existing_location: str = "",
+                 existing_attendees: tuple[str, ...] = ()):
         self.results = results if results is not None else []
         self.calls: list[dict] = []
         # Event ids the fake treats as NOT created by the gatekeeper.
         self.foreign_event_ids = set(foreign_event_ids or ())
         self.existing_title = existing_title
         self.existing_location = existing_location
+        # Emails already on the event before this update -- lets tests
+        # exercise the invite guard on a title/location-only change to an
+        # event that already has guests (see GoogleCalendarClient.update_event).
+        self.existing_attendees = tuple(existing_attendees)
 
     def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]:
         self.calls.append({"time_min": time_min, "time_max": time_max, "max_results": max_results})
@@ -133,10 +138,17 @@ class FakeCalendarClient:
         invite_guard=None,
         location: str | None = None,
     ) -> CalendarEvent:
-        # Mirrors GoogleCalendarClient's containment check and invite guard.
+        # Mirrors GoogleCalendarClient's containment check and invite guard:
+        # the guard fires whenever the resulting attendee list is
+        # non-empty AND title/location is changing (not only when a new
+        # guest is being added -- sendUpdates="all" notifies EXISTING
+        # guests of any changed field too).
         if event_id in self.foreign_event_ids:
             raise GatekeeperDenied("not_gatekeeper_event")
-        if add_attendees and invite_guard is not None:
+        resulting_has_attendees = bool(add_attendees or self.existing_attendees)
+        if resulting_has_attendees and invite_guard is not None and (
+            add_attendees or title is not None or location is not None
+        ):
             invite_guard(
                 title if title is not None else self.existing_title,
                 location if location is not None else self.existing_location,

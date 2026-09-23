@@ -92,6 +92,7 @@ from app.calendar_window import EventTimeSpan, resolve_event_datetime
 from app.config import OWNER_TIMEZONE
 from app.failures import GatekeeperDenied
 from app.google_auth_helper import build_google_service
+from app.policy import EVENT_ATTENDEES_MAX
 
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 # Read/write access to events only (not calendar settings/ACLs/calendar
@@ -281,16 +282,32 @@ class GoogleCalendarClient:
             body["summary"] = title
         if location is not None:
             body["location"] = location
+
+        merged_attendees: list[dict] | None = None
         if add_attendees or remove_attendees:
-            if add_attendees:
-                # New guests will receive the (possibly updated) title and
-                # location -- both go through the invite guard before the
-                # patch, same reasoning as create_event.
-                invite_guard(
-                    title if title is not None else (existing.get("summary") or ""),
-                    location if location is not None else (existing.get("location") or ""),
+            merged_attendees = merge_attendees(existing.get("attendees") or [], add_attendees, remove_attendees)
+            if len(merged_attendees) > EVENT_ATTENDEES_MAX:
+                raise GatekeeperDenied(
+                    "too_many_attendees",
+                    f"the event would have {len(merged_attendees)} attendees; the limit is {EVENT_ATTENDEES_MAX}",
                 )
-            body["attendees"] = merge_attendees(existing.get("attendees") or [], add_attendees, remove_attendees)
+            body["attendees"] = merged_attendees
+
+        # The invite guard screens title+location before either reaches a
+        # real attendee. It must run whenever the patch will actually
+        # notify someone: new guests are always notified (add_attendees),
+        # and sendUpdates="all" below notifies EXISTING guests of ANY
+        # changed field too -- so a title/location-only rename on an
+        # event that already has guests is just as much an "invite" as
+        # adding one. Guarding only on add_attendees (the original
+        # 2026-09-22 implementation) missed that second case entirely.
+        resulting_attendees = merged_attendees if merged_attendees is not None else (existing.get("attendees") or [])
+        if resulting_attendees and (add_attendees or title is not None or location is not None):
+            invite_guard(
+                title if title is not None else (existing.get("summary") or ""),
+                location if location is not None else (existing.get("location") or ""),
+            )
+
         if day_offset is not None or start_time is not None or duration_minutes is not None:
             span = _resolve_updated_timing(existing, day_offset, start_time, duration_minutes)
             body["start"] = {"dateTime": span.start, "timeZone": OWNER_TIMEZONE}
@@ -308,7 +325,10 @@ class GoogleCalendarClient:
         self._get_own_event(service, event_id)
         # sendUpdates="all": attendees (if any) get a real cancellation
         # email immediately, same owner-chosen, no-approval design as
-        # create_event above.
+        # create_event above. No invite guard runs here -- the
+        # cancellation email carries the event's EXISTING title, which
+        # was already screened either at create_event or by update_event's
+        # guard above; deletion itself introduces no new unscreened text.
         service.events().delete(calendarId="primary", eventId=event_id, sendUpdates="all").execute()
 
 

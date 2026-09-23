@@ -355,6 +355,73 @@ def test_adding_guests_runs_the_invite_guard_on_the_title_and_location_they_will
     ]
 
 
+def test_update_event_title_only_on_event_with_existing_attendees_runs_the_invite_guard():
+    """The gap this closes: sendUpdates="all" notifies EXISTING attendees
+    of a title/location change even when no new guest is being added, so
+    the invite guard must run whenever the resulting attendee list is
+    non-empty and title/location is changing -- not only on add_attendees."""
+    seen: list[tuple[str, str]] = []
+    events = _WriteEvents(get_result={
+        **_OWN, "summary": "Existing title", "location": "Existing room",
+        "attendees": [{"email": "guest@example.com", "responseStatus": "accepted"}],
+    })
+    client = _write_client(_WriteService(events))
+
+    _update(client, title="New title", invite_guard=lambda t, l: seen.append((t, l)))
+
+    assert seen == [("New title", "Existing room")]
+
+
+def test_update_event_location_only_on_event_with_existing_attendees_runs_the_invite_guard():
+    seen: list[tuple[str, str]] = []
+    events = _WriteEvents(get_result={
+        **_OWN, "summary": "Existing title",
+        "attendees": [{"email": "guest@example.com"}],
+    })
+    client = _write_client(_WriteService(events))
+
+    _update(client, location="New room", invite_guard=lambda t, l: seen.append((t, l)))
+
+    assert seen == [("Existing title", "New room")]
+
+
+def test_update_event_time_only_change_on_event_with_attendees_does_not_run_the_guard():
+    """A pure time change doesn't alter title/location, so nothing new
+    reaches attendees that wasn't already screened."""
+    seen: list[tuple[str, str]] = []
+    events = _WriteEvents(get_result={
+        **_OWN, "summary": "Existing title",
+        "start": {"dateTime": "2026-09-20T10:00:00+03:00"}, "end": {"dateTime": "2026-09-20T10:30:00+03:00"},
+        "attendees": [{"email": "guest@example.com"}],
+    })
+    client = _write_client(_WriteService(events))
+
+    _update(client, start_time="14:00", invite_guard=lambda t, l: seen.append((t, l)))
+
+    assert seen == []
+
+
+def test_update_event_title_change_without_attendees_does_not_run_the_guard():
+    seen: list[tuple[str, str]] = []
+    events = _WriteEvents(get_result=dict(_OWN))  # no attendees key at all
+    client = _write_client(_WriteService(events))
+
+    _update(client, title="New title", invite_guard=lambda t, l: seen.append((t, l)))
+
+    assert seen == []
+
+
+def test_update_event_refuses_when_merged_attendees_would_exceed_the_cap():
+    existing = [{"email": f"guest{i}@example.com"} for i in range(9)]
+    events = _WriteEvents(get_result={**_OWN, "attendees": existing})
+    client = _write_client(_WriteService(events))
+
+    with pytest.raises(GatekeeperDenied) as denied:
+        _update(client, add_attendees=("new1@example.com", "new2@example.com"))
+    assert denied.value.error_code == "too_many_attendees"
+    assert events.patch_calls == []
+
+
 def test_a_refused_invite_guard_stops_the_patch():
     def refuse(title: str, location: str) -> None:
         raise GatekeeperDenied("sensitive_content_refused")
