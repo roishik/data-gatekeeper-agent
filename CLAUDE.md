@@ -271,6 +271,29 @@ decisions, all mine, all deliberate:
 
    LinkedIn is parked (`research/06`).
 
+   Unfixed findings from the PR #1 code review (2026-09-23), left on purpose:
+   - **Batch reply truncation drops too much** (`reply_guard.py`,
+     `_truncate_at_item_boundary`). It stops at the first item block that doesn't fit, so
+     one large early item (say a 20-result `gmail.search`) hides every later small item that
+     would have fit. A single oversized item renders as `[showing 0 of 1 items]` with no
+     results, because the per-result truncation a single request gets isn't applied inside
+     a batch item. Fix: truncate within the oversized item's result lines. Skipped because it
+     changes the reply layout.
+   - **The attendee cap may count the organizer** (`calendar_executor.py`, `update_event`'s
+     `merge_attendees`). Unverified: Google usually adds the organizer (`self: true`) to
+     `attendees` on an event created with guests. If it does, an event created with 10
+     guests has 11 entries, any later `add_attendees` is denied `too_many_attendees`, and
+     `attendee_count` in replies is off by one. Check against a live event before changing
+     anything.
+   - **A stuck write's reply is misleading.** Since the fix above, a stale `processing` row
+     for a write stays a `duplicate`. The prose still says "the earlier reply for it carries
+     the result", which may not be true if the process died before replying. Better wording
+     would be "an earlier attempt may have been interrupted; check before resending under a
+     new request_id". Skipped because it changes what Instinct sees.
+   - **`StateStore.get_request_status` is only used by tests.** The pipeline reads only
+     `get_request_status_detail`/`get_request_status_details`. Remove it, or define it in
+     terms of the detail read, so the two readers can't drift apart.
+
 ## Architecture (app/)
 
 Webhook `POST /webhooks/agentmail` (`main.py`: body read async, pipeline run on the threadpool
