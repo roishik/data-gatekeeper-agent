@@ -20,28 +20,50 @@ of that (added 2026-09-17):
      itself. Instinct's own model could be the one that got upstream-
      injected and is echoing a poisoned block (research/03's OpenClaw
      contact-name lesson: any attacker-influenced field, not just "the
-     message body", is untrusted), so it's scored too, but never denied
-     on the strength of that score alone -- see app/request_parser.py.
+     message body", is untrusted), so it's scored too. Until 2026-09-22
+     that score never denied anything on the block path; now a high score
+     denies WRITE verbs there (reads stay log-only) -- see "Per-part
+     screening" below.
   2. A fast, cheap pre-filter on the freeform/LLM-fallback path only: a
      score at or above INJECTION_DENY_THRESHOLD skips the paid Anthropic
      call entirely -- a cost/latency win, and defense-in-depth, since it
      only ever ADDS a way to deny, never a way to allow something the
      existing deny-by-default layers wouldn't already allow.
 
-If the TypeSafe call itself fails (network, auth, rate limit) -- or
-TYPESAFE_API_KEY isn't configured at all (NoOpInjectionScreen, used by
-app/main.py until the secret exists) -- `screen()` returns None and the
-pipeline proceeds exactly as it did before this feature existed. Jev's
-own availability must never become a denial-of-service vector against a
-legitimate request: that's what "tripwire, not gate" means in code -- a
-missing signal is "no signal", never "deny" or "allow".
+Per-part screening (added 2026-09-22)
+-------------------------------------
+The email is no longer scored as one blob. app/pipeline.py splits it
+deterministically first (app/request_parser.py's split_email) and each
+part is scored on its own -- `subject`, `body` (everything outside payload
+sections), each `request_block`, and each `payload:<name>` -- long parts
+chunked, via app/jev.py. That separates the parts that can steer what the
+gatekeeper DOES (the subject and the request block, or the whole body on
+the freeform path) from the parts that are only ever data (payload text,
+which lands in a draft or file and is never interpreted). Only the former
+make up the "request score" that gates anything:
+  - freeform path: the reader LLM is skipped at/above the threshold (as before);
+  - block path: WRITE verbs are denied at/above the threshold
+    (app/policy.py's apply_screen_gate), since an upstream-injected Instinct
+    echoing a poisoned block toward a calendar invite is exactly the relay
+    chain the 2026-09-19 review flagged. Reads stay log-only.
+Payload scores are logged, never gating.
+
+If a TypeSafe call fails (network, auth, rate limit) -- or TYPESAFE_API_KEY
+isn't configured at all (NoOpInjectionScreen) -- that part scores None and
+the pipeline proceeds exactly as it would without this feature: a missing
+signal is "no signal", never "deny" or "allow". That's what "tripwire, not
+gate" means in code, and why Jev's availability can never become a
+denial-of-service vector against a legitimate request. (The OUTBOUND screen,
+app/output_screen.py, deliberately fails the other way -- see there.)
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Protocol
 
 from app.config import TYPESAFE_API_KEY, TYPESAFE_MODEL
+from app.jev import chunk_text, max_score, new_client, run_parallel
 
 logger = logging.getLogger("gatekeeper.injection_screen")
 
@@ -59,27 +81,39 @@ _CRITERIA = {
 }
 
 
+@dataclass(frozen=True)
+class InboundScreenResult:
+    scores: dict[str, float | None]  # part name -> max score over its chunks (None = no signal)
+    status: str  # "ok" | "degraded" (some call failed) | "disabled" (no screen configured)
+
+    def max_of(self, names: list[str]) -> float | None:
+        return max_score([self.scores.get(name) for name in names])
+
+
 class InjectionScreen(Protocol):
     def screen(self, text: str) -> float | None: ...
+    def screen_parts(self, parts: dict[str, str]) -> InboundScreenResult: ...
 
 
 class NoOpInjectionScreen:
-    """Used when TYPESAFE_API_KEY isn't configured. Every request scores
-    None (no signal), so the pipeline behaves exactly as it did before
-    this feature existed -- lets the code ship and deploy before the
-    TypeSafe secret exists, and turn on later by adding the secret and
-    redeploying, no code change needed."""
+    """Used when TYPESAFE_API_KEY isn't configured. Every part scores None
+    (no signal), so the pipeline behaves exactly as it would without this
+    feature -- lets the code ship and deploy before the TypeSafe secret
+    exists, and turn on later by adding the secret and redeploying."""
 
     name = "noop"
 
     def screen(self, text: str) -> float | None:
         return None
 
+    def screen_parts(self, parts: dict[str, str]) -> InboundScreenResult:
+        return InboundScreenResult(scores={name: None for name in parts}, status="disabled")
+
 
 class TypeSafeInjectionScreen:
-    """Real implementation, gated behind TYPESAFE_API_KEY. One Jev Noul
-    call per inbound email. Model verified against the installed
-    typesafe-sdk (0.6.0): TypeSafeClient(api_key=..., model=...).system_one(
+    """Real implementation, gated behind TYPESAFE_API_KEY. One Jev Noul call
+    per chunk of every part, run concurrently (app/jev.py). Model verified
+    against the installed typesafe-sdk (0.6.0): TypeSafeClient(...).system_one(
     state=..., questions={...}) -> SystemOneResponse with a `.nouls` dict
     keyed by question name, each holding a `.noul` float."""
 
@@ -92,21 +126,36 @@ class TypeSafeInjectionScreen:
         self._api_key = TYPESAFE_API_KEY
 
     def screen(self, text: str) -> float | None:
-        # Lazy import: tests never need this package to reach the fakes,
-        # same convention as `anthropic` in app/reader_llm.py.
-        from typesafe_sdk import Noul, TypeSafeClient, TypeSafeError
+        return self.screen_parts({"text": text}).scores["text"]
 
+    def screen_parts(self, parts: dict[str, str]) -> InboundScreenResult:
+        jobs = [(name, chunk) for name, text in parts.items() for chunk in chunk_text(text)]
+        results = run_parallel(lambda job: self._score_chunk(job[1]), jobs)
+        per_part: dict[str, list[float | None]] = {name: [] for name in parts}
+        for (name, _), score in zip(jobs, results):
+            per_part[name].append(score)
+        failed = any(score is None for score in results)
+        return InboundScreenResult(
+            scores={name: max_score(values) for name, values in per_part.items()},
+            status="degraded" if failed else "ok",
+        )
+
+    def _score_chunk(self, chunk: str) -> float | None:
         try:
-            with TypeSafeClient(api_key=self._api_key, model=self.model) as client:
+            with new_client(self._api_key, self.model) as client:
                 result = client.system_one(
-                    state=text,
-                    questions={"prompt_injection": Noul(instructions=_INSTRUCTIONS, criteria=_CRITERIA)},
+                    state=chunk,
+                    questions={"prompt_injection": _noul()},
                 )
-        except TypeSafeError:
+            return float(result.nouls["prompt_injection"].noul)
+        except Exception:
             logger.exception("TypeSafe injection screen call failed")
             return None
-        except Exception:
-            logger.exception("TypeSafe injection screen call failed unexpectedly")
-            return None
 
-        return result.nouls["prompt_injection"].noul
+
+def _noul():
+    # Lazy import: tests never need this package to reach the fakes, same
+    # convention as `anthropic` in app/reader_llm.py.
+    from typesafe_sdk import Noul
+
+    return Noul(instructions=_INSTRUCTIONS, criteria=_CRITERIA)

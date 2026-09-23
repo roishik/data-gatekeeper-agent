@@ -12,6 +12,18 @@ structured-output-only pattern from research/03 section 2: the model's
 blast radius is bounded by how little it's allowed to say, not by how
 well it resists being fooled.
 
+Output budget and failure reporting (added 2026-09-22)
+-----------------------------------------------------
+Stage 2 used to share one flat `max_tokens=512` across every verb, so a
+plain-text request to draft a long email or write a long file ran out of
+output budget mid-JSON, failed to parse, and came back as the misleading
+"could not be understood". Each stage-2 model now has its own budget
+(`_STAGE2_MAX_TOKENS`), a truncated response (`stop_reason ==
+"max_tokens"`) is reported as `last_failure = "truncated"` so the parser
+can answer `too_long_for_freeform`, and every call has a hard timeout. Long
+content is meant to travel in a payload section instead (see
+app/request_parser.py), which never reaches this module at all.
+
 Two-stage extraction (added 2026-09-16)
 ---------------------------------------
 The extraction is split into TWO structured-output calls, each carrying a
@@ -69,6 +81,7 @@ VerbLiteral = Literal[
     "drive.search",
     "drive.create_file",
     "contacts.search",
+    "capabilities",
     "unsupported",
 ]
 
@@ -115,6 +128,17 @@ class LLMExtraction(BaseModel):
     start_time: str | None = None  # "HH:MM", owner's local time -- never a full date/timestamp
     duration_minutes: int | None = None
     attendees: list[str] | None = None
+    # calendar.create_event only (added 2026-09-22): a room, address, or
+    # video-call link. NOT reachable on update_event's freeform path --
+    # _CalendarUpdateFields is already at the per-stage 7-property ceiling
+    # (see its own comment); changing a location on an existing event
+    # still works, but only via the deterministic ---GATEKEEPER-REQUEST---
+    # block (app/request_parser.py), never via plain-text extraction.
+    location: str | None = None
+    # calendar.update_event: guests are added/removed, never replaced
+    # wholesale (app/calendar_executor.py's merge_attendees).
+    add_attendees: list[str] | None = None
+    remove_attendees: list[str] | None = None
     # calendar.update_event / delete_event field -- must be copied
     # verbatim from what the email states (e.g. an event id the
     # gatekeeper itself returned in an earlier reply); never invented.
@@ -126,6 +150,9 @@ class LLMExtraction(BaseModel):
 
 class ReaderLLM(Protocol):
     last_usage: dict[str, int] | None
+    # Why the last extract() returned None: "truncated" (ran out of output
+    # budget), "api_error", "invalid_output", or None on success.
+    last_failure: str | None
 
     def extract(self, email_text: str) -> LLMExtraction | None: ...
 
@@ -171,16 +198,27 @@ class _CalendarCreateFields(BaseModel):
     start_time: str | None = None
     duration_minutes: int | None = None
     attendees: list[str] | None = None
+    location: str | None = None  # 6 properties -- still under the 7-property ceiling
 
 
 class _CalendarUpdateFields(BaseModel):
+    # 7 properties -- the per-stage ceiling (tests/test_request_parser.py).
+    # Deliberately NO `location` here: adding an 8th property would exceed
+    # the empirically-verified limit that caused a real production outage
+    # (see the module docstring's "Two-stage extraction" section and
+    # CLAUDE.md's 2026-09-16 entry) -- untested against the live API, not
+    # worth the risk for a field that's still reachable via the block
+    # protocol. If a future field needs adding here, drop one of these
+    # first, or split update_event's freeform extraction into its own
+    # third stage.
     model_config = ConfigDict(extra="forbid")
     event_id: str | None = None
     title: str | None = None
     day_offset: int | None = None
     start_time: str | None = None
     duration_minutes: int | None = None
-    attendees: list[str] | None = None
+    add_attendees: list[str] | None = None
+    remove_attendees: list[str] | None = None
 
 
 class _CalendarDeleteFields(BaseModel):
@@ -208,11 +246,11 @@ _STAGE1_SYSTEM_PROMPT = _QUARANTINE_PREAMBLE + (
     "any) the email is asking for, from this fixed set of verbs: "
     "gmail.search, gmail.create_draft, calendar.list_events, "
     "calendar.create_event, calendar.update_event, calendar.delete_event, "
-    "drive.search, drive.create_file, contacts.search. If the email does "
-    "not clearly and unambiguously ask for exactly one of those actions, "
-    "set verb to 'unsupported'. Copy a request_id ONLY if the email text "
-    "plainly states one -- never invent one. Do not extract any other "
-    "parameter in this step."
+    "drive.search, drive.create_file, contacts.search, capabilities. If "
+    "the email does not clearly and unambiguously ask for exactly one of "
+    "those actions, set verb to 'unsupported'. Copy a request_id ONLY if "
+    "the email text plainly states one -- never invent one. Do not "
+    "extract any other parameter in this step."
 )
 
 _STAGE2_GMAIL_SEARCH_PROMPT = _QUARANTINE_PREAMBLE + (
@@ -253,9 +291,11 @@ _STAGE2_CALENDAR_CREATE_PROMPT = _QUARANTINE_PREAMBLE + (
     "'tomorrow'->1, 'the day after tomorrow'->2, etc.) -- never an actual "
     "date, weekday name, or timestamp; 'start_time' as an 'HH:MM' 24-hour "
     "string in the owner's local time; 'duration_minutes' as an integer; "
-    "and 'attendees' as the list of exact email addresses the request "
-    "names (never add one the email didn't name, never omit one it did). "
-    "Only include a field the email actually provides."
+    "'attendees' as the list of exact email addresses the request "
+    "names (never add one the email didn't name, never omit one it did); "
+    "and 'location' as the exact room, address, or video-call link the "
+    "email states, if any (never invented). Only include a field the "
+    "email actually provides."
 )
 
 _STAGE2_CALENDAR_UPDATE_PROMPT = _QUARANTINE_PREAMBLE + (
@@ -266,8 +306,13 @@ _STAGE2_CALENDAR_UPDATE_PROMPT = _QUARANTINE_PREAMBLE + (
     "one. Only include the fields the email actually asks to change: "
     "'title'; 'day_offset' as a small integer relative to today "
     "('today'->0, 'tomorrow'->1, ...) never an actual date; 'start_time' "
-    "as 'HH:MM'; 'duration_minutes' as an integer; 'attendees' as exact "
-    "email addresses."
+    "as 'HH:MM'; 'duration_minutes' as an integer; 'add_attendees' for "
+    "exact email addresses the email asks to invite, and 'remove_attendees' "
+    "for exact addresses it asks to uninvite -- never list existing guests "
+    "the email doesn't mention. There is no 'location' field here -- if the "
+    "email asks to change an event's location, extract only what it "
+    "otherwise asks to change; that part of the request is not actionable "
+    "this way."
 )
 
 _STAGE2_CALENDAR_DELETE_PROMPT = _QUARANTINE_PREAMBLE + (
@@ -282,6 +327,20 @@ _STAGE2_DRIVE_CREATE_PROMPT = _QUARANTINE_PREAMBLE + (
     "'content' only from what the email explicitly asks the file to "
     "contain -- never invent content the request didn't state."
 )
+
+# Per-call output budgets. Stage 1 returns a verb and an id; most stage-2
+# models return a handful of scalars; the two free-text verbs may have to
+# reproduce a draft/file body. Plain-text input is capped at
+# READER_LLM_MAX_INPUT_CHARS (~5k tokens), so 8192 output tokens covers
+# anything that input could legitimately contain.
+_STAGE1_MAX_TOKENS = 256
+_STAGE2_DEFAULT_MAX_TOKENS = 512
+_STAGE2_MAX_TOKENS = {"gmail.create_draft": 8192, "drive.create_file": 8192}
+# Hard per-call timeouts (the SDK default is 10 minutes): long enough for an
+# 8k-token body from Haiku, short enough that a hung call can't run the
+# request into Cloud Run's own timeout.
+_SHORT_CALL_TIMEOUT_SECONDS = 20.0
+_LONG_CALL_TIMEOUT_SECONDS = 60.0
 
 # verb -> (small stage-2 field model, its system prompt). Verbs absent
 # here need no parameter extraction at all: 'unsupported' (nothing to
@@ -320,20 +379,26 @@ class AnthropicReaderLLM:
             raise RuntimeError("ANTHROPIC_API_KEY is not set -- cannot construct AnthropicReaderLLM.")
         self._api_key = ANTHROPIC_API_KEY
         self.last_usage: dict[str, int] | None = None
+        self.last_failure: str | None = None
 
     def extract(self, email_text: str) -> LLMExtraction | None:
         import anthropic  # lazy import: tests never need this package to reach the fakes
 
-        client = anthropic.Anthropic(api_key=self._api_key)
+        client = anthropic.Anthropic(api_key=self._api_key, max_retries=1)
         # Accumulate usage across BOTH stage calls so the audit log's
         # token counts still reflect the whole extraction, not just the
         # last call.
         usage_acc = {"input_tokens": 0, "output_tokens": 0}
         self.last_usage = None
+        self.last_failure = None
 
         # ── Stage 1: which verb? ──────────────────────────────────────
-        selection = self._call(client, _STAGE1_SYSTEM_PROMPT, _VerbSelection, email_text, usage_acc)
+        selection = self._call(
+            client, _STAGE1_SYSTEM_PROMPT, _VerbSelection, email_text, usage_acc,
+            max_tokens=_STAGE1_MAX_TOKENS, timeout=_SHORT_CALL_TIMEOUT_SECONDS,
+        )
         if selection is None:
+            self.last_usage = dict(usage_acc)
             return None  # never coerce: a failed/unparseable call is unsupported upstream
         verb = selection.verb
         request_id = selection.request_id
@@ -347,28 +412,40 @@ class AnthropicReaderLLM:
 
         # ── Stage 2: that verb's bounded parameters ───────────────────
         model_cls, prompt = stage2
-        fields = self._call(client, prompt, model_cls, email_text, usage_acc)
+        long_output = verb in _STAGE2_MAX_TOKENS
+        fields = self._call(
+            client, prompt, model_cls, email_text, usage_acc,
+            max_tokens=_STAGE2_MAX_TOKENS.get(verb, _STAGE2_DEFAULT_MAX_TOKENS),
+            timeout=_LONG_CALL_TIMEOUT_SECONDS if long_output else _SHORT_CALL_TIMEOUT_SECONDS,
+        )
         if fields is None:
+            self.last_usage = dict(usage_acc)
             return None  # never coerce
         self.last_usage = dict(usage_acc)
         return LLMExtraction(verb=verb, request_id=request_id, **fields.model_dump(exclude_none=True))
 
-    def _call(self, client, system: str, model_cls, email_text: str, usage_acc: dict[str, int]):
+    def _call(
+        self, client, system: str, model_cls, email_text: str, usage_acc: dict[str, int], *,
+        max_tokens: int, timeout: float,
+    ):
         """One structured-output call. Returns a validated `model_cls`
-        instance, or None on any failure (network/API error, or
-        invalid/unparseable JSON) -- the "never coerce" rule: no partial
-        salvage, request_parser.py turns a None into verb='unsupported'."""
+        instance, or None on any failure (network/API error, truncation, or
+        invalid/unparseable JSON) with `last_failure` saying which -- the
+        "never coerce" rule: no partial salvage, request_parser.py turns a
+        None into verb='unsupported' (or too_long_for_freeform)."""
         schema = model_cls.model_json_schema()
         try:
             response = client.messages.create(
                 model=self.model,
-                max_tokens=512,
+                max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": email_text}],
                 output_config={"format": {"type": "json_schema", "schema": schema}},
+                timeout=timeout,
             )
         except Exception:
             logger.exception("reader LLM call failed")
+            self.last_failure = "api_error"
             return None
 
         usage = getattr(response, "usage", None)
@@ -376,9 +453,15 @@ class AnthropicReaderLLM:
             usage_acc["input_tokens"] += getattr(usage, "input_tokens", 0)
             usage_acc["output_tokens"] += getattr(usage, "output_tokens", 0)
 
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            logger.warning("reader LLM output truncated at max_tokens=%d", max_tokens)
+            self.last_failure = "truncated"
+            return None
+
         text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
         try:
             return model_cls.model_validate_json(text)
         except Exception:
             logger.warning("reader LLM returned invalid/unparseable JSON")
+            self.last_failure = "invalid_output"
             return None

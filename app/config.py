@@ -27,7 +27,10 @@ import logging
 import os
 from pathlib import Path
 
-logging.getLogger("httpx").setLevel(logging.WARNING)  # never log auth headers
+# Never log auth headers, and keep per-request HTTP chatter out of Cloud
+# Logging. "httpx2" is the fork the anthropic/typesafe SDKs log through.
+for _noisy in ("httpx", "httpx2"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 logger = logging.getLogger("gatekeeper.config")
 
@@ -93,7 +96,9 @@ GATEKEEPER_INBOX_ADDRESS = _env("GATEKEEPER_INBOX_ADDRESS")
 # Exact-match sender allowlist, display names ignored (see app/ingress.py).
 ALLOWED_SENDERS = _env_list("ALLOWED_SENDERS")
 
-# Who gets BCC'd on every outbound reply — the human audit-log copy.
+# No longer used by the service itself since the owner BCC was dropped
+# 2026-09-22 (AgentMail's own thread history is the readable record
+# now) -- the live e2e test suite still sends from this address.
 OWNER_EMAIL = _env("OWNER_EMAIL")
 
 # Webhook timestamp tolerance, seconds. 300s matches the Standard
@@ -101,13 +106,37 @@ OWNER_EMAIL = _env("OWNER_EMAIL")
 WEBHOOK_TOLERANCE_SECONDS = _env_int("WEBHOOK_TOLERANCE_SECONDS", 300)
 
 # ── Rate limiting (Layer 1) ─────────────────────────────────────────────────
-MAX_REQUESTS_PER_DAY = _env_int("MAX_REQUESTS_PER_DAY", 20)
+# 100/day (raised from 50, 2026-09-23): the batch verb lets one email
+# consume many slots at once, and this cap is an abuse backstop, not a
+# hard business limit the owner wants enforced tightly.
+MAX_REQUESTS_PER_DAY = _env_int("MAX_REQUESTS_PER_DAY", 100)
+
+# A request_id last recorded as `processing` longer ago than this is no
+# longer treated as a duplicate -- see state_store.is_duplicate_request_status.
+# Comfortably above the 120s Cloud Run request timeout (post-refactor),
+# with margin for AgentMail's own retry scheduling.
+PROCESSING_STALE_AFTER_SECONDS = _env_int("PROCESSING_STALE_AFTER_SECONDS", 600)
+
+# ── Protocol version (added 2026-09-23) ─────────────────────────────────────
+# Echoed in every reply's status block so Instinct can tell which
+# revision answered it during a deploy transition (Instinct's review,
+# M1) -- set by docs/RUNBOOK.md's deploy command
+# (--update-env-vars GIT_SHA=$SHA, alongside the existing
+# --labels=commit=$SHA), never baked into the image at build time.
+# "dev" is the honest answer for a local run or an offline test.
+GIT_SHA = _env("GIT_SHA", "dev")
 
 # ── Anthropic (Layer 2, quarantined reader LLM only) ────────────────────────
 ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY")
 # Pinned, dated snapshot on purpose — see research/03 and research/05: a
 # model swap should be a deliberate, tested change, never a silent float.
 ANTHROPIC_MODEL = _env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+# A plain-text (no GATEKEEPER-REQUEST block) email longer than this skips
+# the reader LLM entirely and is answered with `too_long_for_freeform`,
+# pointing at the payload rail (docs/PROTOCOL.md). Anthropic tokens are the
+# ones worth saving; long content belongs in a payload section, which no
+# LLM ever reads. Added 2026-09-22.
+READER_LLM_MAX_INPUT_CHARS = _env_int("READER_LLM_MAX_INPUT_CHARS", 20000)
 
 # ── TypeSafe (additive injection-screening tripwire, between Layers 1/2) ───
 # Added 2026-09-17. NOT the security boundary -- see app/injection_screen.py's
@@ -127,15 +156,40 @@ TYPESAFE_MODEL = _env_str("TYPESAFE_MODEL", "jev-1.13.0")
 # positive here should be rare, not merely unlikely.
 INJECTION_DENY_THRESHOLD = _env_float("INJECTION_DENY_THRESHOLD", 0.85)
 
+# Shared Jev call plumbing (app/jev.py, added 2026-09-22). Long text is
+# chunked with overlap rather than truncated (Jev calls are cheap; see the
+# owner's cost principle in app/jev.py), chunks run concurrently, and every
+# call has a hard timeout.
+JEV_CHUNK_CHARS = _env_int("JEV_CHUNK_CHARS", 4000)
+JEV_CHUNK_OVERLAP = _env_int("JEV_CHUNK_OVERLAP", 200)
+JEV_MAX_WORKERS = _env_int("JEV_MAX_WORKERS", 8)
+JEV_TIMEOUT_SECONDS = _env_float("JEV_TIMEOUT_SECONDS", 10.0)
+
+# Outbound screen (app/output_screen.py, added 2026-09-22): an item going
+# back to Instinct has its text withheld when Jev scores it at/above either
+# threshold. Deliberately lower than the inbound deny threshold: a false
+# positive here only hides one item's text (its ids stay), while a false
+# negative forwards sensitive material. Calibrate against the live suite.
+OUTPUT_SENSITIVE_THRESHOLD = _env_float("OUTPUT_SENSITIVE_THRESHOLD", 0.5)
+OUTPUT_INJECTION_THRESHOLD = _env_float("OUTPUT_INJECTION_THRESHOLD", 0.7)
+# "closed" (default): an item that can't be screened is withheld. "open":
+# it's sent as-is. See app/output_screen.py for why outbound fails closed.
+OUTPUT_SCREEN_FAIL_MODE = _env_str("OUTPUT_SCREEN_FAIL_MODE", "closed")
+if OUTPUT_SCREEN_FAIL_MODE not in {"closed", "open"}:
+    raise RuntimeError("OUTPUT_SCREEN_FAIL_MODE must be 'closed' or 'open'")
+
 # ── Policy (Layer 3) ─────────────────────────────────────────────────────
 # Query terms that make a gmail.search request refuse to run, regardless
 # of who's asking or how politely. Configurable, not hardcoded, per the
-# brief. Defaults cover the brief's own example threat.
+# brief. Narrowed 2026-09-22 (owner's rule) to the one-time-code and
+# password-reset searches whose whole point would be to fetch a secret.
+# Financial searches ("credit card statement", "bank account") are allowed:
+# the owner shares that information with Instinct on purpose, and card
+# numbers in the results are still redacted on the way out.
 SENSITIVE_QUERY_TERMS = _env_list(
     "SENSITIVE_QUERY_TERMS",
-    "otp,one-time code,one time code,verification code,password reset,"
-    "reset your password,2fa,two-factor,two factor,security alert,"
-    "bank account,credit card,routing number,account number,wire transfer",
+    "otp,one-time code,one time code,verification code,login code,sign-in code,"
+    "security code,password reset,reset your password,2fa,two-factor,two factor",
 )
 
 # ── Calendar window resolution (Layer 3/4/5, calendar.list_events) ─────────
@@ -143,7 +197,7 @@ SENSITIVE_QUERY_TERMS = _env_list(
 # days into a concrete midnight-to-midnight window and to format event
 # times for the reply -- never by the LLM, which only ever sees/produces
 # the small bounded integers (see policy.py's CAL_* constants).
-OWNER_TIMEZONE = _env("OWNER_TIMEZONE", "Asia/Jerusalem")
+OWNER_TIMEZONE = _env_str("OWNER_TIMEZONE", "Asia/Jerusalem")
 
 # ── Google (Layer 4, executor) ──────────────────────────────────────────────
 GOOGLE_CLIENT_ID = _env("GOOGLE_CLIENT_ID")
@@ -167,8 +221,7 @@ GOOGLE_DRIVE_FOLDER_ID = _env("GOOGLE_DRIVE_FOLDER_ID")
 # from the original 4000 to 25000 (2026-09-17, owner request, after
 # raising gmail.search's own max_results made 4000 too tight for a full
 # 30-result reply). Not the same limit as AgentMail's own message size
-# cap, if it has one -- unverified either way (see agentmail_client.py's
-# "NOT exercised against a live AgentMail API call" caveat).
+# cap, if it has one -- unverified either way.
 REPLY_MAX_CHARS = _env_int("REPLY_MAX_CHARS", 25000)
 
 # ── Audit log ─────────────────────────────────────────────────────────────

@@ -104,3 +104,18 @@ def test_audit_record_never_carries_a_snippet_or_body_field():
     assert "snippet" not in field_names
     assert "body" not in field_names
     assert "text" not in field_names
+
+
+def test_append_many_chains_exactly_like_one_at_a_time(tmp_path):
+    records = [_record(agentmail_message_id=f"m{i}") for i in range(3)]
+    one_by_one = JSONLAuditLog(tmp_path / "one.jsonl")
+    for record in records:
+        one_by_one.append(record)
+    many = JSONLAuditLog(tmp_path / "many.jsonl")
+    many.append(records[0])
+    many.append_many(records[1:])
+    assert [e["hash"] for e in many.all_entries()] == [e["hash"] for e in one_by_one.all_entries()]
+    assert verify_chain(many.all_entries())
+    # The next single append still chains on from the last batched one.
+    many.append(_record(agentmail_message_id="m3"))
+    assert verify_chain(many.all_entries())

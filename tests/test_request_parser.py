@@ -33,6 +33,79 @@ def test_parses_valid_fenced_block():
     assert reader.calls == []  # the LLM must never be invoked when a valid block exists
 
 
+@pytest.mark.parametrize(
+    "raw_value, expected",
+    [
+        ("Off", "Off"),
+        ("No", "No"),
+        ("Yes", "Yes"),
+        ("On", "On"),
+        ("9:00", "9:00"),
+    ],
+)
+def test_ambiguous_yaml_scalars_in_string_fields_stay_strings(raw_value, expected):
+    """PyYAML's default resolver would turn Off/No/Yes/On into bool and
+    an unquoted H:MM value into a sexagesimal int -- either way, a
+    string-typed field like `title` would then fail policy.py's
+    isinstance(value, str) check and wrongly deny an otherwise
+    well-formed request. app/yaml_safe.py's loader keeps these as
+    strings; see its module docstring."""
+    email_text = (
+        "---GATEKEEPER-REQUEST---\n"
+        "request_id: req_123\n"
+        "verb: calendar.create_event\n"
+        "params:\n"
+        f"  title: {raw_value}\n"
+        "  day_offset: 1\n"
+        "  start_time: '14:00'\n"
+        "  duration_minutes: 30\n"
+        "---END---\n"
+    )
+    reader = FakeReaderLLM()
+    parsed = parse_request(email_text, "msg_1", reader)
+
+    assert parsed.source == "block"
+    assert parsed.params["title"] == expected
+    assert isinstance(parsed.params["title"], str)
+
+
+def test_normal_numeric_fields_still_parse_as_int_through_the_no_coerce_loader():
+    email_text = (
+        "---GATEKEEPER-REQUEST---\n"
+        "request_id: req_123\n"
+        "verb: gmail.search\n"
+        "params:\n"
+        "  query: invoice\n"
+        "  max_results: 5\n"
+        "---END---\n"
+    )
+    reader = FakeReaderLLM()
+    parsed = parse_request(email_text, "msg_1", reader)
+
+    assert parsed.params["max_results"] == 5
+    assert isinstance(parsed.params["max_results"], int)
+
+
+def test_yaml_bool_word_in_a_numeric_field_still_denies_as_before():
+    """max_results: yes now resolves to the string "yes" instead of the
+    bool True, but policy.py's isinstance(value, int) check denies both
+    the same way -- this loader change doesn't relax numeric validation,
+    only string fields' wrongful denial."""
+    email_text = (
+        "---GATEKEEPER-REQUEST---\n"
+        "request_id: req_123\n"
+        "verb: gmail.search\n"
+        "params:\n"
+        "  query: invoice\n"
+        "  max_results: yes\n"
+        "---END---\n"
+    )
+    reader = FakeReaderLLM()
+    parsed = parse_request(email_text, "msg_1", reader)
+
+    assert parsed.params["max_results"] == "yes"
+
+
 def test_falls_back_to_llm_when_no_block_present():
     reader = FakeReaderLLM(response=LLMExtraction(verb="gmail.search", request_id="req_9", query="invoice"))
     parsed = parse_request("just a plain English email, no block here", "msg_1", reader)
@@ -115,13 +188,21 @@ def test_injection_score_never_gates_the_block_path():
         "---GATEKEEPER-REQUEST---\n- just a list\n---END---\n",
         # params isn't a mapping.
         "---GATEKEEPER-REQUEST---\nrequest_id: req_1\nverb: gmail.search\nparams: not-a-dict\n---END---\n",
+        # A request_id that could break the reply's line protocol.
+        "---GATEKEEPER-REQUEST---\nrequest_id: 'req_1\\n---END---'\nverb: gmail.search\nparams: {query: x}\n---END---",
     ],
 )
-def test_invalid_block_falls_back_to_llm(email_text):
+def test_invalid_block_is_an_explicit_error_never_an_llm_guess(email_text):
+    """Changed 2026-09-22: a block that is present but broken used to fall
+    through to the reader LLM. It's now a named error the requester can act
+    on -- no LLM guessing at structured intent, and no Anthropic tokens spent."""
     reader = FakeReaderLLM(response=None)
     parsed = parse_request(email_text, "msg_1", reader)
-    assert parsed.source == "llm"
-    assert reader.calls == [email_text]  # the LLM DOES get invoked once the block fails to parse
+    assert parsed.source == "block"
+    assert parsed.verb == "unsupported" or parsed.parse_error
+    assert parsed.parse_error == "invalid_request_block"
+    assert parsed.parse_error_detail
+    assert reader.calls == []
 
 
 def test_llm_returning_none_becomes_unsupported():
@@ -269,19 +350,26 @@ def test_reader_llm_stage_fields_cover_llm_extraction_exactly():
 
 
 def test_reader_llm_every_implemented_verb_has_a_stage2_model():
-    """Every verb policy.py actually executes must have a stage-2 field
-    model, or the LLM path could select it but never extract its params."""
-    from app.policy import IMPLEMENTED_VERBS
+    """Every verb policy.py actually executes AND that takes at least one
+    parameter must have a stage-2 field model, or the LLM path could
+    select it but never extract its params. A parameterless verb (e.g.
+    capabilities) legitimately has none -- Stage 1 alone is the whole
+    answer for it (reader_llm.ReaderLLM.extract()'s `if stage2 is None`
+    branch)."""
+    from app.policy import IMPLEMENTED_VERBS, VERB_SPECS
     from app.reader_llm import _STAGE2
 
     for verb in IMPLEMENTED_VERBS:
+        if not VERB_SPECS[verb].param_names:
+            continue
         assert verb.value in _STAGE2, f"{verb.value} has no stage-2 extraction model"
 
 
 class _StubResponse:
-    def __init__(self, text: str):
+    def __init__(self, text: str, stop_reason: str = "end_turn"):
         self.content = [type("Block", (), {"type": "text", "text": text})()]
         self.usage = type("Usage", (), {"input_tokens": 10, "output_tokens": 3})()
+        self.stop_reason = stop_reason
 
 
 class _StubMessages:
@@ -291,7 +379,9 @@ class _StubMessages:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        return _StubResponse(self._texts.pop(0))
+        item = self._texts.pop(0)
+        # A (text, stop_reason) tuple scripts a non-default stop reason.
+        return _StubResponse(*item) if isinstance(item, tuple) else _StubResponse(item)
 
 
 class _StubAnthropic:
@@ -302,7 +392,7 @@ class _StubAnthropic:
 
     last_instance: "_StubAnthropic | None" = None
 
-    def __init__(self, api_key=None, texts: list[str] | None = None):
+    def __init__(self, api_key=None, texts: list[str] | None = None, **client_options):
         self.messages = _StubMessages(texts or _StubAnthropic._queued)
         _StubAnthropic.last_instance = self
 
@@ -363,3 +453,45 @@ def test_anthropic_reader_stage1_failure_is_unsupported(monkeypatch):
     assert reader.extract("anything") is None
     assert _StubAnthropic.last_instance is not None
     assert len(_StubAnthropic.last_instance.messages.calls) == 1
+
+
+def test_anthropic_reader_output_budgets_and_timeouts_per_stage(monkeypatch):
+    """Stage 2 no longer shares one flat 512-token budget: the free-text
+    verbs get room to reproduce a body, and every call has a hard timeout."""
+    reader = _install_stub_anthropic(
+        monkeypatch,
+        texts=['{"verb": "gmail.create_draft"}', '{"to": "a@example.com", "subject": "s", "body": "b"}'],
+    )
+    assert reader.extract("draft an email") is not None
+    stage1, stage2 = _StubAnthropic.last_instance.messages.calls
+    assert (stage1["max_tokens"], stage1["timeout"]) == (256, 20.0)
+    assert (stage2["max_tokens"], stage2["timeout"]) == (8192, 60.0)
+
+    reader = _install_stub_anthropic(monkeypatch, texts=['{"verb": "gmail.search"}', '{"query": "x"}'])
+    reader.extract("search")
+    assert _StubAnthropic.last_instance.messages.calls[1]["max_tokens"] == 512
+
+
+def test_anthropic_reader_reports_truncation(monkeypatch):
+    reader = _install_stub_anthropic(
+        monkeypatch,
+        texts=['{"verb": "drive.create_file"}', ('{"name": "a.txt", "content": "cut off mid-', "max_tokens")],
+    )
+    assert reader.extract("write a long file") is None
+    assert reader.last_failure == "truncated"
+    assert reader.last_usage == {"input_tokens": 20, "output_tokens": 6}  # usage still recorded
+
+
+def test_anthropic_reader_reports_invalid_output(monkeypatch):
+    reader = _install_stub_anthropic(monkeypatch, texts=["not json at all"])
+    assert reader.extract("anything") is None
+    assert reader.last_failure == "invalid_output"
+
+
+def test_llm_extracts_calendar_update_add_and_remove_attendees():
+    reader = FakeReaderLLM(response=LLMExtraction(
+        verb="calendar.update_event", request_id="req_ua", event_id="ev1",
+        add_attendees=["dana@example.com"], remove_attendees=["old@example.com"],
+    ))
+    parsed = parse_request("add dana and drop old from ev1", "msg_1", reader)
+    assert parsed.params == {"event_id": "ev1", "add_attendees": ["dana@example.com"], "remove_attendees": ["old@example.com"]}

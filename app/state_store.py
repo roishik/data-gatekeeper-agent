@@ -8,35 +8,119 @@ than a real database: this project already needs a Sheets-writing
 credential for the audit log, so reusing it avoids a second storage
 dependency for a system this small, at 5-50 requests/day).
 
-Two independent checks live here, per the brief:
-  - Idempotency, keyed on the AgentMail message id AND (once parsed) the
-    request_id: AgentMail retries webhooks on a non-2xx/timeout
-    response, and Instinct itself might resend a logically-identical
-    request (same request_id) in a brand-new email after a timeout.
-    Either key alone can produce a duplicate; both are checked.
-  - Rate limiting: how many requests has this sender made today, capped
-    by MAX_REQUESTS_PER_DAY (env).
+Three independent pieces of state live here:
+  - Message dedupe, keyed on the AgentMail message id: AgentMail retries a
+    webhook on a non-2xx/timeout response, and a retry of a message that
+    was already handled must never run it twice.
+  - Request status, keyed on the request_id: Instinct may resend a
+    logically-identical request (same request_id) in a brand-new email. A
+    request whose last status is processing/effect_done/completed is a
+    duplicate; one that last FAILED may be resent and run again. Recording
+    `effect_done` the moment a write verb's side effect has happened (before
+    the reply is even attempted) is what stops a resend after a failed
+    reply from repeating that write.
+  - The daily cap: how many requests a sender made "today", where today is
+    the OWNER's calendar day (OWNER_TIMEZONE), not UTC's.
+
+The Sheets bug this layout exists to prevent (found 2026-09-19)
+----------------------------------------------------------------
+The first version wrote rows that started with a blank cell (`["", sender,
+date]`). Sheets' `values.append` "table detection" then shifted every later
+append one column right, so request ids landed in column B and sender/date
+in C/D -- and the code, reading `row[0]`/`row[1..2]`, never matched
+anything. Request-id dedupe and the daily cap silently never worked in
+production. The rule now, enforced in `SheetsStateStore._append` itself and
+not just by convention: every row this store writes starts with a
+non-empty key in column A, and each record kind has its own tab so no row
+ever needs a placeholder cell.
 """
 from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
 from typing import Protocol
+from zoneinfo import ZoneInfo
+
+from app.config import OWNER_TIMEZONE, PROCESSING_STALE_AFTER_SECONDS
 
 logger = logging.getLogger("gatekeeper.state_store")
+
+# Request lifecycle, in order. `failed` is the only status a resend may run
+# again from -- see the module docstring.
+REQUEST_PROCESSING = "processing"
+REQUEST_EFFECT_DONE = "effect_done"
+REQUEST_COMPLETED = "completed"
+REQUEST_FAILED = "failed"
+DUPLICATE_REQUEST_STATUSES = frozenset({REQUEST_PROCESSING, REQUEST_EFFECT_DONE, REQUEST_COMPLETED})
 
 
 class StateStore(Protocol):
     def is_duplicate_message(self, message_id: str) -> bool: ...
     def mark_message_seen(self, message_id: str) -> None: ...
-    def is_duplicate_request(self, request_id: str) -> bool: ...
-    def mark_request_seen(self, request_id: str) -> None: ...
+    def get_request_status(self, request_id: str) -> str | None: ...
+    def get_request_status_detail(self, request_id: str) -> tuple[str, str] | None: ...
+    def set_request_status(self, request_id: str, status: str, sender: str = "") -> None: ...
     def count_today(self, sender: str, today: date | None = None) -> int: ...
-    def record_request(self, sender: str, today: date | None = None) -> None: ...
+    def record_request(self, sender: str, request_id: str, today: date | None = None) -> None: ...
+    # Batch forms of the three calls above, one Sheets call each however
+    # many ids -- a `batch` request (app/pipeline.py) would otherwise make
+    # ~7 sequential Sheets calls per item, and a 25-item batch would blow
+    # through Sheets' 60-writes-per-minute-per-user quota mid-request.
+    def get_request_status_details(self, request_ids: list[str]) -> dict[str, tuple[str, str]]: ...
+    def set_request_statuses(self, statuses: list[tuple[str, str]], sender: str = "") -> None: ...
+    def record_requests(self, sender: str, request_ids: list[str], today: date | None = None) -> None: ...
 
 
-def _today() -> date:
-    return datetime.now(timezone.utc).date()
+def is_duplicate_request_status(
+    status: str | None, updated_at: str | None = None, *, write_verb: bool, now: datetime | None = None
+) -> bool:
+    """A `processing` row older than PROCESSING_STALE_AFTER_SECONDS is no
+    longer a duplicate: before this, a process that died mid-request
+    (a Cloud Run timeout, a deploy kill, OOM -- after `set_request_status`
+    recorded `processing` but before `_finalize_request_statuses` ever ran)
+    left that request_id wedged as a duplicate FOREVER, and every resend
+    got a `duplicate` reply claiming an earlier reply exists when none
+    does (Instinct's review, F2/M3). `completed`/`effect_done` are always
+    duplicates regardless of age -- those are terminal, not stuck.
+
+    `updated_at` is optional and `None` is treated as "can't tell how old
+    this is" -- i.e. still a duplicate, the same as before this fix
+    existed -- so a caller that doesn't have a timestamp handy keeps the
+    old, safe behavior.
+
+    `write_verb` (the verb of the request now being deduped) turns the
+    age-out off: a write records `processing`, performs its side effect,
+    THEN records `effect_done` -- so a process that died between those
+    last two steps leaves a `processing` row for a write that DID happen,
+    and aging it out would let a resend repeat it (a second calendar
+    invite to real attendees, a second draft or Drive file). A stuck write
+    stays a duplicate, as before this age-out existed; only a read -- where
+    running twice costs nothing -- is let through. The CURRENT request's
+    verb is the right one to check even though the stuck row may have been
+    written by a different verb under the same request_id: whatever the
+    earlier one did, only a write now could repeat a side effect."""
+    if status not in DUPLICATE_REQUEST_STATUSES:
+        return False
+    if status == REQUEST_PROCESSING and updated_at is not None and not write_verb:
+        try:
+            age_seconds = ((now or datetime.now(timezone.utc)) - datetime.fromisoformat(updated_at)).total_seconds()
+        except ValueError:
+            return True
+        if age_seconds > PROCESSING_STALE_AFTER_SECONDS:
+            return False
+    return True
+
+
+def owner_today(now: datetime | None = None) -> date:
+    """"Today" for the daily cap is the owner's calendar day -- a cap that
+    resets at 03:00 Israel time (UTC midnight) is surprising to reason about.
+    `now` is for tests; it defaults to the real current time."""
+    tz = ZoneInfo(OWNER_TIMEZONE)
+    return (now.astimezone(tz) if now else datetime.now(tz)).date()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class InMemoryStateStore:
@@ -48,7 +132,8 @@ class InMemoryStateStore:
 
     def __init__(self) -> None:
         self._seen_messages: set[str] = set()
-        self._seen_requests: set[str] = set()
+        self._request_statuses: dict[str, str] = {}
+        self._request_status_updated_at: dict[str, str] = {}
         self._daily_counts: dict[tuple[str, date], int] = {}
 
     def is_duplicate_message(self, message_id: str) -> bool:
@@ -57,18 +142,37 @@ class InMemoryStateStore:
     def mark_message_seen(self, message_id: str) -> None:
         self._seen_messages.add(message_id)
 
-    def is_duplicate_request(self, request_id: str) -> bool:
-        return request_id in self._seen_requests
+    def get_request_status(self, request_id: str) -> str | None:
+        return self._request_statuses.get(request_id)
 
-    def mark_request_seen(self, request_id: str) -> None:
-        self._seen_requests.add(request_id)
+    def get_request_status_detail(self, request_id: str) -> tuple[str, str] | None:
+        status = self._request_statuses.get(request_id)
+        if status is None:
+            return None
+        return status, self._request_status_updated_at.get(request_id, _now_iso())
+
+    def set_request_status(self, request_id: str, status: str, sender: str = "") -> None:
+        self._request_statuses[request_id] = status
+        self._request_status_updated_at[request_id] = _now_iso()
 
     def count_today(self, sender: str, today: date | None = None) -> int:
-        return self._daily_counts.get((sender, today or _today()), 0)
+        return self._daily_counts.get((sender, today or owner_today()), 0)
 
-    def record_request(self, sender: str, today: date | None = None) -> None:
-        key = (sender, today or _today())
+    def record_request(self, sender: str, request_id: str, today: date | None = None) -> None:
+        key = (sender, today or owner_today())
         self._daily_counts[key] = self._daily_counts.get(key, 0) + 1
+
+    def get_request_status_details(self, request_ids: list[str]) -> dict[str, tuple[str, str]]:
+        details = {rid: self.get_request_status_detail(rid) for rid in request_ids}
+        return {rid: detail for rid, detail in details.items() if detail is not None}
+
+    def set_request_statuses(self, statuses: list[tuple[str, str]], sender: str = "") -> None:
+        for request_id, status in statuses:
+            self.set_request_status(request_id, status, sender)
+
+    def record_requests(self, sender: str, request_ids: list[str], today: date | None = None) -> None:
+        for request_id in request_ids:
+            self.record_request(sender, request_id, today)
 
 
 class SheetsStateStore:
@@ -79,31 +183,40 @@ class SheetsStateStore:
     operator can pin GOOGLE_SHEETS_STATE_SPREADSHEET_ID for future runs
     (see docs/RUNBOOK.md).
 
-    Reads the whole "messages"/"requests" tab per call and scans in
-    Python -- simple and correct at this project's 5-50 requests/day
-    scale. A known, accepted limit: this would not scale past a few
-    thousand rows without an index.
+    One tab per record kind, column A always a non-empty key:
 
-    NOT exercised against a live Sheets API call -- see the final build
-    report's "could not verify" section.
+        messages        message_id | first_seen_at
+        request_status  request_id | status | updated_at | sender   (append-only, last row wins)
+        daily_counts    date       | sender | request_id
+
+    Missing tabs are added on construction, so an existing spreadsheet is
+    upgraded in place. The legacy `requests` tab written by the first
+    version (whose rows are misaligned -- see the module docstring) is left
+    untouched as history and never read.
+
+    Reads a whole tab per call and scans in Python -- simple and correct
+    at this project's 5-50 requests/day scale; would need an index past a
+    few thousand rows per tab.
     """
 
-    _MESSAGES_RANGE = "messages!A:A"
-    _REQUESTS_RANGE = "requests!A:C"  # request_id, sender, date (iso)
+    _MESSAGES_TAB = "messages"
+    _REQUEST_STATUS_TAB = "request_status"
+    _DAILY_COUNTS_TAB = "daily_counts"
+    _TABS = (_MESSAGES_TAB, _REQUEST_STATUS_TAB, _DAILY_COUNTS_TAB)
 
-    def __init__(self, spreadsheet_id: str | None = None):
-        from googleapiclient.discovery import build  # lazy: keep this module importable without the package
+    def __init__(self, spreadsheet_id: str | None = None, service=None):
+        if service is None:
+            from app.google_auth_helper import build_google_service
 
-        from app.google_auth_helper import build_google_credentials
+            service = build_google_service("sheets", "v4", scopes=["https://www.googleapis.com/auth/drive.file"])
+        self._service = service
+        self.spreadsheet_id = spreadsheet_id or self._create_spreadsheet()
+        self._ensure_tabs()
 
-        creds = build_google_credentials(scopes=["https://www.googleapis.com/auth/drive.file"])
-        self._service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-        self.spreadsheet_id = spreadsheet_id or self._get_or_create_spreadsheet()
-
-    def _get_or_create_spreadsheet(self) -> str:
+    def _create_spreadsheet(self) -> str:
         body = {
             "properties": {"title": "data-gatekeeper-state"},
-            "sheets": [{"properties": {"title": "messages"}}, {"properties": {"title": "requests"}}],
+            "sheets": [{"properties": {"title": tab}} for tab in self._TABS],
         }
         created = self._service.spreadsheets().create(body=body, fields="spreadsheetId").execute()
         spreadsheet_id = created["spreadsheetId"]
@@ -114,40 +227,91 @@ class SheetsStateStore:
         )
         return spreadsheet_id
 
-    def _column(self, a1_range: str) -> list[list[str]]:
-        result = self._service.spreadsheets().values().get(spreadsheetId=self.spreadsheet_id, range=a1_range).execute()
+    def _ensure_tabs(self) -> None:
+        meta = self._service.spreadsheets().get(spreadsheetId=self.spreadsheet_id, fields="sheets.properties.title").execute()
+        existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
+        missing = [tab for tab in self._TABS if tab not in existing]
+        if missing:
+            self._service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": tab}}} for tab in missing]},
+            ).execute()
+            logger.info("added state tabs %s to spreadsheet %s", missing, self.spreadsheet_id)
+
+    def _rows(self, tab: str, last_col: str) -> list[list[str]]:
+        result = self._service.spreadsheets().values().get(spreadsheetId=self.spreadsheet_id, range=f"{tab}!A:{last_col}").execute()
         return result.get("values", [])
 
-    def _append(self, a1_range: str, values: list[list[str]]) -> None:
+    def _append(self, tab: str, last_col: str, row: list[str]) -> None:
+        self._append_rows(tab, last_col, [row])
+
+    def _append_rows(self, tab: str, last_col: str, rows: list[list[str]]) -> None:
+        # The invariant from the module docstring, enforced where rows are
+        # written: a blank first cell is exactly what shifted every later
+        # append a column right in production. Checked for every row
+        # before any is written, so a bad row never lands half a batch.
+        for row in rows:
+            if not row or not str(row[0]).strip():
+                raise ValueError(f"refusing to append a row with a blank first cell to {tab!r}")
+        if not rows:
+            return
         self._service.spreadsheets().values().append(
             spreadsheetId=self.spreadsheet_id,
-            range=a1_range,
+            range=f"{tab}!A:{last_col}",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
-            body={"values": values},
+            body={"values": rows},
         ).execute()
 
     def is_duplicate_message(self, message_id: str) -> bool:
-        return any(row and row[0] == message_id for row in self._column(self._MESSAGES_RANGE))
+        return any(row and row[0] == message_id for row in self._rows(self._MESSAGES_TAB, "A"))
 
     def mark_message_seen(self, message_id: str) -> None:
-        self._append("messages!A:A", [[message_id]])
+        self._append(self._MESSAGES_TAB, "B", [message_id, _now_iso()])
 
-    def is_duplicate_request(self, request_id: str) -> bool:
-        return any(row and row[0] == request_id for row in self._column(self._REQUESTS_RANGE))
+    def get_request_status(self, request_id: str) -> str | None:
+        status: str | None = None
+        for row in self._rows(self._REQUEST_STATUS_TAB, "B"):
+            if len(row) >= 2 and row[0] == request_id:
+                status = row[1]  # append-only: the last matching row wins
+        return status
 
-    def mark_request_seen(self, request_id: str) -> None:
-        # Written as its own row (sender/date columns blank) rather than
-        # merged into record_request's row: the two calls happen at
-        # different points in app/pipeline.py and neither should block
-        # on the other. count_today() only matches rows with a non-empty
-        # sender column, so this row is invisible to the rate-cap scan.
-        self._append("requests!A:C", [[request_id, "", ""]])
+    def get_request_status_detail(self, request_id: str) -> tuple[str, str] | None:
+        """(status, updated_at) of the last-written row, or None -- lets
+        is_duplicate_request_status age out a stuck `processing` row. A
+        second, wider (A:C rather than A:B) read of the same tab
+        get_request_status already reads, since the audit-minimization
+        habit elsewhere in this codebase is to fetch only the columns a
+        given method actually needs."""
+        detail: tuple[str, str] | None = None
+        for row in self._rows(self._REQUEST_STATUS_TAB, "C"):
+            if len(row) >= 3 and row[0] == request_id:
+                detail = (row[1], row[2])  # append-only: the last matching row wins
+        return detail
+
+    def set_request_status(self, request_id: str, status: str, sender: str = "") -> None:
+        self._append(self._REQUEST_STATUS_TAB, "D", [request_id, status, _now_iso(), sender])
 
     def count_today(self, sender: str, today: date | None = None) -> int:
-        target = (today or _today()).isoformat()
-        return sum(1 for row in self._column(self._REQUESTS_RANGE) if len(row) >= 3 and row[1] == sender and row[2] == target)
+        target = (today or owner_today()).isoformat()
+        return sum(1 for row in self._rows(self._DAILY_COUNTS_TAB, "B") if len(row) >= 2 and row[0] == target and row[1] == sender)
 
-    def record_request(self, sender: str, today: date | None = None) -> None:
-        target = (today or _today()).isoformat()
-        self._append("requests!A:C", [["", sender, target]])
+    def record_request(self, sender: str, request_id: str, today: date | None = None) -> None:
+        target = (today or owner_today()).isoformat()
+        self._append(self._DAILY_COUNTS_TAB, "C", [target, sender, request_id])
+
+    def get_request_status_details(self, request_ids: list[str]) -> dict[str, tuple[str, str]]:
+        wanted = set(request_ids)
+        details: dict[str, tuple[str, str]] = {}
+        for row in self._rows(self._REQUEST_STATUS_TAB, "C"):
+            if len(row) >= 3 and row[0] in wanted:
+                details[row[0]] = (row[1], row[2])  # append-only: the last matching row wins
+        return details
+
+    def set_request_statuses(self, statuses: list[tuple[str, str]], sender: str = "") -> None:
+        now = _now_iso()
+        self._append_rows(self._REQUEST_STATUS_TAB, "D", [[rid, status, now, sender] for rid, status in statuses])
+
+    def record_requests(self, sender: str, request_ids: list[str], today: date | None = None) -> None:
+        target = (today or owner_today()).isoformat()
+        self._append_rows(self._DAILY_COUNTS_TAB, "C", [[target, sender, rid] for rid in request_ids])

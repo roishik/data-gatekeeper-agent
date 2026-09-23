@@ -1,16 +1,21 @@
 # data-gatekeeper-agent
 
-> **Status: live MVP (read-only) + local-only write access (2026-09-15).** The research below
-> drove the design; `app/` is deployed on Cloud Run and answers allowlisted emails end to end for
-> `gmail.search`/`calendar.list_events` — inbound AgentMail webhook → auth/policy → executor →
-> reply, with a hash-chained audit log. This session added write verbs
-> (`gmail.create_draft`, `calendar.create_event`/`update_event`/`delete_event`,
-> `drive.create_file`) that are **not deployed yet** and deliberately depart from the read-only
-> threat model below for calendar writes (autonomous, no recipient allowlist, no approval step
-> — an explicit owner choice, not an oversight). Current state, infrastructure IDs and next
-> steps: `CLAUDE.md`. `calendar.list_events` resolves relative day language ("tomorrow") to a
-> `day_offset`/`days` pair the LLM picks and Python turns into a timezone-aware window — see
-> `app/calendar_window.py`. See `docs/RUNBOOK.md` for how to run it and the tests.
+> **Status (2026-09-22): live on Cloud Run, read + write.** The research below drove the
+> design; `app/` answers allowlisted emails end to end: inbound AgentMail webhook → signature,
+> dedupe and rate cap → deterministic request block (or a quarantined, tool-less reader LLM for
+> plain text) → deny-by-default policy → one executor → reply, with a hash-chained audit log.
+> - Verbs: `gmail.search`, `gmail.create_draft` (drafts only, never sent),
+>   `calendar.list_events`/`create_event`/`update_event`/`delete_event`, `drive.create_file`.
+> - Calendar writes are autonomous by the owner's choice, contained to events the gatekeeper
+>   created itself.
+> - TypeSafe's Jev classifier screens every inbound part for prompt injection, and every
+>   outbound item for passwords, card numbers and one-time codes (only those: I share other
+>   personal information with Instinct on purpose).
+>
+> Request/response format: [`docs/PROTOCOL.md`](docs/PROTOCOL.md). Operations:
+> [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Current state, infrastructure ids and next steps:
+> `CLAUDE.md`. The research and "candidate architecture" sections below are the 2026-09-14
+> design record and are kept as written; the "Decided" list is kept up to date.
 
 A self-hosted agent that is the **only** thing holding my credentials (Gmail, LinkedIn, ...).
 My consumer AI assistant (Instinct) never gets direct access. Instead it **emails** the
@@ -157,13 +162,32 @@ Inbound email ─► [0] Mail gate: secret sub-address, sender allowlist, DKIM/D
   log sheet (it only reaches files the app itself creates).
 - **2026-09-14 — Storage: my own Google Drive** (a log sheet created by the app, with a hash
   chain). The BCC'd email thread in my personal inbox is the second copy, which the
-  gatekeeper can't rewrite.
+  gatekeeper can't rewrite. *(Superseded 2026-09-22: BCC dropped, see below.)*
 - **2026-09-14 — Hosting: Google Cloud Run** (Python, always-free tier, receives AgentMail's
   webhook with Svix signature verification, secrets in Secret Manager, same GCP project as the
   OAuth client). Rejected: Cloudflare Workers (TypeScript-native), AgentCore / Vertex Agent
   Engine (not free, overkill), Apps Script (can't verify webhook signatures, weak isolation),
   Oracle Always Free (idle reclamation, 2026 policy cuts). See
   [07](research/07-free-hosting-options.md).
+- **2026-09-15 — Write access**, a deliberate departure from the read-only model above:
+  `gmail.create_draft` (drafts only, never sent; I send them myself), autonomous calendar
+  writes with no attendee allowlist, and `drive.create_file` into one app-owned folder.
+- **2026-09-17 — TypeSafe/Jev injection screen** on every inbound email, as a tripwire on top
+  of the quarantine and policy layers rather than a replacement for them.
+- **2026-09-22 — Hardening refactor** after a full quality review:
+  - **No BCC to me.** AgentMail's thread history is the human-readable record, and the hash
+    chain is the tamper-evident one.
+  - **Jev screens every outbound item** for exactly three secrets (passwords, full card
+    numbers, one-time codes) and for text aimed at the reading AI. Flagged text is withheld
+    and ids are kept. This fails closed. It means Google content now reaches a *classifier*,
+    never a generative LLM.
+  - **Unknown request params are ignored**, and listed back, when the request passes Jev.
+  - **Injected block-path writes are denied**; reads stay log-only.
+  - **Calendar update/delete only touch events the gatekeeper created**, and guests are
+    added or removed rather than replaced.
+  - **A payload rail** carries long text verbatim with no LLM involved.
+  - **Inline processing stays.** A Cloud Tasks queue was considered and rejected as
+    unnecessary infrastructure at this volume.
 
 ## Decisions I need to make before building
 

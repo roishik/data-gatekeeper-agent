@@ -4,7 +4,7 @@ agentmail_client.py — the only module that sends outbound email.
 Wraps AgentMail's reply-to-message endpoint:
 
     POST /v0/inboxes/{inbox_id}/messages/{message_id}/reply
-    { "to": [...], "cc": [...], "bcc": [...], "text": "...", "html": "..." }
+    { "to": [...], "text": "..." }
     -> { "message_id": "...", "thread_id": "..." }
 
 behind an interface so app/pipeline.py and its tests never touch the
@@ -15,17 +15,14 @@ has exactly one documented shape to be wrong about (the REST endpoint)
 instead of two (the endpoint AND an SDK wrapper's mapping onto it).
 
 The endpoint path, method, and field names above were confirmed against
-AgentMail's current published API reference (raw markdown fetched during
-this build, not just an AI-summarized pass). NOT exercised against a
-live AgentMail API call, though -- no network call this service would
-make has actually been made. See the final build report's "could not
-verify" section for what that leaves open (live delivery timing/retry
-behavior, and the exact `agentmail` SDK's own wrapper, which this file
-deliberately avoids depending on).
+AgentMail's published API reference, and every reply this service has sent
+since 2026-09-15 went through this code (tests/test_e2e_live.py exercises
+it end to end).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import quote
 from typing import Protocol
 
 from app.config import AGENTMAIL_API_KEY
@@ -40,7 +37,7 @@ class ReplyResult:
 
 
 class AgentMailClient(Protocol):
-    def reply(self, inbox_id: str, message_id: str, to: str, bcc: str, text: str) -> ReplyResult: ...
+    def reply(self, inbox_id: str, message_id: str, to: str, text: str) -> ReplyResult: ...
 
 
 class HttpAgentMailClient:
@@ -51,14 +48,21 @@ class HttpAgentMailClient:
         if not self._api_key:
             raise RuntimeError("AGENTMAIL_API_KEY is not set -- cannot construct HttpAgentMailClient.")
 
-    def reply(self, inbox_id: str, message_id: str, to: str, bcc: str, text: str) -> ReplyResult:
+    def reply(self, inbox_id: str, message_id: str, to: str, text: str) -> ReplyResult:
         import httpx  # lazy: keep this module importable without a live key at import time
 
+        # Both ids are percent-encoded as single path segments: an RFC 5322
+        # Message-ID may legally contain '/', which would otherwise split
+        # the path and turn a real reply into a 404.
         resp = httpx.post(
-            f"{_BASE_URL}/inboxes/{inbox_id}/messages/{message_id}/reply",
+            f"{_BASE_URL}/inboxes/{quote(inbox_id, safe='')}/messages/{quote(message_id, safe='')}/reply",
             headers={"Authorization": f"Bearer {self._api_key}"},
-            json={"to": [to], "bcc": [bcc], "text": text},
-            timeout=30.0,
+            # No cc/bcc, ever: the reply goes to the verified sender only.
+            # (Until 2026-09-22 the owner was BCC'd on every reply; dropped
+            # at the owner's request -- AgentMail's thread history is the
+            # human-readable record now.)
+            json={"to": [to], "text": text},
+            timeout=15.0,
         )
         resp.raise_for_status()
         data = resp.json()

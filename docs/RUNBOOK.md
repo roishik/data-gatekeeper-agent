@@ -1,38 +1,54 @@
 # RUNBOOK
 
-Local run, tests, the Cloud Run deploy sequence, and the kill switch.
-For the design and the layer-by-layer walkthrough, see the repo
-[README](../README.md) and `research/*.md`.
+Local run, tests, the Cloud Run deploy sequence, post-deploy checks, and
+the kill switch. For the request/response format see
+[PROTOCOL.md](PROTOCOL.md); for the design and the layer-by-layer
+walkthrough, the repo [README](../README.md) and `research/*.md`.
 
 ## Local run
 
 ```bash
 cd data-gatekeeper-agent
-uv sync --extra dev
+uv sync            # installs the dev group (pytest) too
 cp .env.example .env
 ```
 
 Fill in `.env`. At minimum, to actually process a request end to end
 you need `AGENTMAIL_API_KEY`, `AGENTMAIL_WEBHOOK_SECRET`,
 `AGENTMAIL_INBOX_ID`, `GATEKEEPER_INBOX_ADDRESS`, `ALLOWED_SENDERS`,
-`OWNER_EMAIL`, `ANTHROPIC_API_KEY`, and the three `GOOGLE_*` credentials
-(minted once via `scripts/google_auth.py`, below). With nothing filled
-in, the app still **imports** and the **test suite still runs**
-(everything below the app layer is tested against fakes, not real
+`ANTHROPIC_API_KEY`, and the three `GOOGLE_*` credentials (minted once via
+`scripts/google_auth.py`, below). `OWNER_EMAIL` is only used by the live
+e2e tests now: replies are no longer BCC'd to the owner (2026-09-22). With
+nothing filled in, the app still **imports** and the **test suite still
+runs** (everything below the app layer is tested against fakes, not real
 credentials) — only actually starting the server and hitting the real
 webhook route needs real values.
 
-**Optional: `TYPESAFE_API_KEY`.** Added 2026-09-17 (`app/injection_screen.py`)
--- an additive tripwire, not the security boundary (see that module's
-docstring), that scores every inbound email for likely prompt-injection
-content via TypeSafe's Jev model, and (only on the freeform/LLM-fallback
-parse path, above `INJECTION_DENY_THRESHOLD`, default `0.85`) skips the
-paid Anthropic reader-LLM call and denies early. Left unset,
-`app/main.py` falls back to `NoOpInjectionScreen` and the pipeline
-behaves exactly as it did before this feature existed -- nothing else in
-this build depends on it.
+**`TYPESAFE_API_KEY` (TypeSafe/Jev screening).** Set in prod. Two screens
+use it:
+- **Inbound** (`app/injection_screen.py`) scores every part of every
+  email: subject, body, request block, and each payload.
+  - At/above `INJECTION_DENY_THRESHOLD` (0.85), the subject+block "request
+    score" denies block-path **write** verbs and skips the reader LLM on the
+    freeform path.
+  - Fails **open**: an unreachable screen means no signal.
+- **Outbound** (`app/output_screen.py`) screens every item a reply carries
+  and withholds the text of flagged items (ids kept).
+  - Thresholds: `OUTPUT_SENSITIVE_THRESHOLD` 0.5 and
+    `OUTPUT_INJECTION_THRESHOLD` 0.7.
+  - Fails **closed** (`OUTPUT_SCREEN_FAIL_MODE=closed`): an unscreenable
+    item's text is withheld.
 
-Implemented verbs as of this build: `gmail.search`, `gmail.create_draft`,
+Tuning: `JEV_CHUNK_CHARS` 4000, `JEV_CHUNK_OVERLAP` 200,
+`JEV_MAX_WORKERS` 8, `JEV_TIMEOUT_SECONDS` 10. Left unset locally, both
+screens are no-ops and behave as if the feature didn't exist.
+
+**Reader LLM limits.** Plain-text requests longer than
+`READER_LLM_MAX_INPUT_CHARS` (20,000) skip the LLM and are answered
+`too_long_for_freeform`, pointing at the payload rail
+([PROTOCOL.md](PROTOCOL.md)).
+
+Implemented verbs: `gmail.search`, `gmail.create_draft`,
 `calendar.list_events`, `calendar.create_event`, `calendar.update_event`,
 `calendar.delete_event`, `drive.create_file`. `calendar.list_events`
 resolves relative day language ("today"/"tomorrow"/"this week") to a
@@ -42,14 +58,17 @@ resolves relative day language ("today"/"tomorrow"/"this week") to a
 return `not_implemented`.
 
 **Write verbs, by owner's explicit choice (see CLAUDE.md):**
-`gmail.create_draft` only ever creates a Gmail DRAFT — the code never
-calls a send endpoint (see `app/gmail_executor.py`'s docstring) — so the
-owner reviewing and manually sending it in Gmail is the approval step
-for that verb. The calendar write verbs and `drive.create_file` run
-fully autonomously, with **no recipient/attendee allowlist and no
-human-approval step** — `calendar.create_event`/`update_event` send real
-Calendar invite/update emails to whatever attendee addresses the request
-names, immediately. There is no push-approval channel in this build.
+- `gmail.create_draft` only ever creates a Gmail DRAFT. The code never
+  calls a send endpoint (see `app/gmail_executor.py`'s docstring), so the
+  owner reviewing and manually sending it in Gmail is the approval step.
+- The calendar write verbs and `drive.create_file` run autonomously, with
+  no recipient/attendee allowlist and no human-approval step. Since
+  2026-09-22:
+  - `update_event`/`delete_event` only touch events the gatekeeper created
+    itself (a private extended property set at creation).
+  - Guests are added/removed, never replaced wholesale.
+  - An event with attendees has its title screened by Jev before any
+    invite goes out.
 
 **A note on the AgentMail key's name.** This project's code always reads
 `AGENTMAIL_API_KEY` (see `app/config.py`) — not `agent_mail_api_key`,
@@ -79,12 +98,24 @@ console (or via `client.webhooks.create(...)`), with event type
 uv run pytest -q
 ```
 
-Fully offline — no network calls, no credentials, no `.env` required.
-Every provider boundary (`app/reader_llm.py`, `app/gmail_executor.py`,
-`app/agentmail_client.py`) is a `Protocol` with a real implementation
-(gated behind having real credentials, never constructed by a test) and
-a fake (`tests/fakes.py`, used by every test). See the final build
-report for the exact list of test scenarios covered.
+The default suite is fully offline — no network calls, no credentials, no
+`.env` required — and runs in CI on every push and PR
+(`.github/workflows/ci.yml`). Every provider boundary is a `Protocol`
+with a real implementation (gated behind real credentials, never
+constructed by a test) and a fake (`tests/fakes.py`).
+
+Three **live** suites skip themselves unless `RUN_E2E=1`. They send real
+traffic, so run them deliberately:
+
+```bash
+RUN_E2E=1 uv run pytest tests/test_sheets_live.py -v            # real Sheets API, scratch spreadsheets (trashed after)
+RUN_E2E=1 uv run pytest tests/test_injection_screen_live.py -v  # real TypeSafe API calls
+RUN_E2E=1 uv run pytest tests/test_e2e_live.py -v               # real email through the deployed service
+```
+
+`test_sheets_live.py` exists because the fakes store rows exactly where
+they're told to, and the real `values.append` doesn't always. See the
+"State sheet" section below.
 
 ## Google OAuth: minting the refresh token
 
@@ -123,67 +154,98 @@ Once, by hand, on your own machine — never inside the deployed service:
 
 ## Cloud Run deploy
 
-Project `data-gatekeeper-roishik`, region `europe-west1` (per the
-README's decided architecture). Secrets are mounted from Secret Manager,
-never baked into the image or passed as plain `--set-env-vars`.
+Service `data-gatekeeper`, project `data-gatekeeper-roishik`, region
+`europe-west1`. Secrets are mounted from Secret Manager, never baked into
+the image or passed as plain `--set-env-vars`. Env vars and secrets
+persist across source deploys, so a routine deploy is one command.
+
+**Deploy only a clean, pushed commit.** `gcloud run deploy --source=.`
+uploads the *working tree* (filtered by `.gcloudignore`), not a commit.
+On 2026-09-19 the live revision turned out to be a local commit that had
+never been pushed, so GitHub and the deploy disagreed. So:
 
 ```bash
-PROJECT=data-gatekeeper-roishik
-REGION=europe-west1
-SERVICE=data-gatekeeper-agent
-
-gcloud config set project "$PROJECT"
-
-# One-time: enable the APIs this deploy needs.
-gcloud services enable run.googleapis.com secretmanager.googleapis.com \
-  artifactregistry.googleapis.com
-
-# Build and push the image (Cloud Build; or `docker build` + `docker push`
-# to Artifact Registry if you prefer building locally).
-gcloud builds submit --tag "$REGION-docker.pkg.dev/$PROJECT/gatekeeper/$SERVICE:latest"
-
-# One-time per secret: create it (see scripts/google_auth.py's printed
-# commands for the three GOOGLE_* ones). Repeat this shape for
-# AGENTMAIL_API_KEY, AGENTMAIL_WEBHOOK_SECRET, ANTHROPIC_API_KEY, etc.
-#   gcloud secrets create AGENTMAIL_API_KEY --data-file=-   # then paste + Ctrl-D
-#   gcloud secrets create AGENTMAIL_WEBHOOK_SECRET --data-file=-
-#   gcloud secrets create ANTHROPIC_API_KEY --data-file=-
-#   gcloud secrets create TYPESAFE_API_KEY --data-file=-   # optional, see "Local run" above
-
-gcloud run deploy "$SERVICE" \
-  --project "$PROJECT" \
-  --region "$REGION" \
-  --image "$REGION-docker.pkg.dev/$PROJECT/gatekeeper/$SERVICE:latest" \
-  --no-allow-unauthenticated=false \
-  --set-env-vars "AGENTMAIL_INBOX_ID=...,GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to,ALLOWED_SENDERS=...,OWNER_EMAIL=...,MAX_REQUESTS_PER_DAY=20,ANTHROPIC_MODEL=claude-haiku-4-5-20251001,AUDIT_LOG_BACKEND=sheets,STATE_STORE_BACKEND=sheets" \
-  --set-secrets "AGENTMAIL_API_KEY=AGENTMAIL_API_KEY:latest,AGENTMAIL_WEBHOOK_SECRET=AGENTMAIL_WEBHOOK_SECRET:latest,ANTHROPIC_API_KEY=ANTHROPIC_API_KEY:latest,GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,GOOGLE_REFRESH_TOKEN=GOOGLE_REFRESH_TOKEN:latest" \
-  --min-instances 0 \
-  --max-instances 2 \
-  --memory 256Mi
+git status --porcelain            # must print nothing
+git push                          # the commit being deployed must be on GitHub
+SHA=$(git rev-parse --short HEAD)
+gcloud run deploy data-gatekeeper --project=data-gatekeeper-roishik --region=europe-west1 \
+  --source=. --labels=commit=$SHA --timeout=120 --max-instances=1 \
+  --update-env-vars=GIT_SHA=$SHA,MAX_REQUESTS_PER_DAY=100 --quiet
 ```
 
-Notes:
-- `--no-allow-unauthenticated=false` means the service IS publicly
-  reachable (AgentMail's webhook has to be able to POST to it from the
-  open internet) — Layer 0's signature verification is what stands in
-  for network-level auth here, which is exactly why it runs first and
-  rejects loudly on any failure.
-- After the first deploy with `AUDIT_LOG_BACKEND=sheets` /
-  `STATE_STORE_BACKEND=sheets`, watch the Cloud Run logs for the "created
-  a new ... spreadsheet" warning (`app/audit_log.py`, `app/state_store.py`)
-  and copy the printed spreadsheet id into
-  `GOOGLE_SHEETS_LOG_SPREADSHEET_ID` / `GOOGLE_SHEETS_STATE_SPREADSHEET_ID`
-  (as an env var or another Secret Manager entry), then redeploy — otherwise
-  a cold start after scale-to-zero creates a fresh spreadsheet every time.
-- Same idea for `drive.create_file` (`app/drive_executor.py`): the first
-  call with `GOOGLE_DRIVE_FOLDER_ID` unset creates a Drive folder and
-  logs its id at WARNING — pin it into `GOOGLE_DRIVE_FOLDER_ID` so every
-  later write lands in the same folder instead of a fresh one per cold
-  start.
-- Register the deployed service's URL + `/webhooks/agentmail` as the
-  AgentMail webhook endpoint (event type `message.received`) once it's
-  live, and copy the signing secret AgentMail gives you into the
-  `AGENTMAIL_WEBHOOK_SECRET` secret above.
+- `--labels=commit=$SHA` makes "which commit is live?" answerable with
+  `gcloud run services describe ... --format='value(metadata.labels.commit)'`.
+- `--timeout=120` (raised from 60 on 2026-09-22): a request that runs
+  Gmail, Jev and the reply in sequence must never be killed mid-write.
+- `--max-instances=1` is part of the audit chain's single-writer guarantee
+  (see `app/main.py`).
+- `GIT_SHA=$SHA` (new, 2026-09-23): every reply's `protocol_version` field
+  reads this env var, falling back to `"dev"` if it's never set. Without
+  it, Instinct can't tell a deploy happened from the reply alone.
+- `MAX_REQUESTS_PER_DAY=100` (raised from 50, 2026-09-23, owner's decision):
+  the code default changed too, but a live env var always wins over the
+  code default on redeploy, so this must be set explicitly at least once
+  or the live service stays at 50.
+
+To change the allowlist (values contain commas, so use gcloud's custom
+delimiter). This widens who can reach the owner's data, so it's the
+owner's call:
+```bash
+gcloud run services update data-gatekeeper --project=data-gatekeeper-roishik --region=europe-west1 --update-env-vars="^;^ALLOWED_SENDERS=roishikler@mail.instinct.com"
+```
+
+Initial setup (done once, 2026-09-14/15; kept for rebuilding from scratch):
+- `gcloud services enable run.googleapis.com secretmanager.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com`
+- Create each secret with `--data-file=-`, reading values from files or
+  Python, never pasting them into a shell: `AGENTMAIL_API_KEY`,
+  `AGENTMAIL_WEBHOOK_SECRET`, `ANTHROPIC_API_KEY`, `TYPESAFE_API_KEY`, and
+  the three `GOOGLE_*` (see `scripts/google_auth.py`'s printed commands).
+  Grant `gatekeeper-run@data-gatekeeper-roishik.iam.gserviceaccount.com`
+  `roles/secretmanager.secretAccessor` on each secret individually.
+- First deploy adds `--service-account=gatekeeper-run@...`,
+  `--allow-unauthenticated` (AgentMail must be able to POST from the
+  open internet; Layer 0's signature check stands in for network auth),
+  `--set-secrets` for every secret above, and the non-secret env vars
+  listed in CLAUDE.md's infrastructure table.
+- The first run with `AUDIT_LOG_BACKEND=sheets` / `STATE_STORE_BACKEND=sheets`
+  and no spreadsheet ids creates the spreadsheets and logs their ids at
+  WARNING. Pin them into `GOOGLE_SHEETS_LOG_SPREADSHEET_ID` /
+  `GOOGLE_SHEETS_STATE_SPREADSHEET_ID`, or every cold start creates new ones.
+- Same for `drive.create_file`: its first live call with
+  `GOOGLE_DRIVE_FOLDER_ID` unset creates a folder and logs its id at
+  WARNING. Pin it.
+- Register `<service URL>/webhooks/agentmail` as the AgentMail webhook
+  (event type `message.received`) and store its signing secret as
+  `AGENTMAIL_WEBHOOK_SECRET`.
+
+## After every deploy
+
+```bash
+uv run python scripts/verify_audit_chain.py --recent 5
+```
+
+Read-only. It recomputes the prod audit log's hash chain, says where it
+broke if it did (a revision-rollout overlap is the one way the service can
+fork its own chain), and summarizes verdicts. It prints no ids and no
+content. Then send one real request (or run the live e2e suite) and check
+its reply.
+
+## State sheet
+
+`GOOGLE_SHEETS_STATE_SPREADSHEET_ID` holds Layer 1's state, one tab per
+record kind. **Column A is always a non-empty key**, enforced in
+`SheetsStateStore._append`:
+
+| tab | columns |
+|---|---|
+| `messages` | message_id, first_seen_at |
+| `request_status` | request_id, status, updated_at, sender (append-only, last row wins) |
+| `daily_counts` | date (owner's timezone), sender, request_id |
+
+The legacy `requests` tab is dead history. Its rows start with a blank
+cell, which made `values.append` shift every later row one column right,
+so request dedupe and the daily cap never matched anything from launch
+until 2026-09-22. Leave it in place; nothing reads it.
 
 ## Kill switch
 
@@ -203,7 +265,7 @@ that a kill switch be a tested operation:
    -refresh step, before any API call is even attempted.
 3. **Delete the Cloud Run service.**
    ```bash
-   gcloud run services delete data-gatekeeper-agent --project data-gatekeeper-roishik --region europe-west1
+   gcloud run services delete data-gatekeeper --project data-gatekeeper-roishik --region europe-west1
    ```
    Removes the running service entirely; AgentMail's webhook then just
    fails to connect (and should be disabled too, per step 1, so it stops
@@ -216,9 +278,8 @@ running service.
 ## Log retention
 
 Not automated in this MVP. `AuditLog`'s two backends (`JSONLAuditLog`,
-`SheetsAuditLog`) are both simple appends with no built-in expiry — see
-the final build report's "known gaps" for what a real retention job
-would need to do (the hash chain makes deleting an OLD entry in the
-middle detectable-as-tampering by design, so a retention job can only
-safely truncate from the START of the chain and record where it cut,
-not delete arbitrary rows).
+`SheetsAuditLog`) are both simple appends with no built-in expiry. A real
+retention job would have to respect the hash chain: deleting an entry in
+the middle is detectable as tampering by design, so a retention job can
+only truncate from the START of the chain and record where it cut, never
+delete arbitrary rows.

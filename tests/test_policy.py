@@ -88,9 +88,7 @@ def test_gmail_search_newer_than_days_in_bounds_allowed(days):
         "find the verification code",
         "password reset email",
         "any 2fa codes",
-        "security alert from bank",
-        "my credit card statement",
-        "CREDIT CARD",  # case-insensitive
+        "latest LOGIN CODE",  # case-insensitive
     ],
 )
 def test_sensitive_queries_refused(query):
@@ -99,8 +97,16 @@ def test_sensitive_queries_refused(query):
     assert decision.error_code == "sensitive_query_refused"
 
 
-def test_non_sensitive_query_allowed():
-    decision = evaluate_policy("gmail.search", {"query": "dinner reservation confirmation"})
+@pytest.mark.parametrize("query", [
+    "dinner reservation confirmation",
+    # Narrowed 2026-09-22: financial searches are the owner's own business;
+    # only the secrets inside results (card numbers, codes) are redacted.
+    "my credit card statement",
+    "security alert from bank",
+    "wire transfer confirmation",
+])
+def test_non_sensitive_query_allowed(query):
+    decision = evaluate_policy("gmail.search", {"query": query})
     assert decision.status == "allowed"
 
 
@@ -183,14 +189,14 @@ def test_calendar_params_has_no_recipient_or_date_string_field():
     assert field_names == {"day_offset", "days", "max_results"}
 
 
-def test_calendar_extra_params_keys_are_ignored_not_propagated():
+def test_calendar_extra_params_are_never_read_only_listed():
     decision = evaluate_policy(
         "calendar.list_events",
         {"day_offset": 1, "to": "attacker@evil.com", "verb": "calendar.delete_event"},
     )
-    assert decision.status == "allowed"
-    assert not hasattr(decision.params, "to")
-    assert not hasattr(decision.params, "verb")
+    assert decision.status == "allowed"  # the Jev gate decides the rest (apply_extra_params_gate)
+    assert decision.ignored_params == ("to", "verb")
+    assert not hasattr(decision.params, "to") and not hasattr(decision.params, "verb")
 
 
 def test_unknown_verb_is_unsupported():
@@ -215,17 +221,18 @@ def test_gmail_search_params_has_no_recipient_style_field():
     assert field_names == {"query", "max_results", "newer_than_days"}
 
 
-def test_extra_params_keys_are_ignored_not_propagated():
-    """An injected extra key (e.g. 'to', mirroring the brief's own
-    example threat) is simply never read -- deny-by-default via
-    allowlisted field extraction, not by pattern-matching the key name."""
+def test_extra_params_keys_are_never_read_and_are_listed_as_ignored():
+    """An injected extra key (e.g. 'to', mirroring the brief's own example
+    threat) never reaches the params object; it's recorded so the reply can
+    say it was ignored, and apply_extra_params_gate decides whether the
+    request may run at all."""
     decision = evaluate_policy(
         "gmail.search",
         {"query": "invoice", "to": "attacker@evil.com", "verb": "gmail.send"},
     )
     assert decision.status == "allowed"
+    assert decision.ignored_params == ("to", "verb")
     assert not hasattr(decision.params, "to")
-    assert not hasattr(decision.params, "verb")
 
 
 # ── gmail.create_draft ──────────────────────────────────────────────────
@@ -261,7 +268,11 @@ def test_gmail_create_draft_subject_too_long_denied():
 
 
 def test_gmail_create_draft_body_too_long_denied():
-    decision = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "hi", "body": "x" * 5001})
+    from app.policy import DRAFT_BODY_MAX_CHARS
+
+    at_cap = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "hi", "body": "x" * DRAFT_BODY_MAX_CHARS})
+    assert at_cap.status == "allowed"
+    decision = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "hi", "body": "x" * (DRAFT_BODY_MAX_CHARS + 1)})
     assert decision.status == "denied"
 
 
@@ -402,6 +413,38 @@ def test_calendar_create_event_no_attendee_allowlist_by_design():
     assert decision.status == "allowed"
 
 
+def test_calendar_create_event_location_is_optional_and_defaults_to_empty():
+    decision = evaluate_policy(
+        "calendar.create_event", {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30}
+    )
+    assert decision.status == "allowed" and decision.params.location == ""
+
+
+def test_calendar_create_event_location_is_accepted():
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30, "location": "Room 4B"},
+    )
+    assert decision.status == "allowed" and decision.params.location == "Room 4B"
+
+
+@pytest.mark.parametrize("location", ["a" * 501, "line one\nline two", "tab\there", 123, ["not", "a", "string"]])
+def test_calendar_create_event_invalid_location_denied(location):
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30, "location": location},
+    )
+    assert decision.status == "denied" and decision.error_code == "invalid_params"
+
+
+def test_calendar_create_event_location_at_the_char_limit_is_allowed():
+    decision = evaluate_policy(
+        "calendar.create_event",
+        {"title": "x", "day_offset": 0, "start_time": "10:00", "duration_minutes": 30, "location": "a" * 500},
+    )
+    assert decision.status == "allowed"
+
+
 # ── calendar.update_event ───────────────────────────────────────────────
 
 
@@ -428,11 +471,60 @@ def test_calendar_update_event_invalid_field_value_denied():
     assert decision.status == "denied"
 
 
-def test_calendar_update_event_can_update_attendees_only():
-    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "attendees": ["new@example.com"]})
+def test_calendar_update_event_can_add_or_remove_attendees_only():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "add_attendees": ["new@example.com"]})
     assert decision.status == "allowed"
-    assert decision.params.attendees == ("new@example.com",)
+    assert decision.params.add_attendees == ("new@example.com",)
+    assert decision.params.remove_attendees == ()
     assert decision.params.title is None
+    removal = evaluate_policy("calendar.update_event", {"event_id": "ev1", "remove_attendees": ["old@example.com"]})
+    assert removal.status == "allowed" and removal.params.remove_attendees == ("old@example.com",)
+
+
+def test_calendar_update_event_has_no_replace_the_whole_guest_list_field():
+    """`attendees` used to REPLACE the guest list, so "add Dana" silently
+    uninvited everyone else. It's gone; the denial says what to use."""
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "attendees": ["new@example.com"]})
+    assert (decision.status, decision.error_code) == ("denied", "invalid_params")
+    assert "add_attendees" in decision.reason
+
+
+def test_calendar_update_event_rejects_an_address_in_both_lists():
+    decision = evaluate_policy(
+        "calendar.update_event",
+        {"event_id": "ev1", "add_attendees": ["A@example.com"], "remove_attendees": ["a@example.com"]},
+    )
+    assert decision.status == "denied"
+
+
+def test_calendar_update_event_empty_guest_lists_are_not_a_change():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "add_attendees": [], "remove_attendees": []})
+    assert decision.status == "denied"
+
+
+def test_calendar_update_event_add_attendees_bounded_and_validated():
+    too_many = evaluate_policy("calendar.update_event", {"event_id": "ev1", "add_attendees": [f"u{i}@example.com" for i in range(11)]})
+    assert too_many.status == "denied" and "add_attendees" in too_many.reason
+    bad = evaluate_policy("calendar.update_event", {"event_id": "ev1", "remove_attendees": ["not-an-email"]})
+    assert bad.status == "denied" and "remove_attendees" in bad.reason
+
+
+def test_calendar_update_event_location_omitted_is_untouched_not_cleared():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "title": "New title"})
+    assert decision.status == "allowed" and decision.params.location is None
+
+
+def test_calendar_update_event_location_can_be_set_or_cleared():
+    set_it = evaluate_policy("calendar.update_event", {"event_id": "ev1", "location": "New room"})
+    assert set_it.status == "allowed" and set_it.params.location == "New room"
+
+    clear_it = evaluate_policy("calendar.update_event", {"event_id": "ev1", "location": ""})
+    assert clear_it.status == "allowed" and clear_it.params.location == ""  # an explicit "" IS a change
+
+
+def test_calendar_update_event_invalid_location_denied():
+    decision = evaluate_policy("calendar.update_event", {"event_id": "ev1", "location": "line one\nline two"})
+    assert decision.status == "denied" and decision.error_code == "invalid_params"
 
 
 # ── calendar.delete_event ───────────────────────────────────────────────
@@ -474,7 +566,10 @@ def test_drive_create_file_name_too_long_denied():
 
 
 def test_drive_create_file_content_too_long_denied():
-    decision = evaluate_policy("drive.create_file", {"name": "x", "content": "y" * 20001})
+    from app.policy import DRIVE_CONTENT_MAX_CHARS
+
+    assert evaluate_policy("drive.create_file", {"name": "x", "content": "y" * DRIVE_CONTENT_MAX_CHARS}).status == "allowed"
+    decision = evaluate_policy("drive.create_file", {"name": "x", "content": "y" * (DRIVE_CONTENT_MAX_CHARS + 1)})
     assert decision.status == "denied"
 
 
@@ -483,6 +578,37 @@ def test_drive_create_file_empty_content_is_allowed():
     only a missing/non-string 'content' key is denied."""
     decision = evaluate_policy("drive.create_file", {"name": "empty.txt", "content": ""})
     assert decision.status == "allowed"
+
+
+# ── capabilities ──────────────────────────────────────────────────────────
+
+
+def test_capabilities_is_always_allowed():
+    from app.policy import CapabilitiesParams
+
+    decision = evaluate_policy("capabilities", {})
+    assert decision.status == "allowed"
+    assert decision.params == CapabilitiesParams()
+
+
+def test_capabilities_is_implemented_but_not_a_write_verb():
+    from app.policy import IMPLEMENTED_VERBS, WRITE_VERBS
+
+    assert Verb.CAPABILITIES in IMPLEMENTED_VERBS
+    assert Verb.CAPABILITIES not in WRITE_VERBS
+
+
+def test_verb_specs_cover_every_implemented_verb_exactly():
+    """IMPLEMENTED_VERBS/VERB_PARAMS/WRITE_VERBS are all derived from
+    VERB_SPECS -- this pins that the registry itself hasn't silently
+    dropped or duplicated an entry."""
+    from app.policy import VERB_SPECS
+
+    assert set(VERB_SPECS.keys()) == {
+        Verb.GMAIL_SEARCH, Verb.GMAIL_CREATE_DRAFT, Verb.CALENDAR_LIST_EVENTS,
+        Verb.CALENDAR_CREATE_EVENT, Verb.CALENDAR_UPDATE_EVENT, Verb.CALENDAR_DELETE_EVENT,
+        Verb.DRIVE_CREATE_FILE, Verb.CAPABILITIES,
+    }
 
 
 # ── write verbs are implemented, not just recognized ────────────────────
@@ -505,3 +631,87 @@ def test_write_verbs_are_recognized_as_implemented(verb):
     from app.policy import IMPLEMENTED_VERBS, Verb
 
     assert Verb(verb) in IMPLEMENTED_VERBS
+
+
+def test_every_implemented_verb_ignores_unknown_parameters():
+    valid = {
+        "gmail.search": {"query": "invoice"},
+        "gmail.create_draft": {"to": "a@example.com", "subject": "Hi", "body": "Hello"},
+        "calendar.list_events": {},
+        "calendar.create_event": {"title": "Meet", "day_offset": 1, "start_time": "10:00", "duration_minutes": 30},
+        "calendar.update_event": {"event_id": "e1", "title": "Moved"},
+        "calendar.delete_event": {"event_id": "e1"},
+        "drive.create_file": {"name": "notes.txt", "content": "hello"},
+        "capabilities": {},
+    }
+    for verb, params in valid.items():
+        assert evaluate_policy(verb, params).status == "allowed", verb
+        decision = evaluate_policy(verb, {**params, "unexpected": "injected"})
+        assert decision.status == "allowed", verb
+        assert decision.ignored_params == ("unexpected",), verb
+        assert evaluate_policy(verb, params).ignored_params == (), verb
+
+
+def test_extras_on_a_denied_request_change_nothing():
+    decision = evaluate_policy("gmail.search", {"query": "", "timezone": "UTC"})
+    assert decision.status == "denied" and decision.ignored_params == ()
+
+
+def test_extra_params_gate_follows_the_injection_screen():
+    from app.policy import apply_extra_params_gate
+
+    with_extras = evaluate_policy("gmail.search", {"query": "invoice", "timezone": "UTC"})
+    assert apply_extra_params_gate(with_extras, 0.02, 0.85) is with_extras  # passed Jev: runs, extras ignored
+    for score in (0.85, 0.97, None):  # flagged, or no signal at all
+        gated = apply_extra_params_gate(with_extras, score, 0.85)
+        assert (gated.status, gated.error_code) == ("denied", "invalid_params"), score
+        assert "timezone" in gated.reason
+    clean = evaluate_policy("gmail.search", {"query": "invoice"})
+    assert apply_extra_params_gate(clean, None, 0.85) is clean  # no extras: the gate never applies
+
+
+def test_ignored_param_names_are_bounded():
+    params = {"query": "invoice", **{f"k{i:02d}" + "x" * 100: 1 for i in range(30)}}
+    decision = evaluate_policy("gmail.search", params)
+    assert len(decision.ignored_params) == 20
+    assert all(len(name) <= 64 for name in decision.ignored_params)
+
+
+@pytest.mark.parametrize(
+    "verb, params",
+    [
+        ("gmail.search", {"query": "invoice\nfrom:boss"}),
+        ("gmail.create_draft", {"to": "a@example.com", "subject": "Hello\nBcc: attacker@evil.com", "body": "x"}),
+        ("gmail.create_draft", {"to": "a@example.com\r\nBcc: x@evil.com", "subject": "Hi", "body": "x"}),
+        ("gmail.create_draft", {"to": "a@example.com", "subject": "Hi", "body": "null byte\x00here"}),
+        ("calendar.create_event", {"title": "Meet\u2028ing", "day_offset": 1, "start_time": "10:00", "duration_minutes": 30}),
+        ("calendar.create_event", {"title": "Meet", "day_offset": 1, "start_time": "10:00", "duration_minutes": 30,
+                                   "attendees": ["a@example.com\n"]}),
+        ("drive.create_file", {"name": "notes\n.txt", "content": "x"}),
+        ("drive.create_file", {"name": "notes.txt", "content": "bell\x07"}),
+    ],
+)
+def test_control_characters_are_denied(verb, params):
+    """A newline in a draft subject used to crash Python's email library
+    mid-request (HeaderParseError); control characters never get that far now."""
+    decision = evaluate_policy(verb, params)
+    assert decision.status == "denied" and decision.error_code == "invalid_params"
+
+
+def test_multi_line_fields_still_allow_newlines_and_tabs():
+    draft = evaluate_policy("gmail.create_draft", {"to": "a@example.com", "subject": "Hi", "body": "line 1\n\tline 2\r\n"})
+    assert draft.status == "allowed"
+    drive = evaluate_policy("drive.create_file", {"name": "notes.txt", "content": "a\n\tb"})
+    assert drive.status == "allowed"
+
+
+@pytest.mark.parametrize("event_id, ok", [
+    ("abc123def456", True),
+    ("abc123_20260922T100000Z", True),  # a recurring event's instance id
+    ("abc/../other", False),
+    ("abc 123", False),
+    ("abc123?sendUpdates=none", False),
+])
+def test_event_id_must_look_like_a_google_event_id(event_id, ok):
+    decision = evaluate_policy("calendar.delete_event", {"event_id": event_id})
+    assert (decision.status == "allowed") is ok

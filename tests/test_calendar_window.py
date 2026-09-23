@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.calendar_window import format_event_range, format_event_time, resolve_event_datetime, resolve_window
+from app.calendar_window import format_event_range, format_event_time, format_window_range, resolve_event_datetime, resolve_window
 
 
 def test_today_window_is_local_midnight_to_midnight():
@@ -28,6 +28,21 @@ def test_multi_day_window_spans_days():
     window = resolve_window(day_offset=0, days=7, timezone_name="Asia/Jerusalem", now=now)
     assert window.time_min.startswith("2026-09-14T00:00:00")
     assert window.time_max.startswith("2026-09-21T00:00:00")
+
+
+def test_format_window_range_single_day():
+    now = datetime(2026, 9, 14, 9, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
+    window = resolve_window(day_offset=1, days=1, timezone_name="Asia/Jerusalem", now=now)
+    assert format_window_range(window.time_min, window.time_max, "Asia/Jerusalem") == "Tue Sep 15"
+
+
+def test_format_window_range_multi_day_span():
+    now = datetime(2026, 9, 14, 9, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
+    window = resolve_window(day_offset=0, days=7, timezone_name="Asia/Jerusalem", now=now)
+    # time_max is exclusive (local midnight the day AFTER the last day
+    # included), so the last included day is one before it, not seven
+    # full days after the start.
+    assert format_window_range(window.time_min, window.time_max, "Asia/Jerusalem") == "Mon Sep 14 - Sun Sep 20"
 
 
 def test_window_carries_a_mandatory_utc_offset():

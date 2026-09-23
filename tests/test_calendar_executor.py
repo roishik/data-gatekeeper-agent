@@ -177,6 +177,15 @@ def test_timed_event_outside_the_window_is_dropped():
 
 
 # ── create_event / update_event / delete_event ──────────────────────────
+# Containment (2026-09-22): update/delete fetch the event first and refuse
+# anything the gatekeeper didn't create (the private `gatekeeper=1` tag).
+
+import pytest
+
+from app.calendar_executor import is_gatekeeper_event, merge_attendees
+from app.failures import GatekeeperDenied
+
+_OWN = {"extendedProperties": {"private": {"gatekeeper": "1", "gatekeeper_request_id": "req_0"}}}
 
 
 class _WriteEvents:
@@ -184,8 +193,9 @@ class _WriteEvents:
     since insert/patch/delete/get have a different shape than list()."""
 
     def __init__(self, get_result: dict | None = None):
-        self.get_result = get_result or {}
+        self.get_result = get_result if get_result is not None else dict(_OWN)
         self.insert_calls: list[dict] = []
+        self.get_calls: list[str] = []
         self.patch_calls: list[dict] = []
         self.delete_calls: list[dict] = []
 
@@ -194,6 +204,7 @@ class _WriteEvents:
         return _Call({**body, "id": "created_1"})
 
     def get(self, calendarId, eventId):
+        self.get_calls.append(eventId)
         return _Call(self.get_result)
 
     def patch(self, calendarId, eventId, body, sendUpdates):
@@ -220,12 +231,24 @@ def _write_client(service):
     return client
 
 
-def test_create_event_inserts_on_primary_calendar_with_send_updates_all():
+def _no_guard(title: str, location: str) -> None:
+    return None
+
+
+def _update(client, **overrides):
+    kwargs = dict(event_id="ev1", title=None, day_offset=None, start_time=None, duration_minutes=None,
+                  add_attendees=(), remove_attendees=(), invite_guard=_no_guard)
+    kwargs.update(overrides)
+    return client.update_event(**kwargs)
+
+
+def test_create_event_inserts_on_primary_calendar_with_send_updates_all_and_the_gatekeeper_tag():
     events = _WriteEvents()
     client = _write_client(_WriteService(events))
 
     result = client.create_event(
-        title="Coffee", day_offset=1, start_time="14:00", duration_minutes=30, attendees=("a@example.com",)
+        title="Coffee", day_offset=1, start_time="14:00", duration_minutes=30, attendees=("a@example.com",),
+        request_id="req_coffee",
     )
 
     assert len(events.insert_calls) == 1
@@ -234,6 +257,8 @@ def test_create_event_inserts_on_primary_calendar_with_send_updates_all():
     assert call["sendUpdates"] == "all"
     assert call["body"]["summary"] == "Coffee"
     assert call["body"]["attendees"] == [{"email": "a@example.com"}]
+    assert call["body"]["extendedProperties"] == {"private": {"gatekeeper": "1", "gatekeeper_request_id": "req_coffee"}}
+    assert is_gatekeeper_event(call["body"])
     assert result.event_id == "created_1"
     assert result.summary == "Coffee"
     assert result.attendee_count == 1
@@ -242,39 +267,54 @@ def test_create_event_inserts_on_primary_calendar_with_send_updates_all():
 def test_create_event_with_no_attendees_sends_empty_list():
     events = _WriteEvents()
     client = _write_client(_WriteService(events))
-    client.create_event(title="Focus", day_offset=0, start_time="09:00", duration_minutes=60, attendees=())
+    client.create_event(title="Focus", day_offset=0, start_time="09:00", duration_minutes=60, attendees=(), request_id="r")
     assert events.insert_calls[0]["body"]["attendees"] == []
 
 
-def test_update_event_title_only_does_not_fetch_existing_or_touch_time():
+def test_create_event_sends_the_given_location():
+    events = _WriteEvents()
+    client = _write_client(_WriteService(events))
+    result = client.create_event(
+        title="Coffee", day_offset=1, start_time="14:00", duration_minutes=30, attendees=(),
+        request_id="req_loc", location="Room 4B",
+    )
+    assert events.insert_calls[0]["body"]["location"] == "Room 4B"
+    assert result.location == "Room 4B"
+
+
+def test_create_event_without_a_location_sends_an_empty_string():
+    events = _WriteEvents()
+    client = _write_client(_WriteService(events))
+    client.create_event(title="Focus", day_offset=0, start_time="09:00", duration_minutes=60, attendees=(), request_id="r")
+    assert events.insert_calls[0]["body"]["location"] == ""
+
+
+def test_update_event_title_only_patches_only_the_title():
     events = _WriteEvents()
     client = _write_client(_WriteService(events))
 
-    result = client.update_event(
-        event_id="ev1", title="New title", day_offset=None, start_time=None, duration_minutes=None, attendees=None
-    )
+    result = _update(client, title="New title")
 
+    assert events.get_calls == ["ev1"]  # always fetched now: the containment check
     assert len(events.patch_calls) == 1
     call = events.patch_calls[0]
     assert call["eventId"] == "ev1"
     assert call["body"] == {"summary": "New title"}
-    assert "start" not in call["body"]
     assert result.summary == "New title"
 
 
-def test_update_event_time_change_fetches_existing_event_to_fill_gaps():
+def test_update_event_time_change_preserves_the_existing_day_and_duration():
     """Changing only start_time must preserve the event's existing day and
-    duration, not silently reset them -- app/calendar_executor.py's
-    _resolve_updated_timing fetches the current event for exactly this."""
+    duration, not silently reset them -- _resolve_updated_timing uses the
+    event fetched for the containment check."""
     events = _WriteEvents(get_result={
+        **_OWN,
         "start": {"dateTime": "2026-09-20T10:00:00+03:00"},
         "end": {"dateTime": "2026-09-20T10:30:00+03:00"},
     })
     client = _write_client(_WriteService(events))
 
-    client.update_event(
-        event_id="ev1", title=None, day_offset=None, start_time="14:00", duration_minutes=None, attendees=None
-    )
+    _update(client, start_time="14:00")
 
     body = events.patch_calls[0]["body"]
     assert body["start"]["dateTime"].startswith("2026-09-20T14:00:00")
@@ -282,25 +322,162 @@ def test_update_event_time_change_fetches_existing_event_to_fill_gaps():
     assert body["end"]["dateTime"].startswith("2026-09-20T14:30:00")
 
 
-def test_update_event_attendees_replaces_full_list():
+def test_update_event_adds_and_removes_guests_without_touching_the_others():
+    existing = [
+        {"email": "Keep@example.com", "responseStatus": "accepted"},
+        {"email": "drop@example.com", "responseStatus": "tentative"},
+    ]
+    events = _WriteEvents(get_result={**_OWN, "summary": "Planning", "attendees": existing})
+    client = _write_client(_WriteService(events))
+
+    _update(client, add_attendees=("new@example.com", "keep@example.com"), remove_attendees=("DROP@example.com",))
+
+    assert events.patch_calls[0]["body"]["attendees"] == [
+        {"email": "Keep@example.com", "responseStatus": "accepted"},  # untouched, response kept
+        {"email": "new@example.com"},
+    ]
+
+
+def test_adding_guests_runs_the_invite_guard_on_the_title_and_location_they_will_see():
+    seen: list[tuple[str, str]] = []
+    events = _WriteEvents(get_result={**_OWN, "summary": "Existing title", "location": "Existing room"})
+    client = _write_client(_WriteService(events))
+
+    _update(client, add_attendees=("a@example.com",), invite_guard=lambda t, l: seen.append((t, l)))
+    _update(client, title="Renamed", add_attendees=("b@example.com",), invite_guard=lambda t, l: seen.append((t, l)))
+    _update(client, location="New room", add_attendees=("c@example.com",), invite_guard=lambda t, l: seen.append((t, l)))
+    _update(client, remove_attendees=("a@example.com",), invite_guard=lambda t, l: seen.append((t, l)))  # no new guest, no guard
+
+    assert seen == [
+        ("Existing title", "Existing room"),  # unchanged title/location, still screened before the invite
+        ("Renamed", "Existing room"),
+        ("Existing title", "New room"),
+    ]
+
+
+def test_update_event_title_only_on_event_with_existing_attendees_runs_the_invite_guard():
+    """The gap this closes: sendUpdates="all" notifies EXISTING attendees
+    of a title/location change even when no new guest is being added, so
+    the invite guard must run whenever the resulting attendee list is
+    non-empty and title/location is changing -- not only on add_attendees."""
+    seen: list[tuple[str, str]] = []
+    events = _WriteEvents(get_result={
+        **_OWN, "summary": "Existing title", "location": "Existing room",
+        "attendees": [{"email": "guest@example.com", "responseStatus": "accepted"}],
+    })
+    client = _write_client(_WriteService(events))
+
+    _update(client, title="New title", invite_guard=lambda t, l: seen.append((t, l)))
+
+    assert seen == [("New title", "Existing room")]
+
+
+def test_update_event_location_only_on_event_with_existing_attendees_runs_the_invite_guard():
+    seen: list[tuple[str, str]] = []
+    events = _WriteEvents(get_result={
+        **_OWN, "summary": "Existing title",
+        "attendees": [{"email": "guest@example.com"}],
+    })
+    client = _write_client(_WriteService(events))
+
+    _update(client, location="New room", invite_guard=lambda t, l: seen.append((t, l)))
+
+    assert seen == [("Existing title", "New room")]
+
+
+def test_update_event_time_only_change_on_event_with_attendees_does_not_run_the_guard():
+    """A pure time change doesn't alter title/location, so nothing new
+    reaches attendees that wasn't already screened."""
+    seen: list[tuple[str, str]] = []
+    events = _WriteEvents(get_result={
+        **_OWN, "summary": "Existing title",
+        "start": {"dateTime": "2026-09-20T10:00:00+03:00"}, "end": {"dateTime": "2026-09-20T10:30:00+03:00"},
+        "attendees": [{"email": "guest@example.com"}],
+    })
+    client = _write_client(_WriteService(events))
+
+    _update(client, start_time="14:00", invite_guard=lambda t, l: seen.append((t, l)))
+
+    assert seen == []
+
+
+def test_update_event_title_change_without_attendees_does_not_run_the_guard():
+    seen: list[tuple[str, str]] = []
+    events = _WriteEvents(get_result=dict(_OWN))  # no attendees key at all
+    client = _write_client(_WriteService(events))
+
+    _update(client, title="New title", invite_guard=lambda t, l: seen.append((t, l)))
+
+    assert seen == []
+
+
+def test_update_event_refuses_when_merged_attendees_would_exceed_the_cap():
+    existing = [{"email": f"guest{i}@example.com"} for i in range(9)]
+    events = _WriteEvents(get_result={**_OWN, "attendees": existing})
+    client = _write_client(_WriteService(events))
+
+    with pytest.raises(GatekeeperDenied) as denied:
+        _update(client, add_attendees=("new1@example.com", "new2@example.com"))
+    assert denied.value.error_code == "too_many_attendees"
+    assert events.patch_calls == []
+
+
+def test_a_refused_invite_guard_stops_the_patch():
+    def refuse(title: str, location: str) -> None:
+        raise GatekeeperDenied("sensitive_content_refused")
+
     events = _WriteEvents()
     client = _write_client(_WriteService(events))
-    client.update_event(
-        event_id="ev1", title=None, day_offset=None, start_time=None, duration_minutes=None,
-        attendees=("new@example.com",),
-    )
-    assert events.patch_calls[0]["body"]["attendees"] == [{"email": "new@example.com"}]
+    with pytest.raises(GatekeeperDenied):
+        _update(client, add_attendees=("a@example.com",), invite_guard=refuse)
+    assert events.patch_calls == []
+
+
+def test_update_event_location_none_leaves_it_untouched_empty_string_clears_it():
+    events = _WriteEvents(get_result={**_OWN, "location": "Old room"})
+    client = _write_client(_WriteService(events))
+
+    _update(client, title="Retitle")  # location omitted (None) -> not in the patch body
+    assert "location" not in events.patch_calls[0]["body"]
+
+    _update(client, location="")  # explicit empty string -> clears it
+    assert events.patch_calls[1]["body"]["location"] == ""
+
+    _update(client, location="New room")
+    assert events.patch_calls[2]["body"]["location"] == "New room"
 
 
 def test_update_event_uses_send_updates_all():
     events = _WriteEvents()
     client = _write_client(_WriteService(events))
-    client.update_event(event_id="ev1", title="x", day_offset=None, start_time=None, duration_minutes=None, attendees=None)
+    _update(client, title="x")
     assert events.patch_calls[0]["sendUpdates"] == "all"
 
 
-def test_delete_event_calls_delete_with_send_updates_all():
+def test_delete_event_checks_ownership_then_deletes_with_send_updates_all():
     events = _WriteEvents()
     client = _write_client(_WriteService(events))
     client.delete_event(event_id="ev1")
+    assert events.get_calls == ["ev1"]
     assert events.delete_calls == [{"calendarId": "primary", "eventId": "ev1", "sendUpdates": "all"}]
+
+
+@pytest.mark.parametrize("foreign", [
+    {},  # a normal event created in the Calendar UI
+    {"extendedProperties": {"private": {"gatekeeper": "0"}}},
+    {"extendedProperties": {"shared": {"gatekeeper": "1"}}},  # only the PRIVATE property counts
+])
+def test_update_and_delete_refuse_events_the_gatekeeper_did_not_create(foreign):
+    events = _WriteEvents(get_result=foreign)
+    client = _write_client(_WriteService(events))
+    with pytest.raises(GatekeeperDenied) as denied:
+        _update(client, title="hijack")
+    assert denied.value.error_code == "not_gatekeeper_event"
+    with pytest.raises(GatekeeperDenied):
+        client.delete_event(event_id="ev1")
+    assert events.patch_calls == [] and events.delete_calls == []
+
+
+def test_merge_attendees_is_case_insensitive_and_never_duplicates():
+    merged = merge_attendees([{"email": "A@x.com"}], add=("a@x.com", "b@x.com", "B@x.com"), remove=())
+    assert merged == [{"email": "A@x.com"}, {"email": "b@x.com"}]

@@ -17,9 +17,11 @@ files/folders this app itself creates, never the owner's existing Drive
 content -- this executor can create files, but structurally cannot read
 or touch anything it didn't create itself.
 
-NOT exercised against a live Drive API call -- the files.create request
-shape below comes from Google's published REST reference. See the final
-build report's "could not verify" section.
+As of 2026-09-22 no drive.create_file has run in prod yet -- the files.create
+request shape below comes from Google's published REST reference, and the
+live suite (tests/test_e2e_live.py) is what exercises it for real. The first
+live call creates the folder and logs its id; see docs/RUNBOOK.md for pinning
+GOOGLE_DRIVE_FOLDER_ID afterwards.
 """
 from __future__ import annotations
 
@@ -28,7 +30,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from app.config import GOOGLE_DRIVE_FOLDER_ID
-from app.google_auth_helper import build_google_credentials
+from app.google_auth_helper import build_google_service
 
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
@@ -53,10 +55,7 @@ class GoogleDriveClient:
         self._folder_id = folder_id or GOOGLE_DRIVE_FOLDER_ID
 
     def _service(self):
-        from googleapiclient.discovery import build  # lazy: keep this module importable without the package
-
-        creds = build_google_credentials(scopes=[DRIVE_FILE_SCOPE])
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
+        return build_google_service("drive", "v3", scopes=[DRIVE_FILE_SCOPE])
 
     def _resolve_folder_id(self, service) -> str:
         if self._folder_id:
