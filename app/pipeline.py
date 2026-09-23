@@ -45,7 +45,7 @@ from typing import Any, Callable
 from app.agentmail_client import AgentMailClient
 from app.audit_log import AuditLog, AuditRecord
 from app.calendar_executor import CalendarClient, CalendarEvent
-from app.calendar_window import resolve_window
+from app.calendar_window import format_window_range, resolve_window
 from app.config import AGENTMAIL_INBOX_ID, INJECTION_DENY_THRESHOLD, MAX_REQUESTS_PER_DAY, OUTPUT_SCREEN_FAIL_MODE, OWNER_TIMEZONE
 from app.drive_executor import DriveClient, DriveFileResult
 from app.failures import GatekeeperDenied, classify_failure
@@ -107,6 +107,7 @@ class ExecutionResults:
 
     gmail_results: list[GmailResult] | None = None
     calendar_results: list[CalendarEvent] | None = None
+    calendar_window_label: str | None = None  # calendar.list_events' resolved date range, for the reply prose
     draft_result: DraftResult | None = None
     created_event: CalendarEvent | None = None
     updated_event: CalendarEvent | None = None
@@ -121,6 +122,7 @@ class ExecutionResults:
         return {
             "gmail_results": self.gmail_results,
             "calendar_results": self.calendar_results,
+            "calendar_window_label": self.calendar_window_label,
             "draft_result": self.draft_result,
             "created_event": self.created_event,
             "updated_event": self.updated_event,
@@ -492,6 +494,7 @@ def _execute(
         results.calendar_results = calendar_client_factory().list_events(
             time_min=window.time_min, time_max=window.time_max, max_results=params.max_results,
         )
+        results.calendar_window_label = format_window_range(window.time_min, window.time_max, OWNER_TIMEZONE)
     elif isinstance(params, CalendarCreateEventParams):
         if params.attendees:
             invite_guard(params.title, params.location)

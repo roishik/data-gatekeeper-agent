@@ -98,6 +98,24 @@ def format_event_time(iso_value: str, all_day: bool, timezone_name: str) -> str:
     return dt.strftime("%a %b %d, %H:%M")
 
 
+def format_window_range(time_min: str, time_max: str, timezone_name: str) -> str:
+    """Renders the day_offset/days window resolve_window resolved into a
+    short human-readable date (or date range), e.g. "Tue Sep 23" for a
+    single day or "Tue Sep 23 - Thu Sep 25" for a span -- so a
+    calendar.list_events reply states which dates it actually searched
+    (an email sent near local midnight can otherwise land on a different
+    day than the sender expected day_offset to mean; this makes the
+    resolved window checkable, the same way create_event's reply already
+    echoes its resolved time). `time_max` is exclusive (local midnight
+    the day AFTER the last day included), matching resolve_window."""
+    tz = ZoneInfo(timezone_name)
+    start_date = datetime.fromisoformat(time_min).astimezone(tz).date()
+    last_included = (datetime.fromisoformat(time_max).astimezone(tz) - timedelta(days=1)).date()
+    if start_date == last_included:
+        return start_date.strftime("%a %b %d")
+    return f"{start_date.strftime('%a %b %d')} - {last_included.strftime('%a %b %d')}"
+
+
 def format_event_range(start: str, end: str, all_day: bool, timezone_name: str) -> str:
     """Renders a start/end pair for the reply -- the single-value
     `format_event_time` above only ever showed the start, which left a

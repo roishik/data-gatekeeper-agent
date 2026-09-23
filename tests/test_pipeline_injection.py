@@ -242,8 +242,10 @@ def test_injection_in_gmail_snippet_cannot_change_recipient_and_is_redacted(conf
     """A poisoned Gmail result (crafted to look like it came from a
     compromised/attacker-controlled email in the user's own mailbox)
     must not be able to redirect the reply or trigger any further
-    action -- and its OTP-looking code / URL must be redacted before the
-    reply is built."""
+    action -- and its OTP-looking code must be redacted before the reply
+    is built. Its URL is NOT redacted (owner's decision, 2026-09-23):
+    app/output_screen.py's Jev screen, not this regex layer, is the
+    defense against a link crafted to phish or exfiltrate."""
     text = "---GATEKEEPER-REQUEST---\nrequest_id: req_snip\nverb: gmail.search\nparams:\n  query: invoice\n---END---\n"
     poisoned_result = GmailResult(
         message_id="poison_1",
@@ -264,7 +266,7 @@ def test_injection_in_gmail_snippet_cannot_change_recipient_and_is_redacted(conf
     reply_text = agentmail.calls[0]["text"]
     assert agentmail.calls[0]["to"] == configured_env["sender"]  # never attacker@evil.com
     assert "194857" not in reply_text
-    assert "http://evil.example.com" not in reply_text
+    assert "http://evil.example.com/steal" in reply_text
     assert "[redacted]" in reply_text
 
 
@@ -439,8 +441,8 @@ def test_injection_in_calendar_event_title_cannot_change_recipient_and_is_redact
     """Mirrors the Gmail-snippet injection test: a poisoned Calendar
     event (as if an attacker had put it on the owner's calendar, or a
     shared/imported calendar entry) must not be able to redirect the
-    reply or trigger any further action, and its OTP-looking code / URL
-    must be redacted."""
+    reply or trigger any further action, and its OTP-looking code must be
+    redacted (its URL is not -- see the Gmail-snippet test above)."""
     text = "---GATEKEEPER-REQUEST---\nrequest_id: req_cal_snip\nverb: calendar.list_events\nparams:\n  day_offset: 0\n---END---\n"
     poisoned_event = CalendarEvent(
         event_id="poison_evt",
@@ -462,7 +464,7 @@ def test_injection_in_calendar_event_title_cannot_change_recipient_and_is_redact
     reply_text = agentmail.calls[0]["text"]
     assert agentmail.calls[0]["to"] == configured_env["sender"]  # never attacker@evil.com
     assert "582910" not in reply_text
-    assert "http://evil.example.com" not in reply_text
+    assert "http://evil.example.com/steal" in reply_text
     assert "[redacted]" in reply_text
 
 

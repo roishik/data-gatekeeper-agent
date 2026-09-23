@@ -12,8 +12,13 @@ from app.reply_guard import redact, render_reply, send_reply
 from tests.fakes import FakeAgentMailClient
 
 
-def test_redact_url():
-    assert redact("click http://evil.example.com/x now") == "click [redacted] now"
+def test_urls_are_not_redacted():
+    """Owner's decision, 2026-09-23: URLs used to be stripped (see the
+    module docstring's earlier history); the owner wants Instinct able to
+    see and review links (e.g. a Drive link someone shared), so this is
+    no longer a regex-layer concern -- app/output_screen.py's Jev screen
+    is the defense against a link crafted to phish or exfiltrate."""
+    assert redact("click http://evil.example.com/x now") == "click http://evil.example.com/x now"
 
 
 def test_redact_otp_like_code():
@@ -80,12 +85,31 @@ def test_render_reply_completed_redacts_gmail_results():
     body = render_reply(parsed, "completed", None, gmail_results=results)
 
     assert "999111" not in body
-    assert "http://evil.com" not in body
+    assert "http://evil.com/steal" in body  # no longer stripped, see test_urls_are_not_redacted
     assert "[redacted]" in body
     assert "request_id: req_1" in body
     assert "status: completed" in body
     assert "result_count: 1" in body
     assert "m1" not in body  # message ids are not exposed in the reply body
+
+
+def test_render_reply_redacts_an_otp_code_split_across_subject_and_snippet():
+    """The context word and the bare digits can land in different fields
+    of the same result (a Gmail subject vs. its snippet, or an event
+    title vs. its location) -- checking each field in isolation for the
+    OTP context word would miss this."""
+    parsed = ParsedRequest(request_id="req_split", verb="gmail.search", params={"query": "x"}, source="block")
+    results = [
+        GmailResult(
+            message_id="m1", sender="noreply@example.com",
+            subject="Your Steam Guard verification code",
+            date="Mon, 14 Sep 2026 10:00:00 +0000",
+            snippet="482913 -- do not share with anyone",
+        )
+    ]
+    body = render_reply(parsed, "completed", None, gmail_results=results)
+    assert "482913" not in body
+    assert "[redacted]" in body
 
 
 def test_render_reply_no_results():
@@ -117,6 +141,17 @@ def test_render_reply_size_cap_preserves_status_block():
     assert "---GATEKEEPER-RESPONSE---" in body
     assert "request_id: req_4" in body
     assert "---END---" in body
+    # result_count still reports the full count, but the visible list must
+    # say how many of them actually made it in -- a blind character cut
+    # used to leave "[truncated]" with no way to tell shown from total.
+    assert f"result_count: {result_count}" in body
+    import re as _re
+    shown_match = _re.search(r"\[showing (\d+) of (\d+)\]", body)
+    assert shown_match is not None
+    shown, total = int(shown_match.group(1)), int(shown_match.group(2))
+    assert total == result_count
+    assert 0 < shown < result_count  # actually truncated, not a fluke full fit
+    assert body.count("- s") == shown  # exactly `shown` result lines actually rendered
 
 
 def test_render_reply_calendar_completed_lists_events():
@@ -150,6 +185,27 @@ def test_render_reply_calendar_completed_lists_events():
     assert "event_id: e2" in body
 
 
+def test_render_reply_calendar_list_events_echoes_the_resolved_window():
+    """An email sent near local midnight can have day_offset resolve to a
+    different date than the sender expected; echoing the resolved window
+    (like create_event already echoes its resolved time) makes that
+    checkable instead of silently surprising."""
+    parsed = ParsedRequest(request_id="req_cal_window", verb="calendar.list_events", params={"day_offset": 1}, source="block")
+    body = render_reply(parsed, "completed", None, calendar_results=[], calendar_window_label="Tue Sep 23")
+    assert "No events found for Tue Sep 23." in body
+
+    events = [CalendarEvent(event_id="e1", summary="Sync", start="2026-09-23T09:00:00+03:00",
+                             end="2026-09-23T09:30:00+03:00", all_day=False, attendee_count=0)]
+    body = render_reply(parsed, "completed", None, calendar_results=events, calendar_window_label="Tue Sep 23")
+    assert "Found 1 event(s) for Tue Sep 23:" in body
+
+
+def test_render_reply_calendar_list_events_without_a_window_label_omits_it():
+    parsed = ParsedRequest(request_id="req_cal_nowindow", verb="calendar.list_events", params={}, source="block")
+    body = render_reply(parsed, "completed", None, calendar_results=[])
+    assert "No events found." in body
+
+
 def test_render_reply_calendar_event_without_location_omits_location_line():
     parsed = ParsedRequest(request_id="req_cal_noloc", verb="calendar.list_events", params={}, source="block")
     events = [
@@ -159,7 +215,11 @@ def test_render_reply_calendar_event_without_location_omits_location_line():
     assert "at " not in body.split("---GATEKEEPER-RESPONSE---")[0]
 
 
-def test_render_reply_calendar_redacts_injected_event_location():
+def test_render_reply_calendar_event_location_url_is_not_redacted():
+    """See test_urls_are_not_redacted: URL stripping was removed
+    2026-09-23. A poisoned location's other content (a password, card
+    number, or OTP) would still be redacted -- only the URL itself
+    passes through now."""
     parsed = ParsedRequest(request_id="req_cal_loc_poison", verb="calendar.list_events", params={}, source="block")
     poisoned = CalendarEvent(
         event_id="e_poison_loc",
@@ -171,8 +231,7 @@ def test_render_reply_calendar_redacts_injected_event_location():
         location="Click http://evil.example.com/x to confirm your account",
     )
     body = render_reply(parsed, "completed", None, calendar_results=[poisoned])
-    assert "http://evil.example.com" not in body
-    assert "[redacted]" in body
+    assert "http://evil.example.com/x" in body
 
 
 def test_render_reply_calendar_no_events():
@@ -194,7 +253,7 @@ def test_render_reply_calendar_redacts_injected_event_title():
     )
     body = render_reply(parsed, "completed", None, calendar_results=[poisoned])
     assert "582910" not in body
-    assert "http://evil.example.com" not in body
+    assert "http://evil.example.com/x" in body  # no longer stripped, see test_urls_are_not_redacted
     assert "[redacted]" in body
 
 

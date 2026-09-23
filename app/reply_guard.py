@@ -17,16 +17,20 @@ layer:
   2. Gmail result text (subject, snippet, sender) and Calendar result
      text (event summary, location) are redacted -- deterministically,
      and deliberately narrowly -- for written-out passwords, full payment
-     card numbers (Luhn-checked), one-time codes (digits in code/login/
-     verification context), and URLs BEFORE they can appear in a
-     reply -- the last line of defense against a poisoned Gmail snippet
-     OR a poisoned calendar event title/location trying to phish or
-     exfiltrate via the reply itself, even though Layer 3 already
-     refused any gmail.search *query* that would knowingly search for
-     such content (there is no equivalent query to refuse for
-     calendar.list_events -- an attacker who can create an event on the
-     owner's calendar controls its title and location directly, which is
-     exactly why this redaction pass matters there too).
+     card numbers (Luhn-checked), and one-time codes (digits in code/
+     login/verification context) BEFORE they can appear in a reply -- the
+     last line of defense against a poisoned Gmail snippet OR a poisoned
+     calendar event title/location trying to phish or exfiltrate via the
+     reply itself, even though Layer 3 already refused any gmail.search
+     *query* that would knowingly search for such content (there is no
+     equivalent query to refuse for calendar.list_events -- an attacker
+     who can create an event on the owner's calendar controls its title
+     and location directly, which is exactly why this redaction pass
+     matters there too). URLs are NOT stripped (owner's decision,
+     2026-09-23: the owner wants Instinct able to see and review links,
+     e.g. a Drive link shared by someone else) -- app/output_screen.py's
+     Jev screen, which asks whether an item's text targets the reader,
+     remains the defense against a link crafted to phish or exfiltrate.
   3. Plain text only, size-capped, no attachments, no rendered links --
      closing the exact auto-fetch exfiltration channel research/03
      section 1.5 (EchoLeak) used.
@@ -71,13 +75,13 @@ _REDACTED = "[redacted]"
 # deliberately. Exactly three things must never leak -- written-out
 # passwords, full payment card numbers, one-time codes -- the same three
 # app/output_screen.py asks Jev about. (Until then every 4-8 digit number
-# was redacted: years in dates, amounts, order numbers.) URLs are the one
-# other thing removed, for a different reason: see module docstring point 3.
+# was redacted: years in dates, amounts, order numbers.) URLs used to be
+# stripped too; the owner removed that 2026-09-23 (see module docstring
+# point 2) -- Jev's outbound screen is now the only defense against a
+# link-based phishing/exfiltration attempt, not this regex layer.
 #
-# Order matters: URLs first (so a digit run inside a URL isn't half-
-# redacted), then passwords, then card numbers, then one-time codes (so a
-# card number isn't chopped into "codes" first).
-_URL_RE = re.compile(r"https?://\S+", re.I)
+# Order matters: passwords first, then card numbers, then one-time codes
+# (so a card number isn't chopped into "codes" first).
 # A value written right after a password label: "password: hunter2",
 # "password is hunter2", "סיסמה: ...". Only redacted when the value looks
 # like a secret (see _looks_like_secret), so "password is required" stays.
@@ -163,21 +167,44 @@ def sanitize_output(text: str) -> str:
     return " ".join(value.split())
 
 
-def safe_display(text: str) -> str:
+def safe_display(text: str, *, otp_context: str | None = None) -> str:
     """Secrecy redaction, then structural escaping -- for every display
-    value that isn't an opaque id."""
-    return sanitize_output(redact(str(text)))
+    value that isn't an opaque id. `otp_context`: see redact()."""
+    return sanitize_output(redact(str(text), otp_context=otp_context))
 
 
-def redact(text: str) -> str:
-    """Pure function, unit-tested in isolation. See the comment above
-    _URL_RE for exactly what is -- and deliberately isn't -- removed."""
-    text = _URL_RE.sub(_REDACTED, text)
+def redact(text: str, *, otp_context: str | None = None) -> str:
+    """Pure function, unit-tested in isolation. See the module-level
+    comment above for exactly what is -- and deliberately isn't -- removed.
+
+    `otp_context`: a caller that redacts a PAIR of related fields
+    separately (a Gmail subject and its snippet, an event title and its
+    location) should pass the combined text of both here, so a one-time
+    code split across the two fields (the context word "code" in the
+    subject, the bare digits in the snippet) is still caught -- checking
+    each field for the context word in isolation would miss it. Defaults
+    to `text` itself when the caller has no wider context to offer."""
     text = _PASSWORD_RE.sub(_redact_password, text)
     text = _CARD_CANDIDATE_RE.sub(_redact_card, text)
-    if _OTP_CONTEXT_RE.search(text):
+    if _OTP_CONTEXT_RE.search(otp_context if otp_context is not None else text):
         text = _OTP_RE.sub(_REDACTED, text)
     return text
+
+
+def _format_event_title_location(summary: str, location: str, *, is_withheld: bool) -> tuple[str, str]:
+    """Shared by the create_event/update_event reply branches, which used
+    to repeat this exact withheld-check / quote / redact sequence with
+    only the event variable's name differing. Title and location are
+    redacted together (`otp_context`) so a one-time code split across the
+    two fields -- e.g. a context word in the title, bare digits in the
+    location -- isn't missed the way redacting each field in isolation
+    would miss it."""
+    if is_withheld:
+        return WITHHELD_TEXT, ""
+    combined = f"{summary} {location}"
+    title = f"'{safe_display(summary, otp_context=combined) or '(no title)'}'"
+    location_suffix = f", at {safe_display(location, otp_context=combined)}" if location else ""
+    return title, location_suffix
 
 
 def render_reply(
@@ -186,6 +213,7 @@ def render_reply(
     error_code: str | None,
     gmail_results: list[GmailResult] | None = None,
     calendar_results: list[CalendarEvent] | None = None,
+    calendar_window_label: str | None = None,
     clarification_question: str | None = None,
     draft_result: DraftResult | None = None,
     created_event: CalendarEvent | None = None,
@@ -214,6 +242,12 @@ def render_reply(
         + (1 if drive_file_result else 0)
     )
     prose_lines: list[str] = []
+    # Set only by the two branches below that render one line per result
+    # item -- lets the size-cap truncation at the end report "showing N
+    # of M" instead of a blind character cut (see _status_block's sibling
+    # truncation logic further down).
+    item_lines_start: int | None = None
+    item_lines_total: int | None = None
 
     def withheld(key: str) -> bool:
         return output is not None and output.is_withheld(key)
@@ -228,8 +262,11 @@ def render_reply(
     elif status == "error":
         prose_lines.append(_error_prose(error_code, retryable))
     elif status == "completed" and parsed_request.verb == "calendar.list_events":
+        when_label = f" for {calendar_window_label}" if calendar_window_label else ""
         if calendar_results:
-            prose_lines.append(f"Found {len(calendar_results)} event(s):")
+            prose_lines.append(f"Found {len(calendar_results)} event(s){when_label}:")
+            item_lines_start = len(prose_lines)
+            item_lines_total = len(calendar_results)
             for i, e in enumerate(calendar_results):
                 # The time comes from Google's structured start/end, never free
                 # text, so it's kept even when the item's text is withheld.
@@ -238,30 +275,27 @@ def render_reply(
                 if withheld(event_key(i)):
                     prose_lines.append(f"- {WITHHELD_TEXT} — {when} {event_id}")
                     continue
-                title = safe_display(e.summary) or "(no title)"
-                location = f", at {safe_display(e.location)}" if e.location else ""
+                combined = f"{e.summary} {e.location}"
+                title = safe_display(e.summary, otp_context=combined) or "(no title)"
+                location = f", at {safe_display(e.location, otp_context=combined)}" if e.location else ""
                 attendees = f", {e.attendee_count} attendee(s)" if e.attendee_count else ""
                 prose_lines.append(f"- {title} — {when}{location}{attendees} {event_id}")
         else:
-            prose_lines.append("No events found.")
+            prose_lines.append(f"No events found{when_label}.")
     elif status == "completed" and parsed_request.verb == "calendar.create_event" and created_event:
         # Title and location are screened as ONE item (app/pipeline.py's
         # _output_items), so a flagged event hides both together rather
         # than exposing whichever field wasn't the sensitive one.
-        if withheld(CREATED_EVENT_KEY):
-            title, location = WITHHELD_TEXT, ""
-        else:
-            title = f"'{safe_display(created_event.summary) or '(no title)'}'"
-            location = f", at {safe_display(created_event.location)}" if created_event.location else ""
+        title, location = _format_event_title_location(
+            created_event.summary, created_event.location, is_withheld=withheld(CREATED_EVENT_KEY)
+        )
         when = format_event_range(created_event.start, created_event.end, created_event.all_day, OWNER_TIMEZONE)
         attendees = f", invited {created_event.attendee_count} attendee(s)" if created_event.attendee_count else ""
         prose_lines.append(f"Created event {title} — {when}{location}{attendees} (event_id: {sanitize_output(created_event.event_id)}).")
     elif status == "completed" and parsed_request.verb == "calendar.update_event" and updated_event:
-        if withheld(UPDATED_EVENT_KEY):
-            title, location = WITHHELD_TEXT, ""
-        else:
-            title = f"'{safe_display(updated_event.summary) or '(no title)'}'"
-            location = f", at {safe_display(updated_event.location)}" if updated_event.location else ""
+        title, location = _format_event_title_location(
+            updated_event.summary, updated_event.location, is_withheld=withheld(UPDATED_EVENT_KEY)
+        )
         when = format_event_range(updated_event.start, updated_event.end, updated_event.all_day, OWNER_TIMEZONE)
         attendees = f", {updated_event.attendee_count} attendee(s)" if updated_event.attendee_count else ""
         prose_lines.append(f"Updated event {title} — {when}{location}{attendees} (event_id: {sanitize_output(updated_event.event_id)}).")
@@ -289,6 +323,8 @@ def render_reply(
         results = gmail_results or []
         if results:
             prose_lines.append(f"Found {len(results)} matching email(s):")
+            item_lines_start = len(prose_lines)
+            item_lines_total = len(results)
             for i, r in enumerate(results):
                 # thread_id is an opaque Google token (like a calendar
                 # event_id): structurally escaped only -- never through
@@ -300,8 +336,14 @@ def render_reply(
                 if withheld(gmail_key(i)):
                     prose_lines.append(f"- {WITHHELD_TEXT}{thread}")
                     continue
-                subject = safe_display(r.subject) or "(no subject)"
-                snippet = safe_display(r.snippet)
+                # Subject and snippet are redacted separately but share one
+                # OTP context check, so a code split across the two (the
+                # word "code" in the subject, the bare digits in the
+                # snippet) isn't missed the way checking each in isolation
+                # would miss it.
+                combined = f"{r.subject} {r.snippet}"
+                subject = safe_display(r.subject, otp_context=combined) or "(no subject)"
+                snippet = safe_display(r.snippet, otp_context=combined)
                 # The sender header is attacker-controlled too (display names can carry
                 # URLs or instructions), so it goes through the same redaction.
                 prose_lines.append(f"- {subject} — {safe_display(r.sender)} ({safe_display(r.date)}){thread}\n  {snippet}")
@@ -362,10 +404,41 @@ def render_reply(
     if len(body) > REPLY_MAX_CHARS:
         # Truncate the prose, never the machine-readable block -- a
         # parser (or a human skimming) must always be able to find an
-        # intact status block even in a capped reply.
-        suffix = "\n\n[truncated]"
-        keep = max(0, REPLY_MAX_CHARS - len(body) + len(prose) - len(suffix))
-        body = f"{prose[:keep]}{suffix}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+        # intact status block even in a capped reply. `available` is the
+        # character budget for the prose itself (the block/markers never
+        # shrink, so whatever they cost is subtracted out first).
+        available = REPLY_MAX_CHARS - (len(body) - len(prose))
+        if item_lines_start is not None and item_lines_total is not None:
+            # A per-item list (gmail.search / calendar.list_events):
+            # truncate at the last COMPLETE item boundary rather than
+            # mid-item, and report how many of the total actually made it
+            # in -- a blind character cut left result_count claiming the
+            # full count while the visible list silently fell short of it.
+            item_lines_end = item_lines_start + item_lines_total
+            head_lines = prose_lines[:item_lines_start]
+            item_lines = prose_lines[item_lines_start:item_lines_end]
+            tail_lines = prose_lines[item_lines_end:]
+            head = "\n".join(head_lines)
+            tail = ("\n" + "\n".join(tail_lines)) if tail_lines else ""
+            # Reserve room for the largest this suffix could ever be
+            # (shown can't have more digits than total).
+            suffix_budget = available - len(f"\n\n[showing {item_lines_total} of {item_lines_total}]") - len(tail)
+            used = len(head)
+            kept_items: list[str] = []
+            for line in item_lines:
+                cost = len(line) + 1  # the newline joining it to what came before
+                if used + cost > suffix_budget:
+                    break
+                used += cost
+                kept_items.append(line)
+            shown = len(kept_items)
+            new_prose = "\n".join([*head_lines, *kept_items])
+            suffix = f"\n\n[showing {shown} of {item_lines_total}]{tail}"
+            body = f"{new_prose}{suffix}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+        else:
+            suffix = "\n\n[truncated]"
+            keep = max(0, available - len(suffix))
+            body = f"{prose[:keep]}{suffix}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
 
     return body
 
