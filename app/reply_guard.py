@@ -53,7 +53,7 @@ import yaml
 from app.agentmail_client import AgentMailClient, ReplyResult
 from app.calendar_executor import CalendarEvent
 from app.calendar_window import format_event_range
-from app.config import OWNER_TIMEZONE, REPLY_MAX_CHARS
+from app.config import GIT_SHA, OWNER_TIMEZONE, REPLY_MAX_CHARS
 from app.drive_executor import DriveFileResult
 from app.gmail_executor import DraftResult, GmailResult
 from app.output_screen import (
@@ -224,6 +224,7 @@ def render_reply(
     detail: str | None = None,
     output: OutputScreenResult | None = None,
     ignored_params: tuple[str, ...] = (),
+    requests_remaining_today: int | None = None,
 ) -> str:
     """Builds the full reply body. Deliberately takes no recipient
     argument at all -- see module docstring point 1. Exactly one of the
@@ -398,6 +399,7 @@ def render_reply(
     yaml_block = _status_block(
         parsed_request.request_id, status, error_code, result_count, retryable, output,
         ignored if status == "completed" else [],
+        requests_remaining_today=requests_remaining_today,
     )
     body = f"{prose}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
 
@@ -476,8 +478,14 @@ def _error_prose(error_code: str | None, retryable: bool) -> str:
 def _status_block(
     request_id: str, status: str, error_code: str | None, result_count: int, retryable: bool,
     output: OutputScreenResult | None = None, ignored_params: list[str] | None = None,
+    requests_remaining_today: int | None = None,
 ) -> str:
     block: dict = {
+        # First key, deliberately: a protocol-level fact about which
+        # revision answered, not a per-request one (Instinct's review,
+        # M1) -- lets Instinct tell old vs. new protocol apart during a
+        # deploy transition instead of guessing from which fields appear.
+        "protocol_version": GIT_SHA,
         "request_id": sanitize_output(request_id),
         "status": sanitize_output(status),
         "error_code": sanitize_output(error_code) if error_code is not None else None,
@@ -485,6 +493,13 @@ def _status_block(
         "result_count": result_count,
         "withheld_count": output.withheld_count if output is not None else 0,
     }
+    if requests_remaining_today is not None:
+        # Omitted (rather than a placeholder) when the count itself
+        # couldn't be read (state_store.count_today failed) -- the
+        # requester should never be told a specific number that might be
+        # wrong (Instinct's review, M6: nearly free since count_today is
+        # already computed for the rate-cap check).
+        block["requests_remaining_today"] = requests_remaining_today
     if output is not None:
         # Only present when there was result content to screen:
         # ok | degraded (some items unscreenable, withheld) | disabled (no screen configured).
@@ -495,11 +510,16 @@ def _status_block(
     return yaml.safe_dump(block, sort_keys=False, default_flow_style=False).strip()
 
 
-def render_minimal_reply(request_id: str, status: str, error_code: str | None, retryable: bool) -> str:
+def render_minimal_reply(
+    request_id: str, status: str, error_code: str | None, retryable: bool,
+    requests_remaining_today: int | None = None,
+) -> str:
     """Fallback used only if render_reply itself raises: no result content
     at all, just the machine-readable status block, so the requester still
     learns what happened to its request."""
-    yaml_block = _status_block(request_id, status, error_code, 0, retryable)
+    yaml_block = _status_block(
+        request_id, status, error_code, 0, retryable, requests_remaining_today=requests_remaining_today
+    )
     return f"This request was processed, but its results could not be formatted.\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
 
 

@@ -300,7 +300,7 @@ def handle_webhook(
             state.reply_status, state.error_code, state.retryable = "error", failure.code, failure.retryable
 
     # ── Layer 5: reply ───────────────────────────────────────────────────
-    _send(state, agentmail_client, output_screen)
+    _send(state, agentmail_client, output_screen, state_store)
     _append_audit(audit_log, _audit_record(state))
     _finalize_request_status(state, state_store)
     return WebhookOutcome(200, state.outcome_reason)
@@ -531,21 +531,30 @@ def _unresolved_request(message_id: str) -> ParsedRequest:
     return ParsedRequest(request_id=fallback_request_id_for(message_id), verb="unsupported", params={}, source="block")
 
 
-def _send(state: _RequestState, agentmail_client: AgentMailClient, output_screen: OutputScreen) -> None:
+def _send(state: _RequestState, agentmail_client: AgentMailClient, output_screen: OutputScreen, state_store) -> None:
     """Render and send the one reply. Never raises: a rendering failure
     falls back to a minimal status-only reply, and a send failure is
     recorded on the audit record instead of being lost."""
+    requests_remaining_today: int | None = None
+    try:
+        requests_remaining_today = max(0, MAX_REQUESTS_PER_DAY - state_store.count_today(state.sender))
+    except Exception:
+        logger.exception("could not compute requests_remaining_today for %s", state.sender)
     try:
         body = render_reply(
             state.parsed, state.reply_status, state.error_code,
             retryable=state.retryable, detail=state.decision.reason if state.decision else None,
             output=state.output,
             ignored_params=state.decision.ignored_params if state.decision and state.reply_status == "completed" else (),
+            requests_remaining_today=requests_remaining_today,
             **state.results.render_kwargs(),
         )
     except Exception:
         logger.exception("rendering the reply for %s failed; sending a minimal reply", state.parsed.request_id)
-        body = render_minimal_reply(state.parsed.request_id, state.reply_status, state.error_code, state.retryable)
+        body = render_minimal_reply(
+            state.parsed.request_id, state.reply_status, state.error_code, state.retryable,
+            requests_remaining_today=requests_remaining_today,
+        )
     if state.output is not None:
         # Whole-reply backstop: the rendered prose (not the status block) is
         # screened once more. Audit-only -- a calibration signal for the

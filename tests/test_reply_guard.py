@@ -3,12 +3,12 @@ verified sender, no cc/bcc"."""
 from __future__ import annotations
 
 from app.calendar_executor import CalendarEvent
-from app.config import REPLY_MAX_CHARS
+from app.config import GIT_SHA, REPLY_MAX_CHARS
 from app.drive_executor import DriveFileResult
 from app.gmail_executor import DraftResult, GmailResult
 from app.output_screen import CREATED_EVENT_KEY, ItemVerdict, OutputScreenResult
 from app.request_parser import ParsedRequest
-from app.reply_guard import redact, render_reply, send_reply
+from app.reply_guard import redact, render_minimal_reply, render_reply, send_reply
 from tests.fakes import FakeAgentMailClient
 
 
@@ -110,6 +110,32 @@ def test_render_reply_redacts_an_otp_code_split_across_subject_and_snippet():
     body = render_reply(parsed, "completed", None, gmail_results=results)
     assert "482913" not in body
     assert "[redacted]" in body
+
+
+def test_render_reply_always_carries_the_protocol_version():
+    parsed = ParsedRequest(request_id="req_ver", verb="gmail.search", params={"query": "x"}, source="block")
+    body = render_reply(parsed, "completed", None, gmail_results=[])
+    assert f"protocol_version: {GIT_SHA}" in body
+
+
+def test_render_minimal_reply_also_carries_the_protocol_version():
+    body = render_minimal_reply("req_min", "error", "internal_error", True)
+    assert f"protocol_version: {GIT_SHA}" in body
+
+
+def test_render_reply_includes_requests_remaining_today_when_given():
+    parsed = ParsedRequest(request_id="req_quota", verb="gmail.search", params={"query": "x"}, source="block")
+    body = render_reply(parsed, "completed", None, gmail_results=[], requests_remaining_today=42)
+    assert "requests_remaining_today: 42" in body
+
+
+def test_render_reply_omits_requests_remaining_today_when_not_given():
+    """None means "couldn't be computed" (e.g. state_store.count_today
+    failed) -- omitted rather than shown as a specific number that might
+    be wrong."""
+    parsed = ParsedRequest(request_id="req_no_quota", verb="gmail.search", params={"query": "x"}, source="block")
+    body = render_reply(parsed, "completed", None, gmail_results=[])
+    assert "requests_remaining_today" not in body
 
 
 def test_render_reply_no_results():

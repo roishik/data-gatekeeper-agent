@@ -117,6 +117,15 @@ MAX_REQUESTS_PER_DAY = _env_int("MAX_REQUESTS_PER_DAY", 100)
 # with margin for AgentMail's own retry scheduling.
 PROCESSING_STALE_AFTER_SECONDS = _env_int("PROCESSING_STALE_AFTER_SECONDS", 600)
 
+# ── Protocol version (added 2026-09-23) ─────────────────────────────────────
+# Echoed in every reply's status block so Instinct can tell which
+# revision answered it during a deploy transition (Instinct's review,
+# M1) -- set by docs/RUNBOOK.md's deploy command
+# (--update-env-vars GIT_SHA=$SHA, alongside the existing
+# --labels=commit=$SHA), never baked into the image at build time.
+# "dev" is the honest answer for a local run or an offline test.
+GIT_SHA = _env("GIT_SHA", "dev")
+
 # ── Anthropic (Layer 2, quarantined reader LLM only) ────────────────────────
 ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY")
 # Pinned, dated snapshot on purpose — see research/03 and research/05: a

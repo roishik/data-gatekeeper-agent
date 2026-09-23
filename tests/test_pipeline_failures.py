@@ -161,6 +161,24 @@ def test_transient_error_says_retryable_and_a_resend_runs_again(configured_env, 
     assert store.get_request_status("req_flaky") == REQUEST_COMPLETED
 
 
+def test_reply_reports_requests_remaining_today(configured_env, audit_log):
+    import app.pipeline as pipeline_module
+
+    monkeypatch_value = 5
+    original = pipeline_module.MAX_REQUESTS_PER_DAY
+    pipeline_module.MAX_REQUESTS_PER_DAY = monkeypatch_value
+    try:
+        store = InMemoryStateStore()
+        agentmail = FakeAgentMailClient()
+        store.record_request("instinct@example.com", "req_prior_1")
+        store.record_request("instinct@example.com", "req_prior_2")
+        _call(make_body(text=SEARCH.format(rid="req_quota")), store=store, agentmail=agentmail, audit_log=audit_log)
+        # 2 already used + this one = 3 of 5, leaving 2.
+        assert "requests_remaining_today: 2" in agentmail.calls[0]["text"]
+    finally:
+        pipeline_module.MAX_REQUESTS_PER_DAY = original
+
+
 def test_execution_time_denial_is_denied_not_error(configured_env, audit_log):
     agentmail = FakeAgentMailClient()
     _call(make_body(text=SEARCH.format(rid="req_no")), gmail=_RaisingGmail(GatekeeperDenied("not_gatekeeper_event")),
