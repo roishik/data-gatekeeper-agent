@@ -41,7 +41,7 @@ from datetime import date, datetime, timezone
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from app.config import OWNER_TIMEZONE
+from app.config import OWNER_TIMEZONE, PROCESSING_STALE_AFTER_SECONDS
 
 logger = logging.getLogger("gatekeeper.state_store")
 
@@ -58,13 +58,38 @@ class StateStore(Protocol):
     def is_duplicate_message(self, message_id: str) -> bool: ...
     def mark_message_seen(self, message_id: str) -> None: ...
     def get_request_status(self, request_id: str) -> str | None: ...
+    def get_request_status_detail(self, request_id: str) -> tuple[str, str] | None: ...
     def set_request_status(self, request_id: str, status: str, sender: str = "") -> None: ...
     def count_today(self, sender: str, today: date | None = None) -> int: ...
     def record_request(self, sender: str, request_id: str, today: date | None = None) -> None: ...
 
 
-def is_duplicate_request_status(status: str | None) -> bool:
-    return status in DUPLICATE_REQUEST_STATUSES
+def is_duplicate_request_status(
+    status: str | None, updated_at: str | None = None, *, now: datetime | None = None
+) -> bool:
+    """A `processing` row older than PROCESSING_STALE_AFTER_SECONDS is no
+    longer a duplicate: before this, a process that died mid-request
+    (a Cloud Run timeout, a deploy kill, OOM -- after `set_request_status`
+    recorded `processing` but before `_finalize_request_status` ever ran)
+    left that request_id wedged as a duplicate FOREVER, and every resend
+    got a `duplicate` reply claiming an earlier reply exists when none
+    does (Instinct's review, F2/M3). `completed`/`effect_done` are always
+    duplicates regardless of age -- those are terminal, not stuck.
+
+    `updated_at` is optional and `None` is treated as "can't tell how old
+    this is" -- i.e. still a duplicate, the same as before this fix
+    existed -- so a caller that doesn't have a timestamp handy keeps the
+    old, safe behavior."""
+    if status not in DUPLICATE_REQUEST_STATUSES:
+        return False
+    if status == REQUEST_PROCESSING and updated_at is not None:
+        try:
+            age_seconds = ((now or datetime.now(timezone.utc)) - datetime.fromisoformat(updated_at)).total_seconds()
+        except ValueError:
+            return True
+        if age_seconds > PROCESSING_STALE_AFTER_SECONDS:
+            return False
+    return True
 
 
 def owner_today(now: datetime | None = None) -> date:
@@ -89,6 +114,7 @@ class InMemoryStateStore:
     def __init__(self) -> None:
         self._seen_messages: set[str] = set()
         self._request_statuses: dict[str, str] = {}
+        self._request_status_updated_at: dict[str, str] = {}
         self._daily_counts: dict[tuple[str, date], int] = {}
 
     def is_duplicate_message(self, message_id: str) -> bool:
@@ -100,8 +126,15 @@ class InMemoryStateStore:
     def get_request_status(self, request_id: str) -> str | None:
         return self._request_statuses.get(request_id)
 
+    def get_request_status_detail(self, request_id: str) -> tuple[str, str] | None:
+        status = self._request_statuses.get(request_id)
+        if status is None:
+            return None
+        return status, self._request_status_updated_at.get(request_id, _now_iso())
+
     def set_request_status(self, request_id: str, status: str, sender: str = "") -> None:
         self._request_statuses[request_id] = status
+        self._request_status_updated_at[request_id] = _now_iso()
 
     def count_today(self, sender: str, today: date | None = None) -> int:
         return self._daily_counts.get((sender, today or owner_today()), 0)
@@ -204,6 +237,19 @@ class SheetsStateStore:
             if len(row) >= 2 and row[0] == request_id:
                 status = row[1]  # append-only: the last matching row wins
         return status
+
+    def get_request_status_detail(self, request_id: str) -> tuple[str, str] | None:
+        """(status, updated_at) of the last-written row, or None -- lets
+        is_duplicate_request_status age out a stuck `processing` row. A
+        second, wider (A:C rather than A:B) read of the same tab
+        get_request_status already reads, since the audit-minimization
+        habit elsewhere in this codebase is to fetch only the columns a
+        given method actually needs."""
+        detail: tuple[str, str] | None = None
+        for row in self._rows(self._REQUEST_STATUS_TAB, "C"):
+            if len(row) >= 3 and row[0] == request_id:
+                detail = (row[1], row[2])  # append-only: the last matching row wins
+        return detail
 
     def set_request_status(self, request_id: str, status: str, sender: str = "") -> None:
         self._append(self._REQUEST_STATUS_TAB, "D", [request_id, status, _now_iso(), sender])

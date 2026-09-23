@@ -121,6 +121,43 @@ def test_only_failed_requests_may_be_resent():
         assert is_duplicate_request_status(status)
 
 
+def test_a_stale_processing_row_is_no_longer_a_duplicate():
+    """A process that dies mid-request (Cloud Run timeout, a deploy kill,
+    OOM) after recording `processing` but before finalizing used to wedge
+    that request_id as a duplicate forever. A `processing` row older than
+    PROCESSING_STALE_AFTER_SECONDS must age out; a recent one must not."""
+    now = datetime(2026, 9, 23, 12, 0, 0, tzinfo=timezone.utc)
+    recent = datetime(2026, 9, 23, 11, 55, 0, tzinfo=timezone.utc).isoformat()  # 5 min ago
+    stale = datetime(2026, 9, 23, 11, 0, 0, tzinfo=timezone.utc).isoformat()  # 60 min ago
+
+    assert is_duplicate_request_status(REQUEST_PROCESSING, recent, now=now)
+    assert not is_duplicate_request_status(REQUEST_PROCESSING, stale, now=now)
+
+    # Terminal statuses are duplicates regardless of age -- they're done,
+    # not stuck.
+    assert is_duplicate_request_status(REQUEST_COMPLETED, stale, now=now)
+    assert is_duplicate_request_status(REQUEST_EFFECT_DONE, stale, now=now)
+
+    # No timestamp at all -- e.g. a caller that only has the plain status
+    # string -- keeps the old, safe behavior: still a duplicate.
+    assert is_duplicate_request_status(REQUEST_PROCESSING)
+
+
+def test_get_request_status_detail_returns_the_last_matching_row():
+    store = InMemoryStateStore()
+    assert store.get_request_status_detail("req_1") is None
+    store.set_request_status("req_1", REQUEST_PROCESSING)
+    detail = store.get_request_status_detail("req_1")
+    assert detail is not None
+    status, updated_at = detail
+    assert status == REQUEST_PROCESSING
+    assert updated_at  # a real ISO timestamp was recorded
+    store.set_request_status("req_1", REQUEST_COMPLETED)
+    updated_detail = store.get_request_status_detail("req_1")
+    assert updated_detail is not None
+    assert updated_detail[0] == REQUEST_COMPLETED
+
+
 def test_daily_cap_counts_per_sender_per_day():
     store = InMemoryStateStore()
     today = date(2026, 9, 14)
@@ -184,6 +221,20 @@ def test_sheets_round_trip_dedupe_status_and_count():
     assert store.count_today("a@example.com", date(2026, 9, 22)) == 2
     assert store.count_today("a@example.com", date(2026, 9, 23)) == 0
     assert store.count_today("b@example.com", date(2026, 9, 22)) == 0
+
+
+def test_sheets_get_request_status_detail_returns_the_last_matching_row_and_its_timestamp():
+    store = SheetsStateStore(spreadsheet_id="sheet_1", service=FakeSheetsService())
+    assert store.get_request_status_detail("req_x") is None
+    store.set_request_status("req_x", REQUEST_PROCESSING, "a@example.com")
+    detail = store.get_request_status_detail("req_x")
+    assert detail is not None
+    assert detail[0] == REQUEST_PROCESSING
+    assert detail[1]  # a real timestamp, not blank
+    store.set_request_status("req_x", REQUEST_COMPLETED, "a@example.com")
+    detail = store.get_request_status_detail("req_x")
+    assert detail is not None
+    assert detail[0] == REQUEST_COMPLETED  # last row wins, same as get_request_status
 
 
 def test_sheets_upgrades_an_existing_spreadsheet_in_place_and_ignores_legacy_tab():

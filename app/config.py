@@ -111,6 +111,12 @@ WEBHOOK_TOLERANCE_SECONDS = _env_int("WEBHOOK_TOLERANCE_SECONDS", 300)
 # hard business limit the owner wants enforced tightly.
 MAX_REQUESTS_PER_DAY = _env_int("MAX_REQUESTS_PER_DAY", 100)
 
+# A request_id last recorded as `processing` longer ago than this is no
+# longer treated as a duplicate -- see state_store.is_duplicate_request_status.
+# Comfortably above the 120s Cloud Run request timeout (post-refactor),
+# with margin for AgentMail's own retry scheduling.
+PROCESSING_STALE_AFTER_SECONDS = _env_int("PROCESSING_STALE_AFTER_SECONDS", 600)
+
 # ── Anthropic (Layer 2, quarantined reader LLM only) ────────────────────────
 ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY")
 # Pinned, dated snapshot on purpose — see research/03 and research/05: a

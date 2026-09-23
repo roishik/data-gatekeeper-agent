@@ -118,6 +118,33 @@ def test_executor_error_gets_an_error_reply_and_one_audit_record(configured_env,
     assert store.get_request_status("req_404") == REQUEST_FAILED
 
 
+def test_a_stale_wedged_processing_request_is_resendable(configured_env, audit_log, monkeypatch):
+    """Before this fix (Instinct's review, F2/M3): a process that died
+    mid-request left its request_id stuck at `processing` forever, and
+    every resend got `duplicate` claiming an earlier reply existed when
+    none did. A `processing` row older than PROCESSING_STALE_AFTER_SECONDS
+    must be treated as resendable, not wedged."""
+    import app.state_store as state_store_module
+
+    monkeypatch.setattr(state_store_module, "PROCESSING_STALE_AFTER_SECONDS", 0)
+
+    store = InMemoryStateStore()
+    # Simulate a crash: `processing` was recorded but the request never
+    # reached _finalize_request_status -- no completed/effect_done/failed
+    # row was ever written.
+    store.set_request_status("req_wedged", "processing")
+
+    healthy = FakeGmailClient()
+    outcome = _call(
+        make_body(message_id="msg_resend", text=SEARCH.format(rid="req_wedged")),
+        store=store, gmail=healthy, audit_log=audit_log,
+    )
+
+    assert outcome.reason == "processed"
+    assert len(healthy.calls) == 1  # it actually ran, not just re-replied
+    assert store.get_request_status("req_wedged") == REQUEST_COMPLETED
+
+
 def test_transient_error_says_retryable_and_a_resend_runs_again(configured_env, audit_log):
     store = InMemoryStateStore()
     agentmail = FakeAgentMailClient()

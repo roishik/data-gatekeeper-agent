@@ -353,8 +353,9 @@ def _run_request(
 
         # ── Layer 1 (cont.): request dedupe, now that we know the id ─────
         stage = "layer1"
-        prior_status = state_store.get_request_status(state.parsed.request_id)
-        if is_duplicate_request_status(prior_status):
+        prior = state_store.get_request_status_detail(state.parsed.request_id)
+        prior_status, prior_updated_at = prior if prior is not None else (None, None)
+        if is_duplicate_request_status(prior_status, prior_updated_at):
             state.layer1 = "duplicate_request"
             state.reply_status, state.error_code = "duplicate", "duplicate_request"
             state.outcome_reason = "duplicate_request"
