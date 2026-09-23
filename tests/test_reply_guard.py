@@ -145,6 +145,28 @@ def test_render_reply_no_results():
     assert "result_count: 0" in body
 
 
+def test_render_reply_capabilities_lists_every_verb_and_its_bounds():
+    from app.capabilities import CapabilitiesInfo, VerbCapability
+
+    parsed = ParsedRequest(request_id="req_caps", verb="capabilities", params={}, source="block")
+    info = CapabilitiesInfo(
+        protocol_version="abc1234",
+        max_requests_per_day=100,
+        batch_max_items=25,
+        verbs=(
+            VerbCapability(verb="gmail.search", is_write=False, param_bounds=("query: string, required",)),
+            VerbCapability(verb="gmail.create_draft", is_write=True, param_bounds=("to: string, required",)),
+        ),
+    )
+    body = render_reply(parsed, "completed", None, capabilities=info)
+    assert "gmail.search (read)" in body
+    assert "gmail.create_draft (write)" in body
+    assert "query: string, required" in body
+    assert "Daily quota: 100 requests" in body
+    assert "batch accepts up to 25 items" in body
+    assert "result_count: 1" in body
+
+
 def test_render_reply_denied_sensitive_query():
     parsed = ParsedRequest(request_id="req_3", verb="gmail.search", params={"query": "otp"}, source="block")
     body = render_reply(parsed, "denied", "sensitive_query_refused")

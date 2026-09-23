@@ -55,36 +55,17 @@ class Verb(str, Enum):
     DRIVE_SEARCH = "drive.search"
     DRIVE_CREATE_FILE = "drive.create_file"
     CONTACTS_SEARCH = "contacts.search"
+    CAPABILITIES = "capabilities"
     UNSUPPORTED = "unsupported"
 
 
-# The verbs with a real executor (research/00 brief, "Suggested next
-# phases" step 3 started the walking skeleton with ONE read-only verb;
-# every write verb below was added once the owner explicitly decided --
-# see CLAUDE.md -- to give the gatekeeper write access: gmail.create_draft
-# only ever creates a Gmail DRAFT, never sends (the owner reviews and
-# sends it themselves in Gmail -- that manual step is the approval), and
-# the calendar/drive write verbs run fully autonomously by the owner's
-# explicit choice, with no recipient/attendee allowlist gating them.
-IMPLEMENTED_VERBS = frozenset({
-    Verb.GMAIL_SEARCH,
-    Verb.GMAIL_CREATE_DRAFT,
-    Verb.CALENDAR_LIST_EVENTS,
-    Verb.CALENDAR_CREATE_EVENT,
-    Verb.CALENDAR_UPDATE_EVENT,
-    Verb.CALENDAR_DELETE_EVENT,
-    Verb.DRIVE_CREATE_FILE,
-})
 NOT_IMPLEMENTED_VERBS = frozenset({Verb.DRIVE_SEARCH, Verb.CONTACTS_SEARCH})
-# Verbs with a side effect outside this service. The injection-screen gate
-# (apply_screen_gate) applies to these only.
-WRITE_VERBS = frozenset({
-    Verb.GMAIL_CREATE_DRAFT,
-    Verb.CALENDAR_CREATE_EVENT,
-    Verb.CALENDAR_UPDATE_EVENT,
-    Verb.CALENDAR_DELETE_EVENT,
-    Verb.DRIVE_CREATE_FILE,
-})
+
+# Batched sub-requests (app/pipeline.py's batch handling), capped so one
+# email's worth of work can't push a single request past the Cloud Run
+# timeout -- each item can itself trigger a Google API call plus Jev
+# screening. Read here by the capabilities verb; enforced in pipeline.py.
+BATCH_MAX_ITEMS = 25
 
 QUERY_MAX_CHARS = 200
 MAX_RESULTS_DEFAULT = 5
@@ -222,6 +203,14 @@ class DriveCreateFileParams:
 
 
 @dataclass(frozen=True)
+class CapabilitiesParams:
+    """No fields: capabilities takes no input, it only reports on this
+    service itself. A dataclass anyway, for the same reason every other
+    verb gets one -- PolicyDecision.params stays a closed union, and
+    app/pipeline.py's executor dispatch stays isinstance()-based."""
+
+
+@dataclass(frozen=True)
 class PolicyDecision:
     status: str  # "allowed" | "denied" | "not_implemented" | "unsupported"
     verb: Verb
@@ -239,6 +228,7 @@ class PolicyDecision:
         | CalendarUpdateEventParams
         | CalendarDeleteEventParams
         | DriveCreateFileParams
+        | CapabilitiesParams
         | None
     ) = None
     # Extra parameters this verb doesn't define, which were NOT read or
@@ -265,20 +255,129 @@ def _is_email(value: str) -> bool:
     return bool(_EMAIL_RE.match(value)) and _is_single_line(value)
 
 
+@dataclass(frozen=True)
+class VerbSpec:
+    """One place to register a verb's param names, whether it's a write,
+    and its bounds -- instead of three hand-maintained tables that could
+    silently drift apart (a prior review flagged WRITE_VERBS as exactly
+    this risk: a future verb added to VERB_PARAMS but forgotten here
+    would fail OPEN on the injection-screen write gate, apply_screen_gate
+    below). IMPLEMENTED_VERBS/VERB_PARAMS/WRITE_VERBS are now all derived
+    from this registry; nothing else builds them by hand. `param_bounds`
+    is a short, human-readable description per param (referencing the
+    real constants above, not re-stating their values), used only by the
+    `capabilities` verb (app/capabilities.py) to describe this service to
+    Instinct -- it has no effect on validation, which still happens in
+    each verb's own _evaluate_* function below."""
+
+    verb: Verb
+    param_names: frozenset[str]
+    is_write: bool
+    param_bounds: tuple[str, ...] = ()
+
+
+VERB_SPECS: dict[Verb, VerbSpec] = {
+    Verb.GMAIL_SEARCH: VerbSpec(
+        verb=Verb.GMAIL_SEARCH,
+        param_names=frozenset({"query", "max_results", "newer_than_days"}),
+        is_write=False,
+        param_bounds=(
+            f"query: string, required, max {QUERY_MAX_CHARS} chars",
+            f"max_results: int, {MAX_RESULTS_MIN}-{MAX_RESULTS_MAX}, default {MAX_RESULTS_DEFAULT}",
+            f"newer_than_days: int, {NEWER_THAN_DAYS_MIN}-{NEWER_THAN_DAYS_MAX}, optional",
+        ),
+    ),
+    Verb.GMAIL_CREATE_DRAFT: VerbSpec(
+        verb=Verb.GMAIL_CREATE_DRAFT,
+        param_names=frozenset({"to", "subject", "body", "thread_id"}),
+        is_write=True,
+        param_bounds=(
+            f"to: string, required, valid email, max {DRAFT_TO_MAX_CHARS} chars",
+            f"subject: string, required, max {DRAFT_SUBJECT_MAX_CHARS} chars",
+            f"body: string, required, max {DRAFT_BODY_MAX_CHARS} chars (use the payload rail for long bodies)",
+            "thread_id: string, optional, from a prior gmail.search reply's thread_id",
+        ),
+    ),
+    Verb.CALENDAR_LIST_EVENTS: VerbSpec(
+        verb=Verb.CALENDAR_LIST_EVENTS,
+        param_names=frozenset({"day_offset", "days", "max_results"}),
+        is_write=False,
+        param_bounds=(
+            f"day_offset: int, {CAL_DAY_OFFSET_MIN}-{CAL_DAY_OFFSET_MAX}, default {CAL_DAY_OFFSET_DEFAULT}",
+            f"days: int, {CAL_DAYS_MIN}-{CAL_DAYS_MAX}, default {CAL_DAYS_DEFAULT}",
+            f"max_results: int, {CAL_MAX_RESULTS_MIN}-{CAL_MAX_RESULTS_MAX}, default {CAL_MAX_RESULTS_DEFAULT}",
+        ),
+    ),
+    Verb.CALENDAR_CREATE_EVENT: VerbSpec(
+        verb=Verb.CALENDAR_CREATE_EVENT,
+        param_names=frozenset({"title", "day_offset", "start_time", "duration_minutes", "attendees", "location"}),
+        is_write=True,
+        param_bounds=(
+            f"title: string, required, max {EVENT_TITLE_MAX_CHARS} chars",
+            f"day_offset: int, {EVENT_DAY_OFFSET_MIN}-{EVENT_DAY_OFFSET_MAX}, required",
+            "start_time: string 'HH:MM', required, owner's local time",
+            f"duration_minutes: int, {EVENT_DURATION_MIN_MINUTES}-{EVENT_DURATION_MAX_MINUTES}, required",
+            f"attendees: list of email strings, up to {EVENT_ATTENDEES_MAX}, optional",
+            f"location: string, max {EVENT_LOCATION_MAX_CHARS} chars, optional",
+        ),
+    ),
+    Verb.CALENDAR_UPDATE_EVENT: VerbSpec(
+        verb=Verb.CALENDAR_UPDATE_EVENT,
+        param_names=frozenset({
+            "event_id", "title", "day_offset", "start_time", "duration_minutes",
+            "location", "add_attendees", "remove_attendees",
+        }),
+        is_write=True,
+        param_bounds=(
+            f"event_id: string, required, max {EVENT_ID_MAX_CHARS} chars",
+            f"title: string, optional, max {EVENT_TITLE_MAX_CHARS} chars",
+            f"day_offset: int, {EVENT_DAY_OFFSET_MIN}-{EVENT_DAY_OFFSET_MAX}, optional",
+            "start_time: string 'HH:MM', optional",
+            f"duration_minutes: int, {EVENT_DURATION_MIN_MINUTES}-{EVENT_DURATION_MAX_MINUTES}, optional",
+            f"location: string, max {EVENT_LOCATION_MAX_CHARS} chars, optional (\"\" clears it, omitted leaves it alone)",
+            f"add_attendees: list of email strings, optional, event total capped at {EVENT_ATTENDEES_MAX}",
+            "remove_attendees: list of email strings, optional",
+        ),
+    ),
+    Verb.CALENDAR_DELETE_EVENT: VerbSpec(
+        verb=Verb.CALENDAR_DELETE_EVENT,
+        param_names=frozenset({"event_id"}),
+        is_write=True,
+        param_bounds=(f"event_id: string, required, max {EVENT_ID_MAX_CHARS} chars",),
+    ),
+    Verb.DRIVE_CREATE_FILE: VerbSpec(
+        verb=Verb.DRIVE_CREATE_FILE,
+        param_names=frozenset({"name", "content"}),
+        is_write=True,
+        param_bounds=(
+            f"name: string, required, max {DRIVE_NAME_MAX_CHARS} chars",
+            f"content: string, required, max {DRIVE_CONTENT_MAX_CHARS} chars (use the payload rail for long content)",
+        ),
+    ),
+    Verb.CAPABILITIES: VerbSpec(
+        verb=Verb.CAPABILITIES,
+        param_names=frozenset(),
+        is_write=False,
+        param_bounds=(),
+    ),
+}
+
+# research/00 brief, "Suggested next phases" step 3 started the walking
+# skeleton with ONE read-only verb; every write verb was added once the
+# owner explicitly decided -- see CLAUDE.md -- to give the gatekeeper
+# write access: gmail.create_draft only ever creates a Gmail DRAFT, never
+# sends (the owner reviews and sends it themselves in Gmail -- that
+# manual step is the approval), and the calendar/drive write verbs run
+# fully autonomously by the owner's explicit choice, with no
+# recipient/attendee allowlist gating them.
+IMPLEMENTED_VERBS = frozenset(VERB_SPECS.keys())
 # Every parameter each verb defines. Anything else in a request is an
 # "extra" parameter: never read, never passed on, and handled centrally in
 # evaluate_policy() -- see rule 2 in the module docstring.
-VERB_PARAMS: dict[Verb, frozenset[str]] = {
-    Verb.GMAIL_SEARCH: frozenset({"query", "max_results", "newer_than_days"}),
-    Verb.GMAIL_CREATE_DRAFT: frozenset({"to", "subject", "body", "thread_id"}),
-    Verb.CALENDAR_LIST_EVENTS: frozenset({"day_offset", "days", "max_results"}),
-    Verb.CALENDAR_CREATE_EVENT: frozenset({"title", "day_offset", "start_time", "duration_minutes", "attendees", "location"}),
-    Verb.CALENDAR_UPDATE_EVENT: frozenset({
-        "event_id", "title", "day_offset", "start_time", "duration_minutes", "location", "add_attendees", "remove_attendees",
-    }),
-    Verb.CALENDAR_DELETE_EVENT: frozenset({"event_id"}),
-    Verb.DRIVE_CREATE_FILE: frozenset({"name", "content"}),
-}
+VERB_PARAMS: dict[Verb, frozenset[str]] = {verb: spec.param_names for verb, spec in VERB_SPECS.items()}
+# Verbs with a side effect outside this service. The injection-screen gate
+# (apply_screen_gate) applies to these only.
+WRITE_VERBS = frozenset(verb for verb, spec in VERB_SPECS.items() if spec.is_write)
 # Extra parameters that are REFUSED instead of ignored, because ignoring
 # them would silently do something different from what was asked: the old
 # `attendees` on update_event meant "replace the guest list", so a request
@@ -423,6 +522,9 @@ def _evaluate_known_params(verb: Verb, params: dict[str, Any]) -> PolicyDecision
 
     if verb == Verb.DRIVE_CREATE_FILE:
         return _evaluate_drive_create_file(params)
+
+    if verb == Verb.CAPABILITIES:
+        return PolicyDecision(status="allowed", verb=verb, params=CapabilitiesParams())
 
     # Unreachable given the enum is exhaustively handled above, but
     # deny-by-default means even an unreachable branch denies rather

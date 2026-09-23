@@ -580,6 +580,37 @@ def test_drive_create_file_empty_content_is_allowed():
     assert decision.status == "allowed"
 
 
+# ── capabilities ──────────────────────────────────────────────────────────
+
+
+def test_capabilities_is_always_allowed():
+    from app.policy import CapabilitiesParams
+
+    decision = evaluate_policy("capabilities", {})
+    assert decision.status == "allowed"
+    assert decision.params == CapabilitiesParams()
+
+
+def test_capabilities_is_implemented_but_not_a_write_verb():
+    from app.policy import IMPLEMENTED_VERBS, WRITE_VERBS
+
+    assert Verb.CAPABILITIES in IMPLEMENTED_VERBS
+    assert Verb.CAPABILITIES not in WRITE_VERBS
+
+
+def test_verb_specs_cover_every_implemented_verb_exactly():
+    """IMPLEMENTED_VERBS/VERB_PARAMS/WRITE_VERBS are all derived from
+    VERB_SPECS -- this pins that the registry itself hasn't silently
+    dropped or duplicated an entry."""
+    from app.policy import VERB_SPECS
+
+    assert set(VERB_SPECS.keys()) == {
+        Verb.GMAIL_SEARCH, Verb.GMAIL_CREATE_DRAFT, Verb.CALENDAR_LIST_EVENTS,
+        Verb.CALENDAR_CREATE_EVENT, Verb.CALENDAR_UPDATE_EVENT, Verb.CALENDAR_DELETE_EVENT,
+        Verb.DRIVE_CREATE_FILE, Verb.CAPABILITIES,
+    }
+
+
 # ── write verbs are implemented, not just recognized ────────────────────
 
 
@@ -611,6 +642,7 @@ def test_every_implemented_verb_ignores_unknown_parameters():
         "calendar.update_event": {"event_id": "e1", "title": "Moved"},
         "calendar.delete_event": {"event_id": "e1"},
         "drive.create_file": {"name": "notes.txt", "content": "hello"},
+        "capabilities": {},
     }
     for verb, params in valid.items():
         assert evaluate_policy(verb, params).status == "allowed", verb

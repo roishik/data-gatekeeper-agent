@@ -493,6 +493,22 @@ def test_drive_and_contacts_are_still_not_implemented(configured_env, audit_log)
         assert "status: not_implemented" in agentmail.calls[0]["text"]
 
 
+def test_capabilities_end_to_end_lists_verbs_and_never_hits_google(configured_env, audit_log):
+    text = "---GATEKEEPER-REQUEST---\nrequest_id: req_caps\nverb: capabilities\nparams: {}\n---END---\n"
+    agentmail = FakeAgentMailClient()
+    body = make_body(text=text)
+    outcome, fake_gmail, fake_calendar = _call(body, agentmail_client=agentmail, audit_log=audit_log)
+
+    assert outcome.http_status == 200
+    reply_text = agentmail.calls[0]["text"]
+    assert "status: completed" in reply_text
+    assert "gmail.search (read)" in reply_text
+    assert "gmail.create_draft (write)" in reply_text
+    assert "capabilities (read)" in reply_text
+    assert fake_gmail.calls == []  # no Google API call for this verb
+    assert fake_calendar.calls == []
+
+
 # ── write verbs, end to end ──────────────────────────────────────────────
 
 

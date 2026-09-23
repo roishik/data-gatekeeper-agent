@@ -53,6 +53,7 @@ import yaml
 from app.agentmail_client import AgentMailClient, ReplyResult
 from app.calendar_executor import CalendarEvent
 from app.calendar_window import format_event_range
+from app.capabilities import CapabilitiesInfo
 from app.config import GIT_SHA, OWNER_TIMEZONE, REPLY_MAX_CHARS
 from app.drive_executor import DriveFileResult
 from app.gmail_executor import DraftResult, GmailResult
@@ -220,6 +221,7 @@ def render_reply(
     updated_event: CalendarEvent | None = None,
     deleted_event_id: str | None = None,
     drive_file_result: DriveFileResult | None = None,
+    capabilities: CapabilitiesInfo | None = None,
     retryable: bool = False,
     detail: str | None = None,
     output: OutputScreenResult | None = None,
@@ -241,6 +243,7 @@ def render_reply(
         + (1 if updated_event else 0)
         + (1 if deleted_event_id else 0)
         + (1 if drive_file_result else 0)
+        + (1 if capabilities else 0)
     )
     prose_lines: list[str] = []
     # Set only by the two branches below that render one line per result
@@ -320,6 +323,19 @@ def render_reply(
     elif status == "completed" and parsed_request.verb == "drive.create_file" and drive_file_result:
         name = WITHHELD_TEXT if withheld(DRIVE_FILE_KEY) else f"'{safe_display(drive_file_result.name)}'"
         prose_lines.append(f"Created Drive file {name}.")
+    elif status == "completed" and parsed_request.verb == "capabilities" and capabilities is not None:
+        # Nothing here originates from Google or the requester, so none of
+        # it needs safe_display/redaction -- see app/capabilities.py.
+        prose_lines.append(f"Capabilities (protocol_version {sanitize_output(capabilities.protocol_version)}):")
+        for v in capabilities.verbs:
+            kind = "write" if v.is_write else "read"
+            prose_lines.append(f"- {sanitize_output(v.verb)} ({kind})")
+            for bound in v.param_bounds:
+                prose_lines.append(f"    {sanitize_output(bound)}")
+        prose_lines.append(
+            f"Daily quota: {capabilities.max_requests_per_day} requests. "
+            f"batch accepts up to {capabilities.batch_max_items} items."
+        )
     elif status == "completed":
         results = gmail_results or []
         if results:

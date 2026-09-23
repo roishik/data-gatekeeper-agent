@@ -81,6 +81,7 @@ VerbLiteral = Literal[
     "drive.search",
     "drive.create_file",
     "contacts.search",
+    "capabilities",
     "unsupported",
 ]
 
@@ -245,11 +246,11 @@ _STAGE1_SYSTEM_PROMPT = _QUARANTINE_PREAMBLE + (
     "any) the email is asking for, from this fixed set of verbs: "
     "gmail.search, gmail.create_draft, calendar.list_events, "
     "calendar.create_event, calendar.update_event, calendar.delete_event, "
-    "drive.search, drive.create_file, contacts.search. If the email does "
-    "not clearly and unambiguously ask for exactly one of those actions, "
-    "set verb to 'unsupported'. Copy a request_id ONLY if the email text "
-    "plainly states one -- never invent one. Do not extract any other "
-    "parameter in this step."
+    "drive.search, drive.create_file, contacts.search, capabilities. If "
+    "the email does not clearly and unambiguously ask for exactly one of "
+    "those actions, set verb to 'unsupported'. Copy a request_id ONLY if "
+    "the email text plainly states one -- never invent one. Do not "
+    "extract any other parameter in this step."
 )
 
 _STAGE2_GMAIL_SEARCH_PROMPT = _QUARANTINE_PREAMBLE + (

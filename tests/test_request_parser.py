@@ -350,12 +350,18 @@ def test_reader_llm_stage_fields_cover_llm_extraction_exactly():
 
 
 def test_reader_llm_every_implemented_verb_has_a_stage2_model():
-    """Every verb policy.py actually executes must have a stage-2 field
-    model, or the LLM path could select it but never extract its params."""
-    from app.policy import IMPLEMENTED_VERBS
+    """Every verb policy.py actually executes AND that takes at least one
+    parameter must have a stage-2 field model, or the LLM path could
+    select it but never extract its params. A parameterless verb (e.g.
+    capabilities) legitimately has none -- Stage 1 alone is the whole
+    answer for it (reader_llm.ReaderLLM.extract()'s `if stage2 is None`
+    branch)."""
+    from app.policy import IMPLEMENTED_VERBS, VERB_SPECS
     from app.reader_llm import _STAGE2
 
     for verb in IMPLEMENTED_VERBS:
+        if not VERB_SPECS[verb].param_names:
+            continue
         assert verb.value in _STAGE2, f"{verb.value} has no stage-2 extraction model"
 
 

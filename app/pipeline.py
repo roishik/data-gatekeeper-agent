@@ -46,6 +46,7 @@ from app.agentmail_client import AgentMailClient
 from app.audit_log import AuditLog, AuditRecord
 from app.calendar_executor import CalendarClient, CalendarEvent
 from app.calendar_window import format_window_range, resolve_window
+from app.capabilities import CapabilitiesInfo, build_capabilities_info
 from app.config import AGENTMAIL_INBOX_ID, INJECTION_DENY_THRESHOLD, MAX_REQUESTS_PER_DAY, OUTPUT_SCREEN_FAIL_MODE, OWNER_TIMEZONE
 from app.drive_executor import DriveClient, DriveFileResult
 from app.failures import GatekeeperDenied, classify_failure
@@ -70,6 +71,7 @@ from app.policy import (
     CalendarDeleteEventParams,
     CalendarListEventsParams,
     CalendarUpdateEventParams,
+    CapabilitiesParams,
     DriveCreateFileParams,
     GmailCreateDraftParams,
     GmailSearchParams,
@@ -113,6 +115,7 @@ class ExecutionResults:
     updated_event: CalendarEvent | None = None
     deleted_event_id: str | None = None
     drive_file_result: DriveFileResult | None = None
+    capabilities: CapabilitiesInfo | None = None
 
     @property
     def wrote(self) -> bool:
@@ -128,6 +131,7 @@ class ExecutionResults:
             "updated_event": self.updated_event,
             "deleted_event_id": self.deleted_event_id,
             "drive_file_result": self.drive_file_result,
+            "capabilities": self.capabilities,
         }
 
 
@@ -515,6 +519,10 @@ def _execute(
         results.deleted_event_id = params.event_id
     elif isinstance(params, DriveCreateFileParams):
         results.drive_file_result = drive_client_factory().create_file(name=params.name, content=params.content)
+    elif isinstance(params, CapabilitiesParams):
+        # No Google API call, no credentials, nothing owner-derived --
+        # see app/capabilities.py's module docstring.
+        results.capabilities = build_capabilities_info()
     return results
 
 
