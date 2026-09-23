@@ -12,9 +12,10 @@ though only ONE combined reply is ever sent.
 """
 from __future__ import annotations
 
+from app.audit_log import SheetsAuditLog, verify_chain
 from app.pipeline import handle_webhook
 from app.policy import BATCH_MAX_ITEMS
-from app.state_store import REQUEST_COMPLETED, InMemoryStateStore
+from app.state_store import REQUEST_COMPLETED, InMemoryStateStore, SheetsStateStore
 from tests.fakes import (
     FakeAgentMailClient,
     FakeCalendarClient,
@@ -23,6 +24,7 @@ from tests.fakes import (
     FakeInjectionScreen,
     FakeReaderLLM,
 )
+from tests.test_state_store import FakeSheetsService
 from tests.webhook_helpers import make_body, sign
 
 
@@ -253,3 +255,81 @@ def test_resending_a_batch_email_does_not_repeat_already_completed_items(configu
     outcome2, _, _, _ = _call(body2, state_store=store, agentmail_client=agentmail, audit_log=audit_log)
     assert outcome2.http_status == 200
     assert "status: duplicate" in agentmail.calls[1]["text"]
+
+
+class _CountingSheets(FakeSheetsService):
+    """Counts every values().get / values().append -- one real Sheets API
+    call each -- across the state store AND the audit log sharing it."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+        self.writes = 0
+
+    def values(self):
+        inner = super().values()
+        svc = self
+
+        class _Counted:
+            def get(self, **kwargs):
+                svc.reads += 1
+                return inner.get(**kwargs)
+
+            def append(self, **kwargs):
+                svc.writes += 1
+                return inner.append(**kwargs)
+
+        return _Counted()
+
+
+def test_a_full_batch_stays_within_the_sheets_write_quota(configured_env, monkeypatch):
+    """Per item, Layer 1 plus finalizing and auditing cost ~7 sequential
+    Sheets calls: a 25-item batch made ~175 in one request, past Sheets'
+    60-writes-per-minute per-user quota. They're now done once per batch,
+    so the Sheets cost doesn't grow with the item count."""
+    import app.pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "MAX_REQUESTS_PER_DAY", 100)
+    svc = _CountingSheets()
+    store = SheetsStateStore(spreadsheet_id="state", service=svc)
+    audit = SheetsAuditLog(spreadsheet_id="log", service=svc)
+    svc.reads = svc.writes = 0  # construction-time reads don't count
+
+    items = [_item(f"req_item_{i}", "capabilities", {}) for i in range(BATCH_MAX_ITEMS)]
+    agentmail = FakeAgentMailClient()
+    outcome, _, _, _ = _call(
+        _batch_body("req_batch_quota", items), state_store=store, agentmail_client=agentmail, audit_log=audit,
+    )
+
+    assert outcome.http_status == 200
+    # message dedupe, the cap, the outer dedupe, the batch's one status read
+    assert svc.reads <= 4
+    # seen, outer processing, quota rows, item processing rows, audit, final statuses
+    assert svc.writes <= 6
+    entries = audit.all_entries()
+    assert len(entries) == BATCH_MAX_ITEMS + 1
+    assert verify_chain(entries)
+    assert store.count_today("instinct@example.com") == BATCH_MAX_ITEMS
+    assert all(
+        store.get_request_status_detail(f"req_item_{i}")[0] == REQUEST_COMPLETED for i in range(BATCH_MAX_ITEMS)
+    )
+    assert f"requests_remaining_today: {100 - BATCH_MAX_ITEMS}" in agentmail.calls[0]["text"]
+
+
+def test_an_item_reusing_the_batch_request_id_is_denied_without_touching_the_batch(configured_env, audit_log):
+    store = InMemoryStateStore()
+    body = _batch_body("req_batch_same", [
+        _item("req_batch_same", "capabilities", {}),
+        _item("req_item_ok", "capabilities", {}),
+    ])
+    agentmail = FakeAgentMailClient()
+    outcome, _, _, _ = _call(body, state_store=store, agentmail_client=agentmail, audit_log=audit_log)
+
+    assert outcome.http_status == 200
+    reply_text = agentmail.calls[0]["text"]
+    assert "must differ from the batch's own request_id" in reply_text
+    assert "status: duplicate" not in reply_text
+    items = {e["record"]["parsed_request_id"]: e["record"] for e in audit_log.all_entries() if e["record"]["batch_id"]}
+    assert items["req_batch_same-item0"]["policy_error_code"] == "invalid_request_block"
+    assert items["req_item_ok"]["reply_status"] == "completed"
+    assert store.get_request_status("req_batch_same") == REQUEST_COMPLETED

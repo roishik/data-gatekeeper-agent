@@ -51,6 +51,9 @@ class _FailingAuditLog:
     def append(self, record):
         raise OSError("sheets unreachable")
 
+    def append_many(self, records):
+        raise OSError("sheets unreachable")
+
     def all_entries(self):
         return []
 
@@ -130,7 +133,7 @@ def test_a_stale_wedged_processing_request_is_resendable(configured_env, audit_l
 
     store = InMemoryStateStore()
     # Simulate a crash: `processing` was recorded but the request never
-    # reached _finalize_request_status -- no completed/effect_done/failed
+    # reached _finalize_request_statuses -- no completed/effect_done/failed
     # row was ever written.
     store.set_request_status("req_wedged", "processing")
 
@@ -143,6 +146,30 @@ def test_a_stale_wedged_processing_request_is_resendable(configured_env, audit_l
     assert outcome.reason == "processed"
     assert len(healthy.calls) == 1  # it actually ran, not just re-replied
     assert store.get_request_status("req_wedged") == REQUEST_COMPLETED
+
+
+def test_a_stale_processing_write_is_never_re_run(configured_env, audit_log, monkeypatch):
+    """The counterpart of the test above: for a WRITE, a stale `processing`
+    row may mean the side effect happened and only `effect_done` was lost
+    (a crash between the two). Re-running it would repeat the write, so it
+    stays a duplicate however old it is."""
+    import app.state_store as state_store_module
+
+    monkeypatch.setattr(state_store_module, "PROCESSING_STALE_AFTER_SECONDS", 0)
+
+    store = InMemoryStateStore()
+    store.set_request_status("req_wedged_write", "processing")
+
+    gmail = FakeGmailClient()
+    agentmail = FakeAgentMailClient()
+    outcome = _call(
+        make_body(message_id="msg_resend", text=DRAFT.format(rid="req_wedged_write")),
+        store=store, gmail=gmail, agentmail=agentmail, audit_log=audit_log,
+    )
+
+    assert outcome.reason == "duplicate_request"
+    assert gmail.calls == []  # no second draft
+    assert "status: duplicate" in agentmail.calls[0]["text"]
 
 
 def test_transient_error_says_retryable_and_a_resend_runs_again(configured_env, audit_log):

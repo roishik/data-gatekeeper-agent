@@ -399,8 +399,8 @@ def _build_prose(
             )
         elif error_code == "sensitive_content_refused":
             prose_lines.append(
-                "This request was refused: the event has attendees, and its title was flagged as "
-                "sensitive (or could not be checked), so no invite was sent."
+                "This request was refused: the event has attendees, and its title or location was "
+                "flagged as sensitive (or could not be checked), so nothing was sent to them."
             )
         elif error_code == "not_gatekeeper_event":
             prose_lines.append(
@@ -646,8 +646,8 @@ def _status_block(
         # Omitted (rather than a placeholder) when the count itself
         # couldn't be read (state_store.count_today failed) -- the
         # requester should never be told a specific number that might be
-        # wrong (Instinct's review, M6: nearly free since count_today is
-        # already computed for the rate-cap check).
+        # wrong (Instinct's review, M6). Derived by app/pipeline.py from the
+        # count its rate-cap check already read, not a second read.
         block["requests_remaining_today"] = requests_remaining_today
     if output is not None:
         # Only present when there was result content to screen:

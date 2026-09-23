@@ -115,10 +115,11 @@ def test_request_status_lifecycle():
 
 
 def test_only_failed_requests_may_be_resent():
-    assert not is_duplicate_request_status(None)
-    assert not is_duplicate_request_status(REQUEST_FAILED)
-    for status in (REQUEST_PROCESSING, REQUEST_EFFECT_DONE, REQUEST_COMPLETED):
-        assert is_duplicate_request_status(status)
+    for write_verb in (False, True):
+        assert not is_duplicate_request_status(None, write_verb=write_verb)
+        assert not is_duplicate_request_status(REQUEST_FAILED, write_verb=write_verb)
+        for status in (REQUEST_PROCESSING, REQUEST_EFFECT_DONE, REQUEST_COMPLETED):
+            assert is_duplicate_request_status(status, write_verb=write_verb)
 
 
 def test_a_stale_processing_row_is_no_longer_a_duplicate():
@@ -130,17 +131,28 @@ def test_a_stale_processing_row_is_no_longer_a_duplicate():
     recent = datetime(2026, 9, 23, 11, 55, 0, tzinfo=timezone.utc).isoformat()  # 5 min ago
     stale = datetime(2026, 9, 23, 11, 0, 0, tzinfo=timezone.utc).isoformat()  # 60 min ago
 
-    assert is_duplicate_request_status(REQUEST_PROCESSING, recent, now=now)
-    assert not is_duplicate_request_status(REQUEST_PROCESSING, stale, now=now)
+    assert is_duplicate_request_status(REQUEST_PROCESSING, recent, write_verb=False, now=now)
+    assert not is_duplicate_request_status(REQUEST_PROCESSING, stale, write_verb=False, now=now)
 
     # Terminal statuses are duplicates regardless of age -- they're done,
     # not stuck.
-    assert is_duplicate_request_status(REQUEST_COMPLETED, stale, now=now)
-    assert is_duplicate_request_status(REQUEST_EFFECT_DONE, stale, now=now)
+    assert is_duplicate_request_status(REQUEST_COMPLETED, stale, write_verb=False, now=now)
+    assert is_duplicate_request_status(REQUEST_EFFECT_DONE, stale, write_verb=False, now=now)
 
     # No timestamp at all -- e.g. a caller that only has the plain status
     # string -- keeps the old, safe behavior: still a duplicate.
-    assert is_duplicate_request_status(REQUEST_PROCESSING)
+    assert is_duplicate_request_status(REQUEST_PROCESSING, write_verb=False)
+
+
+def test_a_stale_processing_row_never_ages_out_for_a_write():
+    """A write records `processing`, does its side effect, THEN records
+    `effect_done` -- a crash between the last two leaves a stale
+    `processing` row for a write that DID happen. Aging it out would let a
+    resend repeat it (a second invite to real attendees), so for a write
+    it stays a duplicate however old it is."""
+    now = datetime(2026, 9, 23, 12, 0, 0, tzinfo=timezone.utc)
+    stale = datetime(2026, 9, 23, 11, 0, 0, tzinfo=timezone.utc).isoformat()
+    assert is_duplicate_request_status(REQUEST_PROCESSING, stale, write_verb=True, now=now)
 
 
 def test_get_request_status_detail_returns_the_last_matching_row():
@@ -235,6 +247,48 @@ def test_sheets_get_request_status_detail_returns_the_last_matching_row_and_its_
     detail = store.get_request_status_detail("req_x")
     assert detail is not None
     assert detail[0] == REQUEST_COMPLETED  # last row wins, same as get_request_status
+
+
+def _batch_lifecycle(store) -> None:
+    store.record_requests("a@example.com", ["req_1", "req_2", "req_3"], date(2026, 9, 22))
+    store.set_request_statuses([("req_1", REQUEST_PROCESSING), ("req_2", REQUEST_PROCESSING)], "a@example.com")
+    store.set_request_statuses([("req_1", REQUEST_COMPLETED)], "a@example.com")
+    store.set_request_statuses([], "a@example.com")  # a batch where nothing ran
+
+
+@pytest.mark.parametrize("make_store", [
+    InMemoryStateStore,
+    lambda: SheetsStateStore(spreadsheet_id="sheet_1", service=FakeSheetsService()),
+])
+def test_batch_state_methods_match_their_single_forms(make_store):
+    store = make_store()
+    _batch_lifecycle(store)
+    assert store.count_today("a@example.com", date(2026, 9, 22)) == 3
+    details = store.get_request_status_details(["req_1", "req_2", "req_missing"])
+    assert set(details) == {"req_1", "req_2"}
+    assert details["req_1"][0] == REQUEST_COMPLETED  # last row wins
+    assert details["req_1"] == store.get_request_status_detail("req_1")
+    assert details["req_2"][0] == REQUEST_PROCESSING
+
+
+def test_sheets_batch_methods_write_each_tab_once_however_many_ids():
+    svc = FakeSheetsService()
+    store = SheetsStateStore(spreadsheet_id="sheet_1", service=svc)
+    calls: list[str] = []
+    real_append_rows = store._append_rows
+
+    def counting_append_rows(tab, last_col, rows):
+        calls.append(tab)
+        real_append_rows(tab, last_col, rows)
+
+    store._append_rows = counting_append_rows  # type: ignore[method-assign]
+    store.record_requests("a@example.com", [f"req_{i}" for i in range(25)], date(2026, 9, 22))
+    store.set_request_statuses([(f"req_{i}", REQUEST_PROCESSING) for i in range(25)], "a@example.com")
+    assert calls == ["daily_counts", "request_status"]
+    for tab, row in svc.appended:
+        assert row and str(row[0]).strip(), f"blank first cell appended to {tab}: {row}"
+    with pytest.raises(ValueError):
+        store.set_request_statuses([("req_ok", REQUEST_PROCESSING), ("", REQUEST_PROCESSING)])
 
 
 def test_sheets_upgrades_an_existing_spreadsheet_in_place_and_ignores_legacy_tab():

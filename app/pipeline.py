@@ -39,9 +39,10 @@ Guarantees, in order of where processing can stop:
 casing around it: app/request_parser.py resolves a `verb: batch` block
 entirely at Layer 2 into N ordinary ParsedRequests (never a real Verb the
 policy engine knows about), and each one runs independently through
-_run_batch_item -- its own dedupe, policy decision, execution, quota
-slot, and eventual audit record (tagged with the outer request's id as
-`batch_id`). Still exactly ONE reply per webhook: render_batch_reply
+_run_batch/_run_batch_item -- its own dedupe, policy decision,
+execution, quota slot, and eventual audit record (tagged with the outer
+request's id as `batch_id`). The Sheets bookkeeping for those is done
+once per batch, not once per item (see _run_batch: Sheets' write quota). Still exactly ONE reply per webhook: render_batch_reply
 (app/reply_guard.py) combines every item's own rendering into one email.
 Two things are deliberately NOT per-item, for cost and latency reasons:
 inbound injection screening (the whole batch block is screened ONCE,
@@ -97,6 +98,7 @@ from app.policy import (
     apply_extra_params_gate,
     apply_screen_gate,
     evaluate_policy,
+    is_write_verb,
     parse_error_decision,
 )
 from app.reader_llm import ReaderLLM
@@ -182,6 +184,12 @@ class _RequestState:
     output: OutputScreenResult | None = None
     output_reply_sensitive: float | None = None
     output_reply_injection: float | None = None
+    # The sender's daily count as read for the rate-cap check, plus how
+    # many slots this webhook then recorded -- enough to report
+    # requests_remaining_today without re-reading the daily_counts tab
+    # (exact, since app/main.py runs one request at a time on one instance).
+    quota_used_before: int | None = None
+    quota_consumed: int = 0
     # Populated only for a `batch` request (state.parsed.verb == "batch"):
     # one finished _RequestState per item, run independently through
     # Layers 1(request)-4. `output` above holds the COMBINED (unscoped)
@@ -331,20 +339,26 @@ def handle_webhook(
 
     # ── Layer 5: reply ───────────────────────────────────────────────────
     _send(state, agentmail_client, state_store)
-    _append_audit(audit_log, _audit_record(state))
-    _finalize_request_status(state, state_store)
-    if state.batch_items is not None:
+    if state.batch_items is None:
+        _append_audit(audit_log, _audit_record(state))
+        _finalize_request_statuses([state], state_store)
+    else:
         # Each item gets its own final status and its own audit record
         # (batch_id = the outer request_id, for correlation) -- deferred
         # until here, rather than inside _run_batch, so each one reflects
         # whether the ONE combined reply actually reached the requester
         # (reply_error/reply_message_id), exactly like a standalone
-        # request's own audit record does.
+        # request's own audit record does. Written as ONE audit append and
+        # ONE status append for the whole batch, not one each per item
+        # (Sheets' write quota -- see _run_batch).
         for item_state in state.batch_items:
             item_state.reply_error = state.reply_error
             item_state.reply_message_id = state.reply_message_id
-            _finalize_request_status(item_state, state_store)
-            _append_audit(audit_log, _audit_record(item_state, batch_id=state.parsed.request_id))
+        _append_audits(audit_log, [
+            _audit_record(state),
+            *(_audit_record(item_state, batch_id=state.parsed.request_id) for item_state in state.batch_items),
+        ])
+        _finalize_request_statuses([state, *state.batch_items], state_store)
     return WebhookOutcome(200, state.outcome_reason)
 
 
@@ -377,7 +391,8 @@ def _run_request(
     the stage it escaped from, for the audit record."""
     stage = "layer1"
     try:
-        if state_store.count_today(state.sender) >= MAX_REQUESTS_PER_DAY:
+        state.quota_used_before = state_store.count_today(state.sender)
+        if state.quota_used_before >= MAX_REQUESTS_PER_DAY:
             _early_return(state, "rate_limited", "rate_limited")
             return stage
 
@@ -407,7 +422,7 @@ def _run_request(
         stage = "layer1"
         prior = state_store.get_request_status_detail(state.parsed.request_id)
         prior_status, prior_updated_at = prior if prior is not None else (None, None)
-        if is_duplicate_request_status(prior_status, prior_updated_at):
+        if is_duplicate_request_status(prior_status, prior_updated_at, write_verb=is_write_verb(state.parsed.verb)):
             _early_return(state, "duplicate_request", "duplicate_request", reply_status="duplicate")
             return stage
         state_store.set_request_status(state.parsed.request_id, REQUEST_PROCESSING, state.sender)
@@ -436,6 +451,7 @@ def _run_request(
             return stage
 
         state_store.record_request(state.sender, state.parsed.request_id)
+        state.quota_consumed = 1
 
         # ── Layer 3: policy ──────────────────────────────────────────────
         stage = "layer3"
@@ -609,31 +625,19 @@ def _run_batch_item(
     drive_client_factory: Callable[[], DriveClient],
     output_screen: OutputScreen,
 ) -> None:
-    """One batch item's Layers 1(request)-4, mirroring _run_request's
-    single-request flow exactly (dedupe, PROCESSING/EFFECT_DONE, policy,
-    execute) -- the only difference is `injection_score` is the shared
-    score the whole email was screened with once (see _run_batch's
-    docstring), never a fresh per-item Jev call, and output screening is
-    NOT done here (deferred to one combined call across every item, in
-    _run_batch, for the same reason: BATCH_MAX_ITEMS separate Jev calls in
-    one request risks the Cloud Run timeout). An exception here is caught
-    and turned into that item's own error status -- one item's failure
-    must not abort the rest of the batch."""
+    """One batch item's Layers 3-4, mirroring _run_request's single-request
+    flow exactly (policy, execute, EFFECT_DONE) -- Layer 1 (cap, dedupe,
+    PROCESSING) was already done for every item at once by _run_batch.
+    `injection_score` is the shared score the whole email was screened with
+    once (see _run_batch's docstring), never a fresh per-item Jev call, and
+    output screening is NOT done here (deferred to one combined call across
+    every item, in _run_batch, for the same reason: BATCH_MAX_ITEMS separate
+    Jev calls in one request risks the Cloud Run timeout). An exception here
+    is caught and turned into that item's own error status -- one item's
+    failure must not abort the rest of the batch."""
     parsed = item_state.parsed
+    stage = "layer3"
     try:
-        if state_store.count_today(item_state.sender) >= MAX_REQUESTS_PER_DAY:
-            _early_return(item_state, "rate_limited", "rate_limited")
-            return
-
-        prior = state_store.get_request_status_detail(parsed.request_id)
-        prior_status, prior_updated_at = prior if prior is not None else (None, None)
-        if is_duplicate_request_status(prior_status, prior_updated_at):
-            _early_return(item_state, "duplicate_request", "duplicate_request", reply_status="duplicate")
-            return
-        state_store.set_request_status(parsed.request_id, REQUEST_PROCESSING, item_state.sender)
-        item_state.request_started = True
-        state_store.record_request(item_state.sender, parsed.request_id)
-
         if parsed.parse_error:
             item_state.decision = parse_error_decision(parsed.verb, parsed.parse_error, parsed.parse_error_detail)
         else:
@@ -641,11 +645,16 @@ def _run_batch_item(
             item_state.decision = apply_screen_gate(item_state.decision, injection_score, INJECTION_DENY_THRESHOLD)
             item_state.decision = apply_extra_params_gate(item_state.decision, injection_score, INJECTION_DENY_THRESHOLD)
 
+        stage = "layer4"
         item_state.results = _execute(
             item_state.decision, parsed, gmail_client_factory, calendar_client_factory, drive_client_factory,
             invite_guard=_make_invite_guard(output_screen),
         )
         if item_state.results.wrote:
+            # Per item, straight after its own side effect -- not batched
+            # with the others: a crash later in the batch must not lose the
+            # record that this write happened (app/state_store.py).
+            stage = "layer1"
             state_store.set_request_status(parsed.request_id, REQUEST_EFFECT_DONE, item_state.sender)
 
         item_state.reply_status, item_state.error_code = _status_for_decision(item_state.decision)
@@ -654,8 +663,8 @@ def _run_batch_item(
         item_state.reply_status, item_state.error_code, item_state.retryable = "denied", denied.error_code, False
     except Exception as exc:
         failure = classify_failure(exc)
-        logger.exception("batch item %s failed (%s)", parsed.request_id, failure.code)
-        item_state.failure_code, item_state.failure_type = failure.code, type(exc).__name__
+        logger.exception("batch item %s failed at %s (%s)", parsed.request_id, stage, failure.code)
+        item_state.failure_code, item_state.failure_stage, item_state.failure_type = failure.code, stage, failure.type_name
         if item_state.results.wrote and item_state.decision is not None:
             # Same rule as the top-level handler: the write already
             # happened, so report it as done rather than inviting a
@@ -696,31 +705,74 @@ def _run_batch(
     output_screen: OutputScreen,
 ) -> tuple[list[_RequestState], OutputScreenResult | None]:
     """Runs every item in state.parsed.batch_items independently, each
-    through the exact same per-request pipeline a standalone request
-    uses (_run_batch_item) -- own dedupe, own policy decision, own
-    execution, own quota slot, own eventual audit record (appended by the
-    caller, app/handle_webhook, once the combined reply's send outcome is
-    known). Returns the finished per-item states plus the ONE combined
-    output-screen result (used for the outer reply's aggregate
-    withheld_count/screen, and scoped per item on each item_state.output
-    for render_batch_reply)."""
-    item_states: list[_RequestState] = []
-    for item_parsed in state.parsed.batch_items:
-        item_state = _RequestState(
+    through the same per-request pipeline a standalone request uses -- own
+    dedupe, own policy decision, own execution, own quota slot, own
+    eventual audit record (appended by the caller, app/handle_webhook,
+    once the combined reply's send outcome is known). Returns the finished
+    per-item states plus the ONE combined output-screen result (used for
+    the outer reply's aggregate withheld_count/screen, and scoped per item
+    on each item_state.output for render_batch_reply).
+
+    Layer 1 is done for all items at once, not per item: one read of the
+    request_status tab, the daily cap decided in memory from the count
+    _run_request already read, then one append each for the quota rows and
+    the PROCESSING rows. Done per item, a batch cost ~7 sequential Sheets
+    calls per item -- a 25-item batch overran Sheets' 60-writes-per-minute
+    per-user quota mid-request (429s, and audit records lost to Cloud
+    Logging) and ate most of the Cloud Run timeout. Every PROCESSING row
+    still lands before any item executes, so a write is never performed
+    without its request_id already claimed."""
+    item_states = [
+        _RequestState(
             message_id=state.message_id, sender=state.sender, parsed=item_parsed,
             injection_score=state.injection_score, payload_injection_score=state.payload_injection_score,
             injection_screen_status=state.injection_screen_status,
         )
+        for item_parsed in state.parsed.batch_items
+    ]
+
+    used = state.quota_used_before if state.quota_used_before is not None else state_store.count_today(state.sender)
+    prior = state_store.get_request_status_details([item_state.parsed.request_id for item_state in item_states])
+    claimed: set[str] = set()
+    runnable: list[_RequestState] = []
+    for item_state in item_states:
+        request_id = item_state.parsed.request_id
+        if used + len(runnable) >= MAX_REQUESTS_PER_DAY:
+            _early_return(item_state, "rate_limited", "rate_limited")
+            continue
+        prior_status, prior_updated_at = prior.get(request_id, (None, None))
+        # `claimed`: a request_id repeated within this same batch is a
+        # duplicate of its first occurrence, as if that one had already
+        # recorded PROCESSING (the rows aren't written until below).
+        if request_id in claimed or is_duplicate_request_status(
+            prior_status, prior_updated_at, write_verb=is_write_verb(item_state.parsed.verb)
+        ):
+            _early_return(item_state, "duplicate_request", "duplicate_request", reply_status="duplicate")
+            continue
+        claimed.add(request_id)
+        runnable.append(item_state)
+
+    runnable_ids = [item_state.parsed.request_id for item_state in runnable]
+    # Quota rows first: if the PROCESSING append then fails, the worst
+    # case is spent quota slots, never a claimed request_id that didn't run.
+    state_store.record_requests(state.sender, runnable_ids)
+    state.quota_consumed = len(runnable_ids)
+    state_store.set_request_statuses([(request_id, REQUEST_PROCESSING) for request_id in runnable_ids], state.sender)
+    for item_state in runnable:
+        item_state.request_started = True
         _run_batch_item(
             item_state, state_store=state_store, injection_score=state.injection_score,
             gmail_client_factory=gmail_client_factory, calendar_client_factory=calendar_client_factory,
             drive_client_factory=drive_client_factory, output_screen=output_screen,
         )
-        item_states.append(item_state)
 
     combined_output = _screen_batch_output(output_screen, item_states)
-    for i, item_state in enumerate(item_states):
-        item_state.output = scoped_output(combined_output, f"item{i}") if combined_output is not None else None
+    if combined_output is not None:
+        for i, item_state in enumerate(item_states):
+            scoped = scoped_output(combined_output, f"item{i}")
+            # An item with nothing to screen gets no output result at all,
+            # the same as a standalone request with no result content.
+            item_state.output = scoped if scoped.verdicts else None
 
     return item_states, combined_output
 
@@ -753,10 +805,14 @@ def _send(state: _RequestState, agentmail_client: AgentMailClient, state_store) 
     falls back to a minimal status-only reply, and a send failure is
     recorded on the audit record instead of being lost."""
     requests_remaining_today: int | None = None
-    try:
-        requests_remaining_today = max(0, MAX_REQUESTS_PER_DAY - state_store.count_today(state.sender))
-    except Exception:
-        logger.exception("could not compute requests_remaining_today for %s", state.sender)
+    if state.quota_used_before is not None:
+        requests_remaining_today = max(0, MAX_REQUESTS_PER_DAY - state.quota_used_before - state.quota_consumed)
+    else:
+        # The rate-cap read itself never happened or failed -- try once more.
+        try:
+            requests_remaining_today = max(0, MAX_REQUESTS_PER_DAY - state_store.count_today(state.sender))
+        except Exception:
+            logger.exception("could not compute requests_remaining_today for %s", state.sender)
     try:
         if state.batch_items is not None:
             body = render_batch_reply(
@@ -805,25 +861,33 @@ def _send(state: _RequestState, agentmail_client: AgentMailClient, state_store) 
         state.reply_error = type(exc).__name__
 
 
-def _finalize_request_status(state: _RequestState, state_store) -> None:
-    """The request's last status row (app/state_store.py). A resend may run
-    again only from FAILED: a read whose reply never arrived, or anything
-    that errored before a side effect. A write that happened stays at
-    EFFECT_DONE unless its reply was delivered."""
+def _final_request_status(state: _RequestState) -> str | None:
+    """The request's last status row (app/state_store.py), or None if it
+    never got as far as recording one. A resend may run again only from
+    FAILED: a read whose reply never arrived, or anything that errored
+    before a side effect. A write that happened stays at EFFECT_DONE unless
+    its reply was delivered."""
     if not state.request_started:
-        return
+        return None
     wrote = state.results.wrote
     replied = state.reply_error is None
     if wrote:
-        status = REQUEST_COMPLETED if replied else REQUEST_EFFECT_DONE
-    elif state.reply_status == "error" or not replied:
-        status = REQUEST_FAILED
-    else:
-        status = REQUEST_COMPLETED
+        return REQUEST_COMPLETED if replied else REQUEST_EFFECT_DONE
+    if state.reply_status == "error" or not replied:
+        return REQUEST_FAILED
+    return REQUEST_COMPLETED
+
+
+def _finalize_request_statuses(states: list[_RequestState], state_store) -> None:
+    """Every final status row in ONE append (a batch's outer request plus
+    all its items -- see _run_batch). Never raises."""
+    statuses = [(s.parsed.request_id, status) for s in states if (status := _final_request_status(s)) is not None]
+    if not statuses:
+        return
     try:
-        state_store.set_request_status(state.parsed.request_id, status, state.sender)
+        state_store.set_request_statuses(statuses, states[0].sender)
     except Exception:
-        logger.exception("could not record final status %s for request %s", status, state.parsed.request_id)
+        logger.exception("could not record final statuses %s", statuses)
 
 
 def _audit_record(state: _RequestState, *, batch_id: str | None = None) -> AuditRecord:
@@ -895,6 +959,17 @@ def _append_audit(audit_log: AuditLog, record: AuditRecord) -> None:
         audit_log.append(record)
     except Exception:
         logger.exception("audit append failed; record follows: %s", json.dumps(_record_for_log(record), sort_keys=True))
+
+
+def _append_audits(audit_log: AuditLog, records: list[AuditRecord]) -> None:
+    """_append_audit for several records in ONE write (a batch -- see
+    _run_batch), with the same never-raise, log-it-instead fallback."""
+    try:
+        audit_log.append_many(records)
+    except Exception:
+        logger.exception("audit append of %d records failed; records follow", len(records))
+        for record in records:
+            logger.error("unwritten audit record: %s", json.dumps(_record_for_log(record), sort_keys=True))
 
 
 def _record_for_log(record: AuditRecord) -> dict[str, Any]:

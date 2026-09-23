@@ -382,6 +382,16 @@ VERB_PARAMS: dict[Verb, frozenset[str]] = {verb: spec.param_names for verb, spec
 # Verbs with a side effect outside this service. The injection-screen gate
 # (apply_screen_gate) applies to these only.
 WRITE_VERBS = frozenset(verb for verb, spec in VERB_SPECS.items() if spec.is_write)
+
+
+def is_write_verb(verb_raw: str) -> bool:
+    """For callers holding a parsed request's raw verb string (Layer 1's
+    request dedupe, app/state_store.py's is_duplicate_request_status)."""
+    try:
+        return Verb(verb_raw) in WRITE_VERBS
+    except ValueError:
+        return False
+
 # Extra parameters that are REFUSED instead of ignored, because ignoring
 # them would silently do something different from what was asked: the old
 # `attendees` on update_event meant "replace the guest list", so a request

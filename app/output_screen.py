@@ -190,10 +190,14 @@ def scoped_output(result: OutputScreenResult, prefix: str) -> OutputScreenResult
     the item's own, unprefixed keys, and withheld_count/max_sensitive/etc.
     are correctly scoped to just that item, for its own audit record."""
     ns = f"{prefix}:"
-    return OutputScreenResult(
-        verdicts={key[len(ns):]: v for key, v in result.verdicts.items() if key.startswith(ns)},
-        status=result.status,
-    )
+    verdicts = {key[len(ns):]: v for key, v in result.verdicts.items() if key.startswith(ns)}
+    status = result.status
+    if status == "degraded" and all(v.screened for v in verdicts.values()):
+        # "degraded" means SOME item in the combined call couldn't be
+        # screened -- only an item that was itself one of them should
+        # carry it (and render the "screening was unavailable" note).
+        status = "ok"
+    return OutputScreenResult(verdicts=verdicts, status=status)
 
 
 class OutputScreen(Protocol):

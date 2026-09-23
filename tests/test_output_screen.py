@@ -148,6 +148,19 @@ def test_all_withheld_helper_follows_the_fail_mode():
     assert all_withheld(["a", "b"], fail_closed=False).withheld_count == 0
 
 
+def test_scoped_output_is_degraded_only_for_the_item_that_was():
+    combined = out.OutputScreenResult(
+        verdicts={
+            "item0:gmail:0": out.ItemVerdict(0.1, 0.1, None, withheld=False, screened=True),
+            "item1:gmail:0": out.ItemVerdict(None, None, None, withheld=True, screened=False),
+        },
+        status="degraded",
+    )
+    assert out.scoped_output(combined, "item0").status == "ok"
+    assert out.scoped_output(combined, "item1").status == "degraded"
+    assert out.scoped_output(combined, "item1").is_withheld("gmail:0")
+
+
 def test_item_text_skips_empty_fields():
     assert item_text({"subject": "Hi", "location": ""}) == "subject: Hi"
 

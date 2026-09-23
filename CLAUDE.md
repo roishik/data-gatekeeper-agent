@@ -93,7 +93,7 @@ Facts about production (verified 2026-09-22 with `scripts/verify_audit_chain.py`
 - **Never run live yet:** `calendar.create_event`/`update_event`/`delete_event` and
   `drive.create_file` have still never run live; the new e2e cases cover them.
 
-Tests: `uv run pytest -q`, 459 passing, fully offline (fakes behind Protocols), and run in CI.
+Tests: `uv run pytest -q`, 468 passing, fully offline (fakes behind Protocols), and run in CI.
 There are three live suites, all skipped unless `RUN_E2E=1`; they send real traffic, so run
 them deliberately:
 - `tests/test_e2e_live.py` sends real email through the deployed service. It now also covers:
@@ -112,7 +112,7 @@ them deliberately:
 A merged review of the refactor above — my own pass plus Instinct's own review of the branch,
 posted as the sole comment on PR #1 — found one real security gap and a list of smaller issues
 and protocol-UX gaps. All fixed on `refactor/hardening-2026-09` (one commit per item), on top of
-everything above, still undeployed. 459 tests passing (up from 419).
+everything above, still undeployed. 468 tests passing (up from 419).
 
 - **Calendar invite-guard gap closed (the one real bug).** `update_event` only ran the invite
   guard when `add_attendees` was given, but Google's `sendUpdates="all"` notifies EXISTING
@@ -140,7 +140,10 @@ everything above, still undeployed. 459 tests passing (up from 419).
   finishing used to leave that request_id stuck as a duplicate forever, with resend replies
   falsely claiming an earlier reply existed. A `processing` row older than
   `PROCESSING_STALE_AFTER_SECONDS` (600s default) is no longer a duplicate; the resend actually
-  re-runs.
+  re-runs. **Reads only** (fixed after the PR #1 review): a write records `processing`, performs
+  its side effect, then records `effect_done`, so a stale `processing` row for a write may mean
+  the write DID happen. A stuck write stays a duplicate forever rather than risk a second
+  invite/draft/file (`is_duplicate_request_status(..., write_verb=...)`).
 - **URLs are no longer redacted from replies** (owner's decision, reversing the original
   refactor's behavior): I want Instinct able to see and act on a link someone shared. Jev's
   outbound "targets the reader" screen remains the defense against a link crafted to phish or
@@ -174,7 +177,14 @@ everything above, still undeployed. 459 tests passing (up from 419).
   request — a high score anywhere in it gates every WRITE item, the safe direction to be
   imprecise in) and outbound screening (every item's output goes through one combined Jev call,
   `app/output_screen.py`'s new `scoped_output()` splitting verdicts back out per item) — 25
-  separate Jev calls in one request would risk the Cloud Run timeout.
+  separate Jev calls in one request would risk the Cloud Run timeout. Layer 1 bookkeeping is
+  also batched (fixed after the PR #1 review): one `request_status` read, the cap decided in
+  memory, one append each for quota rows, `processing` rows, final statuses and audit records
+  (`StateStore.get_request_status_details`/`set_request_statuses`/`record_requests`,
+  `AuditLog.append_many`). Per item it had been ~7 sequential Sheets calls, so a 25-item batch
+  overran Sheets' 60-writes/min per-user quota. Only a write item's `effect_done` is still
+  written per item, straight after its side effect. An item reusing the batch's own
+  request_id is denied under a placeholder id.
 - **`calendar.list_events` echoes its resolved date window** in the reply prose ("Found N
   event(s) for Tue Sep 23"), matching what `create_event` already does for its resolved time —
   `day_offset` resolves at PROCESSING time, not composition time, so an email sent near local
@@ -277,7 +287,7 @@ under one process-wide lock) → `pipeline.handle_webhook`:
 1. `state_store.py` (Sheets): message dedupe (before anything else), request status and the
    daily cap. From here on, every path ends in one reply and one audit record
    (`failures.py`). A `processing` row older than `PROCESSING_STALE_AFTER_SECONDS` is treated as
-   abandoned, not a duplicate.
+   abandoned, not a duplicate, for a read verb only; a write's stays a duplicate.
 2. `request_parser.py` works in order:
    - `split_email` pulls out payload sections first;
    - exactly one fenced `---GATEKEEPER-REQUEST---` YAML block (parsed with a narrowed

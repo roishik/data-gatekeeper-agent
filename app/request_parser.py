@@ -341,6 +341,19 @@ def _parse_batch(batch_request_id: str, params: dict[str, Any], parts: EmailPart
                 parse_error="invalid_request_block", parse_error_detail=f"batch item {i}: a batch cannot contain another batch",
             ))
             continue
+        if item_id == batch_request_id:
+            # The outer request_id is recorded as `processing` before any
+            # item runs, so an item sharing it would always be answered
+            # `duplicate` (falsely claiming an earlier reply) and its final
+            # status row would overwrite the batch's own. Denied under a
+            # placeholder id so it can't touch the batch's status row.
+            items.append(ParsedRequest(
+                request_id=f"{batch_request_id}-item{i}",
+                verb=item_verb, params={}, source="block",
+                parse_error="invalid_request_block",
+                parse_error_detail=f"batch item {i}: request_id must differ from the batch's own request_id",
+            ))
+            continue
         if item_id in seen_ids:
             items.append(ParsedRequest(
                 request_id=item_id, verb=item_verb, params={}, source="block",

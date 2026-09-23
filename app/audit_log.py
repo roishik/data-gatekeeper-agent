@@ -188,7 +188,24 @@ def verify_chain(entries: list[dict]) -> bool:
 
 class AuditLog(Protocol):
     def append(self, record: AuditRecord) -> dict: ...
+    # Several records, chained in order, in ONE write -- a `batch` request
+    # (app/pipeline.py) audits one record per item, and one Sheets append
+    # per record would count against the 60-writes-per-minute quota.
+    def append_many(self, records: list[AuditRecord]) -> list[dict]: ...
     def all_entries(self) -> list[dict]: ...
+
+
+def _chain(records: list[AuditRecord], prev_hash: str) -> list[dict]:
+    """The hash-chained entries for `records`, in order, starting after
+    `prev_hash` -- exactly what the same records appended one at a time
+    would produce."""
+    entries: list[dict] = []
+    for record in records:
+        record_dict = _record_dict(record)
+        entry_hash = compute_entry_hash(record_dict, prev_hash)
+        entries.append({"record": record_dict, "prev_hash": prev_hash, "hash": entry_hash})
+        prev_hash = entry_hash
+    return entries
 
 
 class JSONLAuditLog:
@@ -214,13 +231,16 @@ class JSONLAuditLog:
         return last_hash
 
     def append(self, record: AuditRecord) -> dict:
-        record_dict = _record_dict(record)
-        entry_hash = compute_entry_hash(record_dict, self._prev_hash)
-        entry = {"record": record_dict, "prev_hash": self._prev_hash, "hash": entry_hash}
+        return self.append_many([record])[0]
+
+    def append_many(self, records: list[AuditRecord]) -> list[dict]:
+        entries = _chain(records, self._prev_hash)
         with self._path.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
-        self._prev_hash = entry_hash
-        return entry
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+        if entries:
+            self._prev_hash = entries[-1]["hash"]
+        return entries
 
     def all_entries(self) -> list[dict]:
         if not self._path.exists():
@@ -264,9 +284,12 @@ class SheetsAuditLog:
         return json.loads(rows[-1][0])["hash"] if rows else GENESIS_HASH
 
     def append(self, record: AuditRecord) -> dict:
-        record_dict = _record_dict(record)
-        entry_hash = compute_entry_hash(record_dict, self._prev_hash)
-        entry = {"record": record_dict, "prev_hash": self._prev_hash, "hash": entry_hash}
+        return self.append_many([record])[0]
+
+    def append_many(self, records: list[AuditRecord]) -> list[dict]:
+        entries = _chain(records, self._prev_hash)
+        if not entries:
+            return entries
         # One JSON blob per row, not one column per field: the record
         # shape is expected to grow (new verbs, new verdicts), and a
         # single-column append needs no migration when AuditRecord gains
@@ -278,10 +301,12 @@ class SheetsAuditLog:
             range=self._RANGE,
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
-            body={"values": [[json.dumps(entry)]]},
+            body={"values": [[json.dumps(entry)] for entry in entries]},
         ).execute()
-        self._prev_hash = entry_hash
-        return entry
+        # Only advanced once the write succeeded, so a failed append never
+        # leaves the next record chained to rows that aren't in the sheet.
+        self._prev_hash = entries[-1]["hash"]
+        return entries
 
     def all_entries(self) -> list[dict]:
         result = self._service.spreadsheets().values().get(spreadsheetId=self.spreadsheet_id, range=self._RANGE).execute()
