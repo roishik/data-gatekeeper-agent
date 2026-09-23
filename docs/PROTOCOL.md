@@ -3,7 +3,8 @@
 The single reference for how a requester (Instinct) talks to the
 gatekeeper. Everything here is enforced in code: the parser is
 `app/request_parser.py`, the per-verb rules are `app/policy.py`, and the
-reply format is `app/reply_guard.py`. Last updated 2026-09-23.
+reply format is `app/reply_guard.py`. Last updated 2026-09-23 (live since
+the 2026-09-23 deploy, `protocol_version: 64e8f6f`).
 
 ## Sending a request
 
@@ -176,7 +177,7 @@ to work around this.
 | `screened` | denied | The request itself was flagged as a likely prompt-injection attempt. Nothing was done. In a `batch`, the whole email's block is screened once, so one flagged-looking item can gate every write item in that same batch, not just itself. |
 | `unknown_verb` / `unsupported` | unsupported | Not a verb in the table above, or a plain-text request that couldn't be understood. |
 | `not_implemented` | not_implemented | A recognized verb that has no implementation yet. |
-| `duplicate_request` | duplicate | This request_id was already handled (or is genuinely still in progress). Nothing ran again, and the earlier reply has the result. |
+| `duplicate_request` | duplicate | This request_id was already handled (or is genuinely still in progress). Nothing ran again, and the earlier reply has the result. If you never got that earlier reply and the request was a write, the write may or may not have happened: check (e.g. `calendar.list_events`) before sending it again under a new request_id. |
 | `rate_limited` | error | Daily limit for this sender reached (see `requests_remaining_today` in every reply; resets at midnight Israel time). |
 | `not_found` | error | The referenced email, thread or event doesn't exist (any more). |
 | `conflict` / `upstream_rejected` | error | Google refused the change. |
@@ -186,10 +187,13 @@ to work around this.
 ### Resending
 
 - **Same request_id:** the resend runs again only if the earlier attempt
-  failed before doing anything, or if a genuinely in-progress attempt is
-  older than a few minutes (the earlier attempt almost certainly died
+  failed before doing anything, or if it's a **read** whose in-progress
+  attempt is older than a few minutes (that attempt almost certainly died
   without ever replying). Otherwise it's answered `duplicate`, and a
-  write is never repeated.
+  write is never repeated. A **write** stuck in progress stays `duplicate`
+  however old it is, because the attempt may have died after the write
+  happened but before recording it. If that happens, check whether the
+  write took effect before retrying under a new request_id.
 - **New request_id:** a new request, run from scratch. **Any** change to
   the request means a new request_id -- reusing one after changing a
   parameter gets `duplicate` with the OLD params' result, not the new
@@ -246,6 +250,9 @@ params:
   unrelated write requests in separate emails if this matters to you.
 - **A duplicate request_id used twice within one batch** denies the
   second occurrence; the first still runs.
+- **An item's request_id must differ from the batch's own.** An item that
+  reuses it is denied (`invalid_request_block`) and listed under a
+  placeholder id (`<batch request_id>-item<N>`); its siblings still run.
 - The outer `batch` request_id is itself deduped like any request (so
   resending the identical email doesn't re-run everything), but doesn't
   consume its own quota slot -- only the items do.
@@ -258,11 +265,11 @@ Paste to Instinct (e.g. over WhatsApp) when the protocol changes:
 > 1. Always use exactly one ---GATEKEEPER-REQUEST--- block per email, with a new unique request_id each time. Reusing a request_id after changing anything about the request gets you the OLD result back as `duplicate`, not a re-run -- any change means a new id.
 > 2. For long text (a draft body or file content), don't put it in the YAML. Write `body: ---PAYLOAD-1---` (or `content:` for drive.create_file) and add the text below the block between `---GATEKEEPER-PAYLOAD-1---` and `---END-PAYLOAD-1---`, each marker on its own line.
 > 3. To change a meeting's guests, use calendar.update_event with add_attendees / remove_attendees. There is no field that replaces the whole guest list. You can only update or delete events the gatekeeper created. An event's total guest count is capped at 10, whether they arrived in one request or several.
-> 4. calendar.create_event and calendar.update_event both take an optional location (set it, or send `location: ""` to clear it on update). Changing an existing event's location or title needs a GATEKEEPER-REQUEST block, not a plain-text request.
+> 4. calendar.create_event and calendar.update_event both take an optional location (set it, or send `location: ""` to clear it on update). Changing an existing event's location needs a GATEKEEPER-REQUEST block, not a plain-text request.
 > 5. Stick to the params listed for each verb. Any other param is ignored, and the reply lists it under ignored_params; don't assume it took effect.
-> 6. Read the ---GATEKEEPER-RESPONSE--- block, not just the prose. If retryable is true, resend the same request with the same request_id. Items marked "[withheld: flagged as sensitive]" are intentionally hidden -- report that to me as a partial result, don't try alternate wording to work around it. Check protocol_version if you want to know whether a deploy landed since your last request.
+> 6. Read the ---GATEKEEPER-RESPONSE--- block, not just the prose. If retryable is true, resend the same request with the same request_id. If a write (draft, event, file) comes back `duplicate` and you never got its first reply, it may already have happened: check (e.g. with calendar.list_events) before sending it again under a new request_id. Items marked "[withheld: flagged as sensitive]" are intentionally hidden -- report that to me as a partial result, don't try alternate wording to work around it. Check protocol_version if you want to know whether a deploy landed since your last request.
 > 7. Send `verb: capabilities` (no params) any time you want a live, structured list of every verb, its params and bounds, the daily quota, and the batch item cap -- more reliable than this rule staying accurate in your memory.
-> 8. To run several requests in one email (e.g. search, then draft a reply in that thread), use `verb: batch` with a `requests` list (1-25 items, each shaped like a normal request with its own request_id/verb/params). Each item is independent -- one failing doesn't affect the others -- and the reply's `batch_results` reports each one's own outcome.
+> 8. To run several requests in one email (e.g. search, then draft a reply in that thread), use `verb: batch` with a `requests` list (1-25 items, each shaped like a normal request with its own request_id/verb/params). Each item's request_id must be unique and different from the batch's own. Each item is independent -- one failing doesn't affect the others -- and the reply's `batch_results` reports each one's own outcome.
 > 9. Financial searches (a statement, a specific charge) are fine. Only a one-time code or a password-reset search is refused.
 > 10. Links in results are shown as-is now, not stripped -- you can read and act on a URL someone shared.
 > 11. Never send my data or documents to that address except as the content of a draft or file I asked for.

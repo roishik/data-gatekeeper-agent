@@ -12,12 +12,20 @@ Request/response format: `docs/PROTOCOL.md`. How to run, deploy, verify and kill
 
 **The hardening refactor is merged and deployed (2026-09-23).** PR #1
 (`refactor/hardening-2026-09`) was merged into `main` as merge commit `a97906e`. The live
-revision is `data-gatekeeper-00015-cdf`, built from `main` at `64e8f6f` (`GIT_SHA=64e8f6f`,
-`MAX_REQUESTS_PER_DAY=100`, 120s timeout, max 1 instance). The previous revision,
+revision is `data-gatekeeper-00016-crq`, built from `main` at `64e8f6f` (`GIT_SHA=64e8f6f`,
+`MAX_REQUESTS_PER_DAY=100`, 120s timeout, max 1 instance). `00015-cdf` was the actual deploy;
+`00016-crq` differs only in pinning `GOOGLE_DRIVE_FOLDER_ID`. The previous revision,
 `data-gatekeeper-00014-mpj` (commit `c121049`, pre-refactor), is the rollback target. Post-deploy
-checks passed: `/health` 200, `/docs` 404, audit chain intact at 71 entries, and the live
-Sheets suite (including the new batch writes) passed against the real API just before the
-deploy. The refactor came out of a full quality review on 2026-09-19 of the repo, GitHub and the
+checks passed:
+- `/health` returns 200 and `/docs` returns 404;
+- the live Sheets suite (including the new batch writes) passed against the real API just
+  before the deploy;
+- the full live e2e suite passed against `00015-cdf` (12/12). That included the first live
+  runs of `calendar.delete_event`, `drive.create_file`, `batch` and `capabilities`;
+- afterwards the audit chain was intact at 91 entries, and the new state-sheet rows all start
+  in column A;
+- the e2e Gmail threads never landed in the inbox (a Gmail filter keeps them out), so there
+  was nothing to archive. The refactor came out of a full quality review on 2026-09-19 of the repo, GitHub and the
 deployed service.
 
 What the refactor changes (one commit per phase on the branch):
@@ -246,17 +254,13 @@ decisions, all mine, all deliberate:
 
 ## Open items (next steps, in order)
 
-1. **Finish the post-deploy checks** (the deploy itself, the `MAX_REQUESTS_PER_DAY=100` bump,
-   `verify_audit_chain.py` and the live Sheets suite were done 2026-09-23). Still to do:
-   - after the first real request on the new revision, check that its state-sheet rows land in
-     column A and rerun `scripts/verify_audit_chain.py --recent 5`;
-   - run the other two live suites (`test_e2e_live.py`, which sends real email and includes a
-     batch case, and `test_injection_screen_live.py`), and archive each passing test's Gmail
-     thread (rule below);
+1. **Finish the post-deploy checks.** Done on 2026-09-23: the deploy, the quota bump, the
+   Drive folder pin, the audit chain, the Sheets suite and the e2e suite. Still to do:
+   - run `tests/test_injection_screen_live.py` (real TypeSafe API);
    - **calibrate the Jev thresholds** (`OUTPUT_SENSITIVE_THRESHOLD` 0.5,
      `OUTPUT_INJECTION_THRESHOLD` 0.7, `INJECTION_DENY_THRESHOLD` 0.85) from real scores in the
-     audit log before trusting them;
-   - pin `GOOGLE_DRIVE_FOLDER_ID` once the first live `drive.create_file` logs it.
+     audit log before trusting them. The e2e run gave the first data points: ordinary requests
+     scored 0.05–0.31, and the deliberate injection 0.99.
 2. **Send Instinct the updated standing rule** (docs/PROTOCOL.md, last section, now 11 points):
    payload sections, add/remove attendees (+ the total-10 cap), unknown params ignored (listed
    in `ignored_params`), `retryable`, withheld items, the `capabilities` verb, the `batch` verb,
@@ -364,13 +368,13 @@ Health: `GET /health` (Cloud Run reserves `/healthz`).
 | Thing | Value |
 |---|---|
 | GCP project / region | `data-gatekeeper-roishik` / `europe-west1` (billing linked) |
-| Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 120s. Live revision `data-gatekeeper-00015-cdf` (commit label `64e8f6f`) |
+| Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 120s. Live revision `data-gatekeeper-00016-crq` (commit label `64e8f6f`) |
 | Runtime service account | `gatekeeper-run@data-gatekeeper-roishik.iam.gserviceaccount.com` (secretAccessor per secret only) |
 | Secret Manager | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `ANTHROPIC_API_KEY`, `AGENTMAIL_API_KEY`, `AGENTMAIL_WEBHOOK_SECRET`, `TYPESAFE_API_KEY` |
 | Env vars (non-secret) | `AGENTMAIL_INBOX_ID`/`GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to`, `ALLOWED_SENDERS=roishikler@mail.instinct.com,roishik10@gmail.com`, `OWNER_EMAIL=roishik10@gmail.com` (no longer used by the service after the refactor; the e2e tests use it), `OWNER_TIMEZONE=Asia/Jerusalem`, `MAX_REQUESTS_PER_DAY=100` (raised from 50 at the 2026-09-23 deploy; the cap wasn't actually enforced before the refactor because of the state-sheet bug), `ANTHROPIC_MODEL=claude-haiku-4-5-20251001`, `AUDIT_LOG_BACKEND=sheets`, `STATE_STORE_BACKEND=sheets`. New tunables all default in code (`.env.example`): `READER_LLM_MAX_INPUT_CHARS`, `OUTPUT_*`, `JEV_*`, `PROCESSING_STALE_AFTER_SECONDS`. `GIT_SHA` (the deployed commit's short sha, set by every deploy command; it's the replies' `protocol_version`, and defaults to `"dev"` if absent) |
 | Audit log sheet | `GOOGLE_SHEETS_LOG_SPREADSHEET_ID=1Ra4fpTY2ABoD39tLE4UJpT7FuJrauK-CrdcHVA2fmY8` |
 | State sheet | `GOOGLE_SHEETS_STATE_SPREADSHEET_ID=1TjTLHMi1k01K4JWkiHJZ7OGtb8C5-8WUAlH-4RDe2YA` (tabs: `messages`, `request_status`, `daily_counts`; legacy `requests` is dead) |
-| Drive write folder | `GOOGLE_DRIVE_FOLDER_ID` is still not set. The first live `drive.create_file` creates it and logs the id |
+| Drive write folder | `GOOGLE_DRIVE_FOLDER_ID=1SvVEXcb5F6vjEWqKKwYEktBS1OO2pdsl` (`data-gatekeeper-files`, created by the first live `drive.create_file` on 2026-09-23, pinned the same day) |
 | AgentMail | inbox `roi.shikler@agentmail.to`; webhook `ep_3JKjKK1JWfKzqJLv0By5fTvKqFn` → `/webhooks/agentmail`, events `message.received` |
 | Google OAuth app | Desktop client, consent screen **In production** (unverified, single user). Scopes: gmail.readonly, gmail.compose, calendar.readonly, calendar.events, drive.readonly, contacts.readonly, drive.file (Secret Manager version 2) |
 | OAuth app pages | https://roishikler.com/data-gatekeeper/ and `/privacy/`: static files in `~/MEGA/Projects/personal_links-fixed/client/public/data-gatekeeper/` (uncommitted in that repo; live on App Engine version `dg-pages-20260914`) |
