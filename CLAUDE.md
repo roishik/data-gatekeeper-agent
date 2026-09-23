@@ -8,12 +8,17 @@ the audit trail. Background and decisions: `README.md` (the "Decided" list) and 
 Request/response format: `docs/PROTOCOL.md`. How to run, deploy, verify and kill it:
 `docs/RUNBOOK.md`.
 
-## Current state (as of 2026-09-22)
+## Current state (as of 2026-09-23)
 
-**Hardening refactor done on branch `refactor/hardening-2026-09`. It is NOT deployed yet: the
-live revision is still `data-gatekeeper-00014-mpj` (commit `c121049`, pre-refactor).** It came
-out of a full quality review on 2026-09-19 of the repo, GitHub and the deployed service. Local
-`main` was also pushed that day, so GitHub now matches the deploy.
+**The hardening refactor is merged and deployed (2026-09-23).** PR #1
+(`refactor/hardening-2026-09`) was merged into `main` as merge commit `a97906e`. The live
+revision is `data-gatekeeper-00015-cdf`, built from `main` at `64e8f6f` (`GIT_SHA=64e8f6f`,
+`MAX_REQUESTS_PER_DAY=100`, 120s timeout, max 1 instance). The previous revision,
+`data-gatekeeper-00014-mpj` (commit `c121049`, pre-refactor), is the rollback target. Post-deploy
+checks passed: `/health` 200, `/docs` 404, audit chain intact at 71 entries, and the live
+Sheets suite (including the new batch writes) passed against the real API just before the
+deploy. The refactor came out of a full quality review on 2026-09-19 of the repo, GitHub and the
+deployed service.
 
 What the refactor changes (one commit per phase on the branch):
 - **State sheet fixed (critical).** From launch, Sheets' `values.append` shifted rows that
@@ -84,14 +89,16 @@ What the refactor changes (one commit per phase on the branch):
   - CI added, plus Dependabot and `.gcloudignore`.
   - `scripts/verify_audit_chain.py` added.
 
-Facts about production (verified 2026-09-22 with `scripts/verify_audit_chain.py`):
+Facts about production (verified 2026-09-23 with `scripts/verify_audit_chain.py`, right after
+the deploy):
 - **Instinct uses the protocol.** It sends daily fenced-block requests with unique request_ids,
-  mostly `gmail.search`. Open item #1 (the Instinct protocol test) is effectively done.
-  - It once tried a verb that doesn't exist, `drive.capabilities` — now a real verb,
-    `capabilities` (see below), so that specific gap is closed once this deploys.
-- **The audit chain is intact** (65 entries).
-- **Never run live yet:** `calendar.create_event`/`update_event`/`delete_event` and
-  `drive.create_file` have still never run live; the new e2e cases cover them.
+  mostly `gmail.search`. The original "Instinct protocol test" open item is effectively done.
+  - It once tried a verb that doesn't exist, `drive.capabilities`. `capabilities` is now a
+    real verb (see below), live since the 2026-09-23 deploy.
+- **The audit chain is intact** (71 entries, all from the pre-refactor revision so far).
+- **Writes seen live:** Instinct sent one `calendar.create_event` and one
+  `calendar.update_event` on the old revision (the update was allowed, 2026-09-23).
+  `calendar.delete_event` and `drive.create_file` have never run live; the e2e suite covers them.
 
 Tests: `uv run pytest -q`, 468 passing, fully offline (fakes behind Protocols), and run in CI.
 There are three live suites, all skipped unless `RUN_E2E=1`; they send real traffic, so run
@@ -107,12 +114,12 @@ them deliberately:
 - `tests/test_injection_screen_live.py` calls the real TypeSafe API.
 - `tests/test_sheets_live.py` uses the real Sheets API on scratch spreadsheets.
 
-## Second-round fixes (2026-09-23, same branch, still not deployed)
+## Second-round fixes (2026-09-23, merged and deployed the same day)
 
 A merged review of the refactor above — my own pass plus Instinct's own review of the branch,
 posted as the sole comment on PR #1 — found one real security gap and a list of smaller issues
 and protocol-UX gaps. All fixed on `refactor/hardening-2026-09` (one commit per item), on top of
-everything above, still undeployed. 468 tests passing (up from 419).
+everything above. 468 tests passing (up from 419).
 
 - **Calendar invite-guard gap closed (the one real bug).** `update_event` only ran the invite
   guard when `add_attendees` was given, but Google's `sendUpdates="all"` notifies EXISTING
@@ -239,14 +246,13 @@ decisions, all mine, all deliberate:
 
 ## Open items (next steps, in order)
 
-1. **Deploy the refactor**, with my go-ahead, following docs/RUNBOOK.md's procedure: merge the
-   PR, clean pushed commit, `--labels=commit=<sha> --timeout=120 --max-instances=1
-   --update-env-vars=GIT_SHA=<sha>`. Then:
-   - update the live `MAX_REQUESTS_PER_DAY` env var to 100 (code default was already wrong
-     before this deploy; don't let the live value stay at the old 50);
-   - run `scripts/verify_audit_chain.py`, and check that new state-sheet rows land in column A;
-   - run the three live suites (now including a batch case) and archive each passing test's
-     Gmail thread (rule below);
+1. **Finish the post-deploy checks** (the deploy itself, the `MAX_REQUESTS_PER_DAY=100` bump,
+   `verify_audit_chain.py` and the live Sheets suite were done 2026-09-23). Still to do:
+   - after the first real request on the new revision, check that its state-sheet rows land in
+     column A and rerun `scripts/verify_audit_chain.py --recent 5`;
+   - run the other two live suites (`test_e2e_live.py`, which sends real email and includes a
+     batch case, and `test_injection_screen_live.py`), and archive each passing test's Gmail
+     thread (rule below);
    - **calibrate the Jev thresholds** (`OUTPUT_SENSITIVE_THRESHOLD` 0.5,
      `OUTPUT_INJECTION_THRESHOLD` 0.7, `INJECTION_DENY_THRESHOLD` 0.85) from real scores in the
      audit log before trusting them;
@@ -259,10 +265,7 @@ decisions, all mine, all deliberate:
 3. Remove `roishik10@gmail.com` from `ALLOWED_SENDERS` (it was added for testing), and revoke
    Instinct's own Google access at myaccount.google.com/connections. The catch: the live e2e
    suite sends from that address, so it needs another sender first (or stays, knowingly).
-4. Old branch `fix/durable-agentmail-webhook` on GitHub. Its output framing and extra-param
-   rejection were ported; its Cloud Tasks queue was rejected (inline processing chosen). Delete
-   it once the refactor is merged, with my OK.
-5. Later:
+4. Later:
    - `drive.search` / `contacts.search`;
    - an injection test suite in CI (promptfoo/AgentDojo);
    - a daily digest;
@@ -361,10 +364,10 @@ Health: `GET /health` (Cloud Run reserves `/healthz`).
 | Thing | Value |
 |---|---|
 | GCP project / region | `data-gatekeeper-roishik` / `europe-west1` (billing linked) |
-| Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 60s live; the refactor's deploy raises it to 120s |
+| Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 120s. Live revision `data-gatekeeper-00015-cdf` (commit label `64e8f6f`) |
 | Runtime service account | `gatekeeper-run@data-gatekeeper-roishik.iam.gserviceaccount.com` (secretAccessor per secret only) |
 | Secret Manager | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `ANTHROPIC_API_KEY`, `AGENTMAIL_API_KEY`, `AGENTMAIL_WEBHOOK_SECRET`, `TYPESAFE_API_KEY` |
-| Env vars (non-secret) | `AGENTMAIL_INBOX_ID`/`GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to`, `ALLOWED_SENDERS=roishikler@mail.instinct.com,roishik10@gmail.com`, `OWNER_EMAIL=roishik10@gmail.com` (no longer used by the service after the refactor; the e2e tests use it), `OWNER_TIMEZONE=Asia/Jerusalem`, `MAX_REQUESTS_PER_DAY=50` (**not actually enforced before the refactor**: the state-sheet bug; code default is now 100 as of the second-round fixes, but the LIVE value stays 50 until updated at deploy), `ANTHROPIC_MODEL=claude-haiku-4-5-20251001`, `AUDIT_LOG_BACKEND=sheets`, `STATE_STORE_BACKEND=sheets`. New tunables all default in code (`.env.example`): `READER_LLM_MAX_INPUT_CHARS`, `OUTPUT_*`, `JEV_*`, `PROCESSING_STALE_AFTER_SECONDS`. **Not yet set anywhere**: `GIT_SHA` (needed at deploy time for the new `protocol_version` reply field; defaults to `"dev"` if absent) |
+| Env vars (non-secret) | `AGENTMAIL_INBOX_ID`/`GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to`, `ALLOWED_SENDERS=roishikler@mail.instinct.com,roishik10@gmail.com`, `OWNER_EMAIL=roishik10@gmail.com` (no longer used by the service after the refactor; the e2e tests use it), `OWNER_TIMEZONE=Asia/Jerusalem`, `MAX_REQUESTS_PER_DAY=100` (raised from 50 at the 2026-09-23 deploy; the cap wasn't actually enforced before the refactor because of the state-sheet bug), `ANTHROPIC_MODEL=claude-haiku-4-5-20251001`, `AUDIT_LOG_BACKEND=sheets`, `STATE_STORE_BACKEND=sheets`. New tunables all default in code (`.env.example`): `READER_LLM_MAX_INPUT_CHARS`, `OUTPUT_*`, `JEV_*`, `PROCESSING_STALE_AFTER_SECONDS`. `GIT_SHA` (the deployed commit's short sha, set by every deploy command; it's the replies' `protocol_version`, and defaults to `"dev"` if absent) |
 | Audit log sheet | `GOOGLE_SHEETS_LOG_SPREADSHEET_ID=1Ra4fpTY2ABoD39tLE4UJpT7FuJrauK-CrdcHVA2fmY8` |
 | State sheet | `GOOGLE_SHEETS_STATE_SPREADSHEET_ID=1TjTLHMi1k01K4JWkiHJZ7OGtb8C5-8WUAlH-4RDe2YA` (tabs: `messages`, `request_status`, `daily_counts`; legacy `requests` is dead) |
 | Drive write folder | `GOOGLE_DRIVE_FOLDER_ID` is still not set. The first live `drive.create_file` creates it and logs the id |
@@ -380,9 +383,9 @@ Only a clean, pushed commit (see docs/RUNBOOK.md for why):
 git status --porcelain && git push && SHA=$(git rev-parse --short HEAD)
 gcloud run deploy data-gatekeeper --project=data-gatekeeper-roishik --region=europe-west1 --source=. --labels=commit=$SHA --timeout=120 --max-instances=1 --update-env-vars=GIT_SHA=$SHA,MAX_REQUESTS_PER_DAY=100 --quiet
 ```
-`GIT_SHA` and the `MAX_REQUESTS_PER_DAY=100` bump are both new with the second-round fixes
-(2026-09-23) — without `GIT_SHA` set, every reply's `protocol_version` reads `dev`; without
-bumping the quota, the live value stays at the old 50 even though the code default is now 100.
+Every deploy must pass `GIT_SHA`, or replies' `protocol_version` goes stale (or reads `dev`).
+Passing `MAX_REQUESTS_PER_DAY=100` again is harmless; it's already the live value since the
+2026-09-23 deploy.
 Env vars and secrets persist across source deploys. To change the allowlist (values contain
 commas, so use gcloud's custom delimiter):
 ```bash
