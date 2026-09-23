@@ -111,3 +111,43 @@ def test_audit_log_chain_verifies_after_real_appends(require_google):
         assert verify_chain(reopened.all_entries())
     finally:
         _trash(log.spreadsheet_id)
+
+
+def test_batch_state_writes_land_in_the_columns_the_code_reads(require_google):
+    """The multi-row forms a `batch` request uses (one append per tab for
+    the whole batch -- app/pipeline.py's _run_batch): every row of a
+    multi-row append must still start in column A."""
+    store = SheetsStateStore(spreadsheet_id=None)  # creates a scratch spreadsheet
+    try:
+        day = date(2026, 1, 1)
+        ids = [f"req_batch_live_{i}" for i in range(3)]
+        store.record_requests("a@example.com", ids, day)
+        store.set_request_statuses([(rid, REQUEST_PROCESSING) for rid in ids], "a@example.com")
+        store.set_request_statuses([(ids[0], REQUEST_COMPLETED), (ids[1], REQUEST_FAILED)], "a@example.com")
+
+        assert store.count_today("a@example.com", day) == 3
+        details = store.get_request_status_details([*ids, "req_missing"])
+        assert set(details) == set(ids)
+        assert [details[rid][0] for rid in ids] == [REQUEST_COMPLETED, REQUEST_FAILED, REQUEST_PROCESSING]
+
+        status_rows = _raw(store, "request_status!A:D")
+        assert [r[0] for r in status_rows] == [*ids, ids[0], ids[1]]
+        assert all(r[3] == "a@example.com" for r in status_rows)
+        assert [r[:3] for r in _raw(store, "daily_counts!A:C")] == [["2026-01-01", "a@example.com", rid] for rid in ids]
+    finally:
+        _trash(store.spreadsheet_id)
+
+
+def test_audit_log_append_many_chains_in_one_write(require_google):
+    log = SheetsAuditLog(spreadsheet_id=None)  # creates a scratch spreadsheet
+    try:
+        log.append(AuditRecord(agentmail_message_id="msg_live_0", sender="a@example.com", layer0_verdict="ok", layer1_verdict="ok"))
+        log.append_many([
+            AuditRecord(agentmail_message_id=f"msg_live_{i}", sender="a@example.com", layer0_verdict="ok", layer1_verdict="ok")
+            for i in range(1, 4)
+        ])
+        entries = log.all_entries()
+        assert [e["record"]["agentmail_message_id"] for e in entries] == [f"msg_live_{i}" for i in range(4)]
+        assert verify_chain(entries)
+    finally:
+        _trash(log.spreadsheet_id)
