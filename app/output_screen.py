@@ -198,7 +198,6 @@ def scoped_output(result: OutputScreenResult, prefix: str) -> OutputScreenResult
 
 class OutputScreen(Protocol):
     def screen_items(self, items: dict[str, dict[str, str]]) -> OutputScreenResult: ...
-    def screen_text(self, text: str) -> tuple[float | None, float | None]: ...
 
 
 def item_text(fields: dict[str, str]) -> str:
@@ -217,9 +216,6 @@ class NoOpOutputScreen:
             verdicts={key: ItemVerdict(None, None, None, withheld=False, screened=False) for key in items},
             status="disabled",
         )
-
-    def screen_text(self, text: str) -> tuple[float | None, float | None]:
-        return None, None
 
 
 class TypeSafeOutputScreen:
@@ -264,11 +260,6 @@ class TypeSafeOutputScreen:
             withheld = sensitive >= self.sensitive_threshold or targets_reader >= self.injection_threshold
             verdicts[key] = ItemVerdict(sensitive, targets_reader, category, withheld=withheld, screened=True)
         return OutputScreenResult(verdicts=verdicts, status="degraded" if degraded else "ok")
-
-    def screen_text(self, text: str) -> tuple[float | None, float | None]:
-        answers = run_parallel(self._ask, chunk_text(text))
-        present = [a for a in answers if a is not None]
-        return max_score([a[0] for a in present]), max_score([a[1] for a in present])
 
     def _ask(self, text: str) -> tuple[float, float, str | None] | None:
         try:

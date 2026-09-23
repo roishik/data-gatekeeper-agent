@@ -330,7 +330,7 @@ def handle_webhook(
             state.reply_status, state.error_code, state.retryable = "error", failure.code, failure.retryable
 
     # ── Layer 5: reply ───────────────────────────────────────────────────
-    _send(state, agentmail_client, output_screen, state_store)
+    _send(state, agentmail_client, state_store)
     _append_audit(audit_log, _audit_record(state))
     _finalize_request_status(state, state_store)
     if state.batch_items is not None:
@@ -346,6 +346,16 @@ def handle_webhook(
             _finalize_request_status(item_state, state_store)
             _append_audit(audit_log, _audit_record(item_state, batch_id=state.parsed.request_id))
     return WebhookOutcome(200, state.outcome_reason)
+
+
+def _early_return(state: _RequestState, reason: str, error_code: str, *, reply_status: str = "error") -> None:
+    """`state.layer1` (the audit record) and `state.outcome_reason` (the
+    returned WebhookOutcome) want the same short reason for an early
+    return out of _run_request/_run_batch_item -- previously set by hand,
+    three near-identical lines, at each call site."""
+    state.layer1 = reason
+    state.reply_status, state.error_code = reply_status, error_code
+    state.outcome_reason = reason
 
 
 def _run_request(
@@ -368,9 +378,7 @@ def _run_request(
     stage = "layer1"
     try:
         if state_store.count_today(state.sender) >= MAX_REQUESTS_PER_DAY:
-            state.layer1 = "rate_limited"
-            state.reply_status, state.error_code = "error", "rate_limited"
-            state.outcome_reason = "rate_limited"
+            _early_return(state, "rate_limited", "rate_limited")
             return stage
 
         # ── Deterministic split, then the injection screen, part by part
@@ -400,9 +408,7 @@ def _run_request(
         prior = state_store.get_request_status_detail(state.parsed.request_id)
         prior_status, prior_updated_at = prior if prior is not None else (None, None)
         if is_duplicate_request_status(prior_status, prior_updated_at):
-            state.layer1 = "duplicate_request"
-            state.reply_status, state.error_code = "duplicate", "duplicate_request"
-            state.outcome_reason = "duplicate_request"
+            _early_return(state, "duplicate_request", "duplicate_request", reply_status="duplicate")
             return stage
         state_store.set_request_status(state.parsed.request_id, REQUEST_PROCESSING, state.sender)
         state.request_started = True
@@ -616,15 +622,13 @@ def _run_batch_item(
     parsed = item_state.parsed
     try:
         if state_store.count_today(item_state.sender) >= MAX_REQUESTS_PER_DAY:
-            item_state.layer1 = "rate_limited"
-            item_state.reply_status, item_state.error_code = "error", "rate_limited"
+            _early_return(item_state, "rate_limited", "rate_limited")
             return
 
         prior = state_store.get_request_status_detail(parsed.request_id)
         prior_status, prior_updated_at = prior if prior is not None else (None, None)
         if is_duplicate_request_status(prior_status, prior_updated_at):
-            item_state.layer1 = "duplicate_request"
-            item_state.reply_status, item_state.error_code = "duplicate", "duplicate_request"
+            _early_return(item_state, "duplicate_request", "duplicate_request", reply_status="duplicate")
             return
         state_store.set_request_status(parsed.request_id, REQUEST_PROCESSING, item_state.sender)
         item_state.request_started = True
@@ -744,7 +748,7 @@ def _unresolved_request(message_id: str) -> ParsedRequest:
     return ParsedRequest(request_id=fallback_request_id_for(message_id), verb="unsupported", params={}, source="block")
 
 
-def _send(state: _RequestState, agentmail_client: AgentMailClient, output_screen: OutputScreen, state_store) -> None:
+def _send(state: _RequestState, agentmail_client: AgentMailClient, state_store) -> None:
     """Render and send the one reply. Never raises: a rendering failure
     falls back to a minimal status-only reply, and a send failure is
     recorded on the audit record instead of being lost."""
@@ -777,14 +781,16 @@ def _send(state: _RequestState, agentmail_client: AgentMailClient, output_screen
             requests_remaining_today=requests_remaining_today,
         )
     if state.output is not None:
-        # Whole-reply backstop: the rendered prose (not the status block) is
-        # screened once more. Audit-only -- a calibration signal for the
-        # per-item thresholds, never a second withholding pass.
-        try:
-            prose = body.split("\n\n---GATEKEEPER-RESPONSE---", 1)[0]
-            state.output_reply_sensitive, state.output_reply_injection = output_screen.screen_text(prose)
-        except Exception:
-            logger.exception("whole-reply screen failed")
+        # Audit-only calibration signal for the per-item thresholds
+        # (OUTPUT_SENSITIVE_THRESHOLD/OUTPUT_INJECTION_THRESHOLD): the
+        # max verdict already computed per item, not a second Jev call
+        # over the whole rendered prose -- every item was already
+        # screened individually a few lines up (_screen_output/
+        # _screen_batch_output), and re-screening the same text again
+        # here would cost one more network round trip per reply for a
+        # number this derives for free from verdicts already in hand.
+        state.output_reply_sensitive = state.output.max_sensitive
+        state.output_reply_injection = state.output.max_targets_reader
     try:
         result = send_reply(
             agentmail_client,

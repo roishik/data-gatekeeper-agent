@@ -240,7 +240,11 @@ class PolicyDecision:
 # ── Shared validators ─────────────────────────────────────────────────────
 
 _SINGLE_LINE_FORBIDDEN_RE = re.compile(r"[\x00-\x1f\x7f\u0085\u2028\u2029]")
-_MULTI_LINE_FORBIDDEN_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Control characters other than tab/newline/CR -- exported (not
+# underscore-prefixed) because app/reply_guard.py's sanitize_output()
+# strips this exact same class of character from outbound display text;
+# a single definition means the two can't quietly drift apart.
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _is_single_line(value: str) -> bool:
@@ -248,7 +252,7 @@ def _is_single_line(value: str) -> bool:
 
 
 def _is_clean_multi_line(value: str) -> bool:
-    return not _MULTI_LINE_FORBIDDEN_RE.search(value)
+    return not CONTROL_CHARS_RE.search(value)
 
 
 def _is_email(value: str) -> bool:
@@ -404,6 +408,24 @@ def _contains_sensitive_term(query: str) -> str | None:
     return None
 
 
+def _clears_screen(injection_score: float | None, threshold: float | None, *, deny_when_no_signal: bool) -> bool:
+    """Whether a gate below should let its decision through unchanged
+    (True) or add a denial (False). The two gates that use this
+    deliberately disagree about a MISSING signal (no score: TypeSafe
+    unreachable, or the screen isn't configured) -- named explicitly here
+    instead of left implicit in each gate's own inverted comparison,
+    which invited a future edit to "fix" one to match the other:
+      - apply_screen_gate (deny_when_no_signal=False): no signal clears
+        the screen -- TypeSafe's own availability must never become a
+        denial-of-service against real write requests.
+      - apply_extra_params_gate (deny_when_no_signal=True): no signal
+        denies -- extras are tolerated only when the request POSITIVELY
+        passed the screen, not merely when nothing said otherwise."""
+    if injection_score is None or threshold is None:
+        return not deny_when_no_signal
+    return injection_score < threshold
+
+
 def apply_screen_gate(decision: PolicyDecision, injection_score: float | None, threshold: float | None) -> PolicyDecision:
     """The block-path injection gate (owner's decision, 2026-09-22): an
     ALLOWED write verb is denied when the request's injection score (subject
@@ -417,7 +439,7 @@ def apply_screen_gate(decision: PolicyDecision, injection_score: float | None, t
     availability can't become a denial-of-service against real requests."""
     if decision.status != "allowed" or decision.verb not in WRITE_VERBS:
         return decision
-    if injection_score is None or threshold is None or injection_score < threshold:
+    if _clears_screen(injection_score, threshold, deny_when_no_signal=False):
         return decision
     return PolicyDecision(
         status="denied", verb=decision.verb, error_code="screened",
@@ -435,7 +457,7 @@ def apply_extra_params_gate(decision: PolicyDecision, injection_score: float | N
     add a denial; it never allows anything."""
     if decision.status != "allowed" or not decision.ignored_params:
         return decision
-    if injection_score is not None and threshold is not None and injection_score < threshold:
+    if _clears_screen(injection_score, threshold, deny_when_no_signal=True):
         return decision
     return PolicyDecision(
         status="denied", verb=decision.verb, error_code="invalid_params",

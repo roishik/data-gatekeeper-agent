@@ -138,11 +138,6 @@ def test_empty_items_need_no_call(stub_sdk):
     assert stub_sdk.calls == [] and not result.is_withheld("drive_file")
 
 
-def test_screen_text_returns_max_scores(stub_sdk):
-    stub_sdk.rules = {"secret": (0.8, 0.1, "password")}
-    assert TypeSafeOutputScreen().screen_text("benign reply with a secret inside") == (0.8, 0.1)
-
-
 def test_noop_screen_withholds_nothing():
     result = NoOpOutputScreen().screen_items({"gmail:0": {"subject": "code 123456"}})
     assert result.status == "disabled" and result.withheld_count == 0
@@ -199,7 +194,10 @@ def test_withheld_gmail_item_keeps_its_thread_id_and_nothing_else(configured_env
     assert record["output_withheld_count"] == 1
     assert record["output_withheld_categories"] == ["one_time_code"]
     assert record["output_screen_status"] == "ok"
-    assert record["output_reply_sensitive"] == 0.05  # the whole-reply backstop ran
+    # Derived from the per-item verdicts already computed above (no
+    # second whole-reply Jev call) -- the max sensitive score across
+    # every item, i.e. the withheld item's own 0.95.
+    assert record["output_reply_sensitive"] == 0.95
 
 
 def test_withheld_calendar_item_keeps_its_time_and_event_id(configured_env, audit_log):

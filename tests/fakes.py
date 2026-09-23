@@ -207,16 +207,13 @@ class FakeAgentMailClient:
 class FakeOutputScreen:
     """Scripted outbound-screen stand-in. Items whose key is in `withhold`
     come back flagged sensitive; everything else clean. `fail_with` makes
-    screen_items() raise, for the pipeline's fail-closed path. Records every
-    call: `item_calls` (the items dict) and `text_calls` (whole-reply text)."""
+    screen_items() raise, for the pipeline's fail-closed path. Records
+    every call in `item_calls` (the items dict)."""
 
-    def __init__(self, withhold: set[str] | None = None, fail_with: BaseException | None = None,
-                 reply_scores: tuple[float | None, float | None] = (0.05, 0.05)):
+    def __init__(self, withhold: set[str] | None = None, fail_with: BaseException | None = None):
         self.withhold = set(withhold or ())
         self.fail_with = fail_with
-        self.reply_scores = reply_scores
         self.item_calls: list[dict[str, dict[str, str]]] = []
-        self.text_calls: list[str] = []
 
     def screen_items(self, items: dict[str, dict[str, str]]) -> OutputScreenResult:
         self.item_calls.append({k: dict(v) for k, v in items.items()})
@@ -233,7 +230,3 @@ class FakeOutputScreen:
             for key in items
         }
         return OutputScreenResult(verdicts=verdicts, status="ok")
-
-    def screen_text(self, text: str) -> tuple[float | None, float | None]:
-        self.text_calls.append(text)
-        return self.reply_scores

@@ -68,7 +68,14 @@ from app.output_screen import (
     event_key,
     gmail_key,
 )
+from app.policy import CONTROL_CHARS_RE
 from app.request_parser import ParsedRequest
+
+# The machine-readable block's fence -- a single definition instead of
+# the four separate copies of the same two literals this module used to
+# build every reply body with (see _wrap_body below).
+RESPONSE_MARKER = "---GATEKEEPER-RESPONSE---"
+END_MARKER = "---END---"
 
 _REDACTED = "[redacted]"
 
@@ -144,7 +151,6 @@ def _redact_password(match: re.Match) -> str:
 # `---GATEKEEPER-RESPONSE---` could plant a fake status block in a reply --
 # a real concern, since Instinct (an LLM) parses these replies.
 _ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
-_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _LINE_SEPARATORS_RE = re.compile(r"[\r\n\u0085\u2028\u2029]+")
 # Every marker the protocol uses, including the payload rail's (docs/PROTOCOL.md).
 _RESERVED_MARKER_RE = re.compile(
@@ -162,7 +168,7 @@ def sanitize_output(text: str) -> str:
     value = str(text)
     value = _ANSI_RE.sub("", value)
     value = _LINE_SEPARATORS_RE.sub(" ", value)
-    value = _CONTROL_RE.sub("", value)
+    value = CONTROL_CHARS_RE.sub("", value)
     value = _RESERVED_MARKER_RE.sub("[reserved marker removed]", value)
     value = _ROLE_TAG_RE.sub("[role tag removed]", value)
     value = _ROLE_LABEL_RE.sub("[role label removed] ", value)
@@ -448,9 +454,13 @@ def _truncate_at_item_boundary(
     return new_prose, shown
 
 
+def _wrap_body(prose: str, yaml_block: str) -> str:
+    return f"{prose}\n\n{RESPONSE_MARKER}\n{yaml_block}\n{END_MARKER}\n"
+
+
 def _finalize_body(prose_lines: list[str], item_lines_start: int | None, item_lines_total: int | None, yaml_block: str, unit: str = "results") -> str:
     prose = "\n".join(prose_lines)
-    body = f"{prose}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+    body = _wrap_body(prose, yaml_block)
     if len(body) <= REPLY_MAX_CHARS:
         return body
 
@@ -467,11 +477,11 @@ def _finalize_body(prose_lines: list[str], item_lines_start: int | None, item_li
         # say how many actually made it in.
         new_prose, shown = _truncate_at_item_boundary(prose_lines, item_lines_start, item_lines_total, available, unit)
         suffix = f"\n\n[showing {shown} of {item_lines_total} {unit}]"
-        return f"{new_prose}{suffix}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+        return _wrap_body(f"{new_prose}{suffix}", yaml_block)
 
     suffix = "\n\n[truncated]"
     keep = max(0, available - len(suffix))
-    return f"{prose[:keep]}{suffix}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+    return _wrap_body(f"{prose[:keep]}{suffix}", yaml_block)
 
 
 def render_reply(
@@ -663,7 +673,7 @@ def render_minimal_reply(
     yaml_block = _status_block(
         request_id, status, error_code, 0, retryable, requests_remaining_today=requests_remaining_today
     )
-    return f"This request was processed, but its results could not be formatted.\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+    return _wrap_body("This request was processed, but its results could not be formatted.", yaml_block)
 
 
 def send_reply(
