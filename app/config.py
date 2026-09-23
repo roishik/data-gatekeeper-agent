@@ -96,7 +96,9 @@ GATEKEEPER_INBOX_ADDRESS = _env("GATEKEEPER_INBOX_ADDRESS")
 # Exact-match sender allowlist, display names ignored (see app/ingress.py).
 ALLOWED_SENDERS = _env_list("ALLOWED_SENDERS")
 
-# Who gets BCC'd on every outbound reply — the human audit-log copy.
+# No longer used by the service itself since the owner BCC was dropped
+# 2026-09-22 (AgentMail's own thread history is the readable record
+# now) -- the live e2e test suite still sends from this address.
 OWNER_EMAIL = _env("OWNER_EMAIL")
 
 # Webhook timestamp tolerance, seconds. 300s matches the Standard
@@ -104,7 +106,10 @@ OWNER_EMAIL = _env("OWNER_EMAIL")
 WEBHOOK_TOLERANCE_SECONDS = _env_int("WEBHOOK_TOLERANCE_SECONDS", 300)
 
 # ── Rate limiting (Layer 1) ─────────────────────────────────────────────────
-MAX_REQUESTS_PER_DAY = _env_int("MAX_REQUESTS_PER_DAY", 20)
+# 100/day (raised from 50, 2026-09-23): the batch verb lets one email
+# consume many slots at once, and this cap is an abuse backstop, not a
+# hard business limit the owner wants enforced tightly.
+MAX_REQUESTS_PER_DAY = _env_int("MAX_REQUESTS_PER_DAY", 100)
 
 # ── Anthropic (Layer 2, quarantined reader LLM only) ────────────────────────
 ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY")

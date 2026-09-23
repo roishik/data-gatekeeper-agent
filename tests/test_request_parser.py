@@ -33,6 +33,79 @@ def test_parses_valid_fenced_block():
     assert reader.calls == []  # the LLM must never be invoked when a valid block exists
 
 
+@pytest.mark.parametrize(
+    "raw_value, expected",
+    [
+        ("Off", "Off"),
+        ("No", "No"),
+        ("Yes", "Yes"),
+        ("On", "On"),
+        ("9:00", "9:00"),
+    ],
+)
+def test_ambiguous_yaml_scalars_in_string_fields_stay_strings(raw_value, expected):
+    """PyYAML's default resolver would turn Off/No/Yes/On into bool and
+    an unquoted H:MM value into a sexagesimal int -- either way, a
+    string-typed field like `title` would then fail policy.py's
+    isinstance(value, str) check and wrongly deny an otherwise
+    well-formed request. app/yaml_safe.py's loader keeps these as
+    strings; see its module docstring."""
+    email_text = (
+        "---GATEKEEPER-REQUEST---\n"
+        "request_id: req_123\n"
+        "verb: calendar.create_event\n"
+        "params:\n"
+        f"  title: {raw_value}\n"
+        "  day_offset: 1\n"
+        "  start_time: '14:00'\n"
+        "  duration_minutes: 30\n"
+        "---END---\n"
+    )
+    reader = FakeReaderLLM()
+    parsed = parse_request(email_text, "msg_1", reader)
+
+    assert parsed.source == "block"
+    assert parsed.params["title"] == expected
+    assert isinstance(parsed.params["title"], str)
+
+
+def test_normal_numeric_fields_still_parse_as_int_through_the_no_coerce_loader():
+    email_text = (
+        "---GATEKEEPER-REQUEST---\n"
+        "request_id: req_123\n"
+        "verb: gmail.search\n"
+        "params:\n"
+        "  query: invoice\n"
+        "  max_results: 5\n"
+        "---END---\n"
+    )
+    reader = FakeReaderLLM()
+    parsed = parse_request(email_text, "msg_1", reader)
+
+    assert parsed.params["max_results"] == 5
+    assert isinstance(parsed.params["max_results"], int)
+
+
+def test_yaml_bool_word_in_a_numeric_field_still_denies_as_before():
+    """max_results: yes now resolves to the string "yes" instead of the
+    bool True, but policy.py's isinstance(value, int) check denies both
+    the same way -- this loader change doesn't relax numeric validation,
+    only string fields' wrongful denial."""
+    email_text = (
+        "---GATEKEEPER-REQUEST---\n"
+        "request_id: req_123\n"
+        "verb: gmail.search\n"
+        "params:\n"
+        "  query: invoice\n"
+        "  max_results: yes\n"
+        "---END---\n"
+    )
+    reader = FakeReaderLLM()
+    parsed = parse_request(email_text, "msg_1", reader)
+
+    assert parsed.params["max_results"] == "yes"
+
+
 def test_falls_back_to_llm_when_no_block_present():
     reader = FakeReaderLLM(response=LLMExtraction(verb="gmail.search", request_id="req_9", query="invoice"))
     parsed = parse_request("just a plain English email, no block here", "msg_1", reader)

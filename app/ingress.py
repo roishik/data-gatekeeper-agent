@@ -29,6 +29,7 @@ a rejection is for.
 """
 from __future__ import annotations
 
+import binascii
 import email.utils
 import hashlib
 import hmac
@@ -81,7 +82,12 @@ def verify_signature(
 
     Also rejects a timestamp outside +/- tolerance_seconds: a signature
     alone never expires on its own, so this is the replay-window half of
-    the check, done unconditionally even when the signature is valid."""
+    the check, done unconditionally even when the signature is valid.
+
+    A misconfigured AGENTMAIL_WEBHOOK_SECRET that isn't valid base64
+    returns a clean denial rather than letting binascii.Error escape --
+    every webhook used to become a 500 (and an AgentMail retry storm)
+    instead of a rejection until this was caught."""
     secret = secret if secret is not None else (AGENTMAIL_WEBHOOK_SECRET or "")
     tolerance = tolerance_seconds if tolerance_seconds is not None else WEBHOOK_TOLERANCE_SECONDS
 
@@ -99,7 +105,10 @@ def verify_signature(
     if abs(current - ts) > tolerance:
         return Verdict(False, "stale_timestamp")
 
-    secret_bytes = b64decode(secret[len("whsec_"):] if secret.startswith("whsec_") else secret)
+    try:
+        secret_bytes = b64decode(secret[len("whsec_"):] if secret.startswith("whsec_") else secret, validate=True)
+    except (binascii.Error, ValueError):
+        return Verdict(False, "invalid_webhook_secret")
     signed_content = f"{svix_id}.{svix_timestamp}.".encode() + body
     expected = b64encode(hmac.new(secret_bytes, signed_content, hashlib.sha256).digest()).decode()
 

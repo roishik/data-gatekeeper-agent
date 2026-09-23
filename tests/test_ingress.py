@@ -59,6 +59,17 @@ def test_no_secret_configured_is_rejected():
     assert verdict.reason == "no_webhook_secret_configured"
 
 
+def test_malformed_configured_secret_is_rejected_cleanly():
+    """A misconfigured AGENTMAIL_WEBHOOK_SECRET that isn't valid base64
+    must deny the webhook, not crash it (binascii.Error used to escape
+    verify_signature uncaught, turning every request into a 500)."""
+    body = b'{"hello": "world"}'
+    svix_id, ts, sig = sign(body)
+    verdict = verify_signature(body, svix_id, ts, sig, secret="whsec_not-valid-base64!!!")
+    assert not verdict.accepted
+    assert verdict.reason == "invalid_webhook_secret"
+
+
 def test_check_event_accepts_valid_event():
     verdict = check_event(
         event_type="message.received",

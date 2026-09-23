@@ -81,6 +81,7 @@ import yaml
 
 from app.config import READER_LLM_MAX_INPUT_CHARS
 from app.reader_llm import ReaderLLM
+from app.yaml_safe import safe_load_no_coerce
 
 _BLOCK_RE = re.compile(r"^---GATEKEEPER-REQUEST---[ \t]*\n(.*?)\n---END---[ \t]*$", re.S | re.M)
 _PAYLOAD_RE = re.compile(
@@ -226,7 +227,7 @@ def _parse_block(parts: EmailParts, fallback_id: str) -> ParsedRequest:
         return _block_error(fallback_id, "invalid_payload", "payload sections were sent without a GATEKEEPER-REQUEST block", parts)
 
     try:
-        data = yaml.safe_load(parts.block_texts[0])
+        data = safe_load_no_coerce(parts.block_texts[0])
     except yaml.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         where = f" (block line {mark.line + 1}, column {mark.column + 1})" if mark is not None else ""
