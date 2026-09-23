@@ -80,6 +80,7 @@ from typing import Any
 import yaml
 
 from app.config import READER_LLM_MAX_INPUT_CHARS
+from app.policy import BATCH_MAX_ITEMS
 from app.reader_llm import ReaderLLM
 from app.yaml_safe import safe_load_no_coerce
 
@@ -132,6 +133,12 @@ class ParsedRequest:
     parse_error_detail: str | None = None  # our own words, never echoed input
     payload_count: int = 0
     payload_chars: int = 0
+    # Populated only when verb == "batch" (block path only -- "batch" is
+    # resolved here, in Layer 2, into N ordinary ParsedRequests, never a
+    # real Verb the policy engine knows about; see app/pipeline.py's batch
+    # handling). Each item may carry its own parse_error independently --
+    # one malformed item denies only that item, not the whole batch.
+    batch_items: tuple[ParsedRequest, ...] = ()
 
 
 def normalize_newlines(text: str) -> str:
@@ -220,6 +227,35 @@ def _block_error(fallback_id: str, code: str, detail: str, parts: EmailParts, re
     )
 
 
+def _validate_request_shape(data: Any) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
+    """(request_id, verb, params, error) from one parsed YAML mapping --
+    shared between the top-level block and each batch sub-item (see
+    _parse_batch), so both validate request_id/verb/params identically."""
+    if not isinstance(data, dict):
+        return None, None, None, "must be a YAML mapping"
+
+    request_id = data.get("request_id")
+    if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id.strip()):
+        return (
+            None, None, None,
+            "request_id is required: 1-128 characters of letters, digits and . _ : - (starting with a letter or digit)",
+        )
+    request_id = request_id.strip()
+
+    verb = data.get("verb")
+    if not isinstance(verb, str) or not verb.strip():
+        return request_id, None, None, "verb is required"
+    verb = verb.strip()
+
+    params = data.get("params", {})
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return request_id, verb, None, "params must be a mapping"
+
+    return request_id, verb, params, None
+
+
 def _parse_block(parts: EmailParts, fallback_id: str) -> ParsedRequest:
     if len(parts.block_texts) > 1:
         return _block_error(fallback_id, "ambiguous_request", "the email contains more than one GATEKEEPER-REQUEST block", parts)
@@ -232,37 +268,106 @@ def _parse_block(parts: EmailParts, fallback_id: str) -> ParsedRequest:
         mark = getattr(exc, "problem_mark", None)
         where = f" (block line {mark.line + 1}, column {mark.column + 1})" if mark is not None else ""
         return _block_error(fallback_id, "invalid_request_block", f"the block is not valid YAML{where}", parts)
-    if not isinstance(data, dict):
-        return _block_error(fallback_id, "invalid_request_block", "the block must be a YAML mapping", parts)
 
-    request_id = data.get("request_id")
-    if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id.strip()):
-        return _block_error(
-            fallback_id, "invalid_request_block",
-            "request_id is required: 1-128 characters of letters, digits and . _ : - (starting with a letter or digit)",
-            parts,
-        )
-    request_id = request_id.strip()
-
-    verb = data.get("verb")
-    if not isinstance(verb, str) or not verb.strip():
-        return _block_error(fallback_id, "invalid_request_block", "verb is required", parts, request_id=request_id)
-    verb = verb.strip()
-
-    params = data.get("params", {})
-    if params is None:
-        params = {}
-    if not isinstance(params, dict):
-        return _block_error(fallback_id, "invalid_request_block", "params must be a mapping", parts, request_id=request_id, verb=verb)
+    request_id, verb, params, err = _validate_request_shape(data)
+    if err:
+        return _block_error(fallback_id, "invalid_request_block", err, parts, request_id=request_id, verb=verb or "unsupported")
+    # _validate_request_shape's contract guarantees these are not None
+    # here; checked explicitly rather than with `assert`, which `python
+    # -O` strips (same discipline as app/policy.py's evaluators).
+    if request_id is None or verb is None or params is None:
+        return _block_error(fallback_id, "invalid_request_block", "validated request shape missing", parts)
 
     if parts.payload_error:
         return _block_error(fallback_id, "invalid_payload", parts.payload_error, parts, request_id=request_id, verb=verb)
+
+    if verb == "batch":
+        return _parse_batch(request_id, params, parts, fallback_id)
+
     params, payload_problem = _substitute_payloads(verb, params, parts.payloads)
     if payload_problem:
         return _block_error(fallback_id, "invalid_payload", payload_problem, parts, request_id=request_id, verb=verb)
 
     return ParsedRequest(
         request_id=request_id, verb=verb, params=params, source="block",
+        payload_count=len(parts.payloads), payload_chars=sum(len(p) for p in parts.payloads.values()),
+    )
+
+
+def _parse_batch(batch_request_id: str, params: dict[str, Any], parts: EmailParts, fallback_id: str) -> ParsedRequest:
+    """`verb: batch` is resolved entirely here: `params.requests` (a list
+    of {request_id, verb, params} mappings, identical in shape to a
+    top-level block) becomes N ordinary ParsedRequests, run independently
+    by app/pipeline.py -- each with its own dedupe/policy/execution/audit
+    record. A malformed or duplicate-id ITEM denies only that item; a
+    problem with the batch envelope itself (missing/oversized `requests`,
+    a payload no item referenced) denies the whole batch, since there's
+    nothing else to run in that case."""
+    items_raw = params.get("requests")
+    if not isinstance(items_raw, list) or not items_raw:
+        return _block_error(
+            fallback_id, "invalid_request_block", "batch requires a non-empty 'requests' list",
+            parts, request_id=batch_request_id, verb="batch",
+        )
+    if len(items_raw) > BATCH_MAX_ITEMS:
+        return _block_error(
+            fallback_id, "invalid_request_block", f"batch accepts at most {BATCH_MAX_ITEMS} items",
+            parts, request_id=batch_request_id, verb="batch",
+        )
+
+    seen_ids: set[str] = set()
+    all_used_payloads: set[str] = set()
+    items: list[ParsedRequest] = []
+    for i, item_raw in enumerate(items_raw):
+        item_id, item_verb, item_params, err = _validate_request_shape(item_raw)
+        placeholder_id = item_id or f"{batch_request_id}-item{i}"
+        if err:
+            items.append(ParsedRequest(
+                request_id=placeholder_id, verb=item_verb or "unsupported", params={}, source="block",
+                parse_error="invalid_request_block", parse_error_detail=f"batch item {i}: {err}",
+            ))
+            continue
+        # _validate_request_shape's contract guarantees these three are not
+        # None when err is None -- checked explicitly, not with `assert`.
+        if item_id is None or item_verb is None or item_params is None:
+            items.append(ParsedRequest(
+                request_id=placeholder_id, verb="unsupported", params={}, source="block",
+                parse_error="invalid_request_block", parse_error_detail=f"batch item {i}: validated request shape missing",
+            ))
+            continue
+        if item_verb == "batch":
+            items.append(ParsedRequest(
+                request_id=item_id, verb="unsupported", params={}, source="block",
+                parse_error="invalid_request_block", parse_error_detail=f"batch item {i}: a batch cannot contain another batch",
+            ))
+            continue
+        if item_id in seen_ids:
+            items.append(ParsedRequest(
+                request_id=item_id, verb=item_verb, params={}, source="block",
+                parse_error="invalid_request_block", parse_error_detail=f"batch item {i}: duplicate request_id within this batch",
+            ))
+            continue
+        seen_ids.add(item_id)
+        item_params, used, payload_problem = _substitute_payloads_for_item(item_verb, item_params or {}, parts.payloads)
+        if payload_problem:
+            items.append(ParsedRequest(
+                request_id=item_id, verb=item_verb, params={}, source="block",
+                parse_error="invalid_payload", parse_error_detail=f"batch item {i}: {payload_problem}",
+            ))
+            continue
+        all_used_payloads |= used
+        items.append(ParsedRequest(request_id=item_id, verb=item_verb, params=item_params, source="block"))
+
+    unused = sorted(set(parts.payloads) - all_used_payloads)
+    if unused:
+        return _block_error(
+            fallback_id, "invalid_payload",
+            f"payload section(s) not referenced by any batch item: {', '.join(unused)}",
+            parts, request_id=batch_request_id, verb="batch",
+        )
+
+    return ParsedRequest(
+        request_id=batch_request_id, verb="batch", params={}, source="block", batch_items=tuple(items),
         payload_count=len(parts.payloads), payload_chars=sum(len(p) for p in parts.payloads.values()),
     )
 
@@ -275,7 +380,15 @@ def _payload_ref(value: Any) -> str | None:
     return None
 
 
-def _substitute_payloads(verb: str, params: dict[str, Any], payloads: dict[str, str]) -> tuple[dict[str, Any], str | None]:
+def _substitute_payloads_for_item(
+    verb: str, params: dict[str, Any], payloads: dict[str, str]
+) -> tuple[dict[str, Any], set[str], str | None]:
+    """Substitutes payload references for ONE request; returns
+    (new_params, used_payload_names, error). Does not check whether every
+    payload in the email was used -- a single request checks that itself
+    (_substitute_payloads, below); a batch checks it once, collectively,
+    across every item (_parse_batch), since different items may
+    legitimately use different payloads."""
     allowed = PAYLOAD_PARAMS.get(verb, frozenset())
     out: dict[str, Any] = {}
     used: set[str] = set()
@@ -286,12 +399,19 @@ def _substitute_payloads(verb: str, params: dict[str, Any], payloads: dict[str, 
             out[key] = value
             continue
         if key not in allowed or isinstance(value, list):
-            return params, f"'{key}' cannot take a payload (only {', '.join(sorted(allowed)) or 'no field'} can, for {verb})"
+            return params, used, f"'{key}' cannot take a payload (only {', '.join(sorted(allowed)) or 'no field'} can, for {verb})"
         name = refs[0]
         if name not in payloads:
-            return params, f"'{key}' references payload '{name}', which is not in the email"
+            return params, used, f"'{key}' references payload '{name}', which is not in the email"
         out[key] = payloads[name]
         used.add(name)
+    return out, used, None
+
+
+def _substitute_payloads(verb: str, params: dict[str, Any], payloads: dict[str, str]) -> tuple[dict[str, Any], str | None]:
+    out, used, error = _substitute_payloads_for_item(verb, params, payloads)
+    if error:
+        return params, error
     unused = sorted(set(payloads) - used)
     if unused:
         return params, f"payload section(s) not referenced by any param: {', '.join(unused)}"

@@ -520,3 +520,41 @@ def test_e2e_code_bearing_email_is_withheld_but_keeps_its_thread_id():
     assert block["withheld_count"] >= 1, body
     assert "482913" not in body
     assert "[withheld: flagged as sensitive] (thread_id:" in body
+
+
+def test_e2e_batch_of_two_reads_runs_both_and_replies_once():
+    """Read-only on purpose (no test invites anyone, per this file's own
+    convention) -- two DIFFERENT verbs in one batch, to confirm the
+    combined reply actually reflects both items' own outcomes, not just
+    the first."""
+    _require_config()
+    batch_request_id = _new_request_id("batch")
+    item1_id = _new_request_id("batch-item-search")
+    item2_id = _new_request_id("batch-item-caps")
+    body = (
+        "---GATEKEEPER-REQUEST---\n"
+        f"request_id: {batch_request_id}\n"
+        "verb: batch\n"
+        "params:\n"
+        "  requests:\n"
+        f"    - request_id: {item1_id}\n"
+        "      verb: gmail.search\n"
+        "      params:\n"
+        "        query: newer_than:7d\n"
+        "        max_results: 3\n"
+        f"    - request_id: {item2_id}\n"
+        "      verb: capabilities\n"
+        "      params: {}\n"
+        "---END---\n"
+    )
+    _send_from_owner(f"gatekeeper e2e batch {batch_request_id}", body)
+
+    block, reply_body = _wait_for_reply(batch_request_id)
+    assert block["status"] == "completed", block
+    batch_results = {r["request_id"]: r for r in block.get("batch_results", [])}
+    assert batch_results.get(item1_id, {}).get("status") == "completed", block
+    assert batch_results.get(item2_id, {}).get("status") == "completed", block
+    assert f"request_id: {item1_id}" in reply_body
+    assert f"request_id: {item2_id}" in reply_body
+    assert "gmail.search (read)" in reply_body
+    assert "capabilities (read)" in reply_body

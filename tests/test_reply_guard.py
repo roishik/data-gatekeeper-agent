@@ -194,7 +194,7 @@ def test_render_reply_size_cap_preserves_status_block():
     # used to leave "[truncated]" with no way to tell shown from total.
     assert f"result_count: {result_count}" in body
     import re as _re
-    shown_match = _re.search(r"\[showing (\d+) of (\d+)\]", body)
+    shown_match = _re.search(r"\[showing (\d+) of (\d+) results\]", body)
     assert shown_match is not None
     shown, total = int(shown_match.group(1)), int(shown_match.group(2))
     assert total == result_count

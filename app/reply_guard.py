@@ -47,6 +47,7 @@ items' text is withheld outright (ids kept) -- see render_reply's `output`.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 import yaml
 
@@ -208,7 +209,15 @@ def _format_event_title_location(summary: str, location: str, *, is_withheld: bo
     return title, location_suffix
 
 
-def render_reply(
+@dataclass(frozen=True)
+class _ProseResult:
+    lines: list[str]
+    result_count: int
+    item_lines_start: int | None  # see render_reply's truncation step
+    item_lines_total: int | None
+
+
+def _build_prose(
     parsed_request: ParsedRequest,
     status: str,
     error_code: str | None,
@@ -226,15 +235,11 @@ def render_reply(
     detail: str | None = None,
     output: OutputScreenResult | None = None,
     ignored_params: tuple[str, ...] = (),
-    requests_remaining_today: int | None = None,
-) -> str:
-    """Builds the full reply body. Deliberately takes no recipient
-    argument at all -- see module docstring point 1. Exactly one of the
-    result arguments is populated per call in practice (app/pipeline.py
-    only ever executes one verb per request), but each is accepted
-    independently rather than a single ambiguous "results" blob, so a
-    caller can't accidentally hand one verb's result to another verb's
-    formatter."""
+) -> _ProseResult:
+    """Everything render_reply needs to say about ONE request's outcome --
+    factored out so render_batch_reply can build the same prose per item
+    (against a per-item SCOPED view of the combined output screen; see
+    _scoped_output) without duplicating every verb's rendering branch."""
     result_count = (
         len(gmail_results or [])
         + len(calendar_results or [])
@@ -410,55 +415,173 @@ def render_reply(
             f"Note: ignored parameter(s) that {sanitize_output(parsed_request.verb)} doesn't use: {', '.join(ignored)}."
         )
 
-    prose = "\n".join(prose_lines)
+    return _ProseResult(prose_lines, result_count, item_lines_start, item_lines_total)
 
+
+def _truncate_at_item_boundary(
+    prose_lines: list[str], item_lines_start: int, item_lines_total: int, available: int, unit: str
+) -> tuple[str, int]:
+    """Truncates `prose_lines` at the last COMPLETE item boundary (never
+    mid-item), returning (new_prose, shown). Shared by render_reply's
+    per-result-line truncation and render_batch_reply's per-item-block
+    truncation -- `unit` is just the word used in the "[showing N of M
+    <unit>]" suffix, since one is "results" and the other is "items"."""
+    item_lines_end = item_lines_start + item_lines_total
+    head_lines = prose_lines[:item_lines_start]
+    item_lines = prose_lines[item_lines_start:item_lines_end]
+    tail_lines = prose_lines[item_lines_end:]
+    head = "\n".join(head_lines)
+    tail = ("\n" + "\n".join(tail_lines)) if tail_lines else ""
+    # Reserve room for the largest this suffix could ever be (shown can't
+    # have more digits than total).
+    suffix_budget = available - len(f"\n\n[showing {item_lines_total} of {item_lines_total} {unit}]") - len(tail)
+    used = len(head)
+    kept_items: list[str] = []
+    for line in item_lines:
+        cost = len(line) + 1  # the newline joining it to what came before
+        if used + cost > suffix_budget:
+            break
+        used += cost
+        kept_items.append(line)
+    shown = len(kept_items)
+    new_prose = "\n".join([*head_lines, *kept_items]) + tail
+    return new_prose, shown
+
+
+def _finalize_body(prose_lines: list[str], item_lines_start: int | None, item_lines_total: int | None, yaml_block: str, unit: str = "results") -> str:
+    prose = "\n".join(prose_lines)
+    body = f"{prose}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+    if len(body) <= REPLY_MAX_CHARS:
+        return body
+
+    # Truncate the prose, never the machine-readable block -- a parser (or
+    # a human skimming) must always be able to find an intact status
+    # block even in a capped reply. `available` is the character budget
+    # for the prose itself (the block/markers never shrink, so whatever
+    # they cost is subtracted out first).
+    available = REPLY_MAX_CHARS - (len(body) - len(prose))
+    if item_lines_start is not None and item_lines_total is not None:
+        # A blind character cut left result_count (or batch_results)
+        # claiming the full count while the visible list silently fell
+        # short of it -- truncate at the last COMPLETE item instead, and
+        # say how many actually made it in.
+        new_prose, shown = _truncate_at_item_boundary(prose_lines, item_lines_start, item_lines_total, available, unit)
+        suffix = f"\n\n[showing {shown} of {item_lines_total} {unit}]"
+        return f"{new_prose}{suffix}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+
+    suffix = "\n\n[truncated]"
+    keep = max(0, available - len(suffix))
+    return f"{prose[:keep]}{suffix}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+
+
+def render_reply(
+    parsed_request: ParsedRequest,
+    status: str,
+    error_code: str | None,
+    gmail_results: list[GmailResult] | None = None,
+    calendar_results: list[CalendarEvent] | None = None,
+    calendar_window_label: str | None = None,
+    clarification_question: str | None = None,
+    draft_result: DraftResult | None = None,
+    created_event: CalendarEvent | None = None,
+    updated_event: CalendarEvent | None = None,
+    deleted_event_id: str | None = None,
+    drive_file_result: DriveFileResult | None = None,
+    capabilities: CapabilitiesInfo | None = None,
+    retryable: bool = False,
+    detail: str | None = None,
+    output: OutputScreenResult | None = None,
+    ignored_params: tuple[str, ...] = (),
+    requests_remaining_today: int | None = None,
+) -> str:
+    """Builds the full reply body. Deliberately takes no recipient
+    argument at all -- see module docstring point 1. Exactly one of the
+    result arguments is populated per call in practice (app/pipeline.py
+    only ever executes one verb per request), but each is accepted
+    independently rather than a single ambiguous "results" blob, so a
+    caller can't accidentally hand one verb's result to another verb's
+    formatter."""
+    prose_result = _build_prose(
+        parsed_request, status, error_code,
+        gmail_results=gmail_results, calendar_results=calendar_results, calendar_window_label=calendar_window_label,
+        clarification_question=clarification_question, draft_result=draft_result, created_event=created_event,
+        updated_event=updated_event, deleted_event_id=deleted_event_id, drive_file_result=drive_file_result,
+        capabilities=capabilities, retryable=retryable, detail=detail, output=output, ignored_params=ignored_params,
+    )
+    ignored = [sanitize_output(name) for name in ignored_params]
     yaml_block = _status_block(
-        parsed_request.request_id, status, error_code, result_count, retryable, output,
+        parsed_request.request_id, status, error_code, prose_result.result_count, retryable, output,
         ignored if status == "completed" else [],
         requests_remaining_today=requests_remaining_today,
     )
-    body = f"{prose}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
+    return _finalize_body(prose_result.lines, prose_result.item_lines_start, prose_result.item_lines_total, yaml_block)
 
-    if len(body) > REPLY_MAX_CHARS:
-        # Truncate the prose, never the machine-readable block -- a
-        # parser (or a human skimming) must always be able to find an
-        # intact status block even in a capped reply. `available` is the
-        # character budget for the prose itself (the block/markers never
-        # shrink, so whatever they cost is subtracted out first).
-        available = REPLY_MAX_CHARS - (len(body) - len(prose))
-        if item_lines_start is not None and item_lines_total is not None:
-            # A per-item list (gmail.search / calendar.list_events):
-            # truncate at the last COMPLETE item boundary rather than
-            # mid-item, and report how many of the total actually made it
-            # in -- a blind character cut left result_count claiming the
-            # full count while the visible list silently fell short of it.
-            item_lines_end = item_lines_start + item_lines_total
-            head_lines = prose_lines[:item_lines_start]
-            item_lines = prose_lines[item_lines_start:item_lines_end]
-            tail_lines = prose_lines[item_lines_end:]
-            head = "\n".join(head_lines)
-            tail = ("\n" + "\n".join(tail_lines)) if tail_lines else ""
-            # Reserve room for the largest this suffix could ever be
-            # (shown can't have more digits than total).
-            suffix_budget = available - len(f"\n\n[showing {item_lines_total} of {item_lines_total}]") - len(tail)
-            used = len(head)
-            kept_items: list[str] = []
-            for line in item_lines:
-                cost = len(line) + 1  # the newline joining it to what came before
-                if used + cost > suffix_budget:
-                    break
-                used += cost
-                kept_items.append(line)
-            shown = len(kept_items)
-            new_prose = "\n".join([*head_lines, *kept_items])
-            suffix = f"\n\n[showing {shown} of {item_lines_total}]{tail}"
-            body = f"{new_prose}{suffix}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
-        else:
-            suffix = "\n\n[truncated]"
-            keep = max(0, available - len(suffix))
-            body = f"{prose[:keep]}{suffix}\n\n---GATEKEEPER-RESPONSE---\n{yaml_block}\n---END---\n"
 
-    return body
+@dataclass(frozen=True)
+class BatchItemInput:
+    """One batch item's finished outcome -- everything render_batch_reply
+    needs to render its portion and list it in batch_results. Built by
+    app/pipeline.py from its own per-item _RequestState after running
+    each batch item independently through Layers 1(request)-4."""
+
+    parsed_request: ParsedRequest
+    status: str
+    error_code: str | None
+    retryable: bool
+    detail: str | None
+    ignored_params: tuple[str, ...]
+    output: OutputScreenResult | None  # already scoped to this item's own keys -- see app/output_screen.py's scoped_output
+    render_kwargs: dict  # gmail_results/calendar_results/.../capabilities, from ExecutionResults.render_kwargs()
+
+
+def render_batch_reply(
+    batch_request_id: str,
+    items: list[BatchItemInput],
+    *,
+    combined_output: OutputScreenResult | None,
+    requests_remaining_today: int | None = None,
+) -> str:
+    """One reply for every item in a `batch` request (app/pipeline.py):
+    each item ran as its own first-class request (own dedupe, own policy
+    decision, own audit record) -- this only combines their PROSE into
+    one email and their statuses into one `batch_results` list, reusing
+    the exact same per-verb rendering `_build_prose` already has for a
+    single request, so a fix to how (say) a withheld calendar event
+    renders applies here too, automatically."""
+    item_blocks: list[str] = []
+    batch_results: list[dict] = []
+    total_result_count = 0
+    for i, item in enumerate(items):
+        prose = _build_prose(
+            item.parsed_request, item.status, item.error_code,
+            retryable=item.retryable, detail=item.detail, output=item.output,
+            ignored_params=item.ignored_params, **item.render_kwargs,
+        )
+        header = (
+            f"Item {i + 1} ({sanitize_output(item.parsed_request.verb)}, "
+            f"request_id: {sanitize_output(item.parsed_request.request_id)}):"
+        )
+        block_lines = "\n".join(f"  {line}" for line in prose.lines)
+        item_blocks.append(f"{header}\n{block_lines}" if block_lines else header)
+        total_result_count += prose.result_count
+        batch_results.append({
+            "request_id": sanitize_output(item.parsed_request.request_id),
+            "verb": sanitize_output(item.parsed_request.verb),
+            "status": sanitize_output(item.status),
+            "error_code": sanitize_output(item.error_code) if item.error_code is not None else None,
+            "retryable": item.retryable,
+        })
+
+    yaml_block = _status_block(
+        batch_request_id, "completed", None, total_result_count, False, combined_output,
+        requests_remaining_today=requests_remaining_today, extra={"batch_results": batch_results},
+    )
+    # Each element of item_blocks is one item's ENTIRE prose (however many
+    # lines) -- treating the whole list as the "items" region means
+    # _finalize_body's boundary-aware truncation drops whole items from
+    # the end, never mid-item, the same guarantee render_reply gives a
+    # single request's own result list.
+    return _finalize_body(item_blocks, 0, len(item_blocks), yaml_block, unit="items")
 
 
 _EXPLAINED_DENIALS = {
@@ -494,7 +617,7 @@ def _error_prose(error_code: str | None, retryable: bool) -> str:
 def _status_block(
     request_id: str, status: str, error_code: str | None, result_count: int, retryable: bool,
     output: OutputScreenResult | None = None, ignored_params: list[str] | None = None,
-    requests_remaining_today: int | None = None,
+    requests_remaining_today: int | None = None, extra: dict | None = None,
 ) -> str:
     block: dict = {
         # First key, deliberately: a protocol-level fact about which
@@ -523,6 +646,10 @@ def _status_block(
         block["screen"] = output.status
     if ignored_params:
         block["ignored_params"] = list(ignored_params)
+    if extra:
+        # Batch-only fields (batch_results) -- kept out of every other
+        # caller's signature since nothing but render_batch_reply uses it.
+        block.update(extra)
     return yaml.safe_dump(block, sort_keys=False, default_flow_style=False).strip()
 
 

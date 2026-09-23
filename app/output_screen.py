@@ -180,6 +180,22 @@ def all_withheld(keys: list[str], fail_closed: bool) -> OutputScreenResult:
     )
 
 
+def scoped_output(result: OutputScreenResult, prefix: str) -> OutputScreenResult:
+    """A view of `result` containing only the verdicts whose key starts
+    with `prefix + ":"`, with the prefix stripped back off. Used by
+    app/pipeline.py's batch handling: every item's output items are
+    screened together in ONE combined screen_items() call (namespaced
+    `f"item{i}:{key}"`, so 25 items cost one Jev call instead of 25), then
+    each item gets its own scoped view back -- is_withheld(key) works with
+    the item's own, unprefixed keys, and withheld_count/max_sensitive/etc.
+    are correctly scoped to just that item, for its own audit record."""
+    ns = f"{prefix}:"
+    return OutputScreenResult(
+        verdicts={key[len(ns):]: v for key, v in result.verdicts.items() if key.startswith(ns)},
+        status=result.status,
+    )
+
+
 class OutputScreen(Protocol):
     def screen_items(self, items: dict[str, dict[str, str]]) -> OutputScreenResult: ...
     def screen_text(self, text: str) -> tuple[float | None, float | None]: ...

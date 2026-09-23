@@ -53,6 +53,11 @@ _FIELD_ORDER = [
     "event_id", "timestamp", "agentmail_message_id", "sender",
     "layer0_verdict", "layer1_verdict",
     "parsed_request_id", "parsed_verb", "parsed_source",
+    # Set only for a request that ran as one item of a `batch` (the
+    # batch's own request_id, i.e. the AgentMail message's fallback id or
+    # its stated request_id) -- lets every item's record from the same
+    # batch be correlated. None for an ordinary, non-batched request.
+    "batch_id",
     # Payload rail (added 2026-09-22): counts only, never payload text.
     "payload_count", "payload_chars",
     "injection_score", "payload_injection_score", "injection_screen_status",
@@ -96,6 +101,7 @@ class AuditRecord:
     parsed_request_id: str | None = None
     parsed_verb: str | None = None
     parsed_source: str | None = None  # "block" | "llm" | "screened" | "llm_skipped" | None
+    batch_id: str | None = None
     payload_count: int = 0
     payload_chars: int = 0
     # TypeSafe/Jev Noul probability that this email attempts a prompt

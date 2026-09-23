@@ -34,6 +34,23 @@ Guarantees, in order of where processing can stop:
      it's rendered: flagged items go out with their text withheld (ids
      kept), and a calendar write that would send a flagged title to
      attendees is refused before it happens.
+
+`batch` (added 2026-09-23) generalizes guarantee 4 rather than special-
+casing around it: app/request_parser.py resolves a `verb: batch` block
+entirely at Layer 2 into N ordinary ParsedRequests (never a real Verb the
+policy engine knows about), and each one runs independently through
+_run_batch_item -- its own dedupe, policy decision, execution, quota
+slot, and eventual audit record (tagged with the outer request's id as
+`batch_id`). Still exactly ONE reply per webhook: render_batch_reply
+(app/reply_guard.py) combines every item's own rendering into one email.
+Two things are deliberately NOT per-item, for cost and latency reasons:
+inbound injection screening (the whole batch block is screened ONCE,
+like any single request's block -- one high score anywhere in it gates
+every WRITE item via apply_screen_gate, the safe direction to be
+imprecise in) and outbound content screening (every item's output is
+screened in ONE combined Jev call, app/output_screen.py's scoped_output
+splitting the verdicts back out per item) -- BATCH_MAX_ITEMS (25)
+separate Jev calls in one request would risk the Cloud Run timeout.
 """
 from __future__ import annotations
 
@@ -65,6 +82,7 @@ from app.output_screen import (
     all_withheld,
     event_key,
     gmail_key,
+    scoped_output,
 )
 from app.policy import (
     CalendarCreateEventParams,
@@ -82,7 +100,7 @@ from app.policy import (
     parse_error_decision,
 )
 from app.reader_llm import ReaderLLM
-from app.reply_guard import render_minimal_reply, render_reply, send_reply
+from app.reply_guard import BatchItemInput, render_batch_reply, render_minimal_reply, render_reply, send_reply
 from app.request_parser import EmailParts, ParsedRequest, fallback_request_id_for, parse_request, split_email
 from app.state_store import (
     REQUEST_COMPLETED,
@@ -164,6 +182,14 @@ class _RequestState:
     output: OutputScreenResult | None = None
     output_reply_sensitive: float | None = None
     output_reply_injection: float | None = None
+    # Populated only for a `batch` request (state.parsed.verb == "batch"):
+    # one finished _RequestState per item, run independently through
+    # Layers 1(request)-4. `output` above holds the COMBINED (unscoped)
+    # output-screen result across every item, for the outer status
+    # block's aggregate withheld_count/screen; each item's own `output`
+    # is a view scoped to just its keys (app/output_screen.py's
+    # scoped_output). See _run_batch/render_batch_reply.
+    batch_items: list[_RequestState] | None = None
 
 
 def extract_message_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -307,6 +333,18 @@ def handle_webhook(
     _send(state, agentmail_client, output_screen, state_store)
     _append_audit(audit_log, _audit_record(state))
     _finalize_request_status(state, state_store)
+    if state.batch_items is not None:
+        # Each item gets its own final status and its own audit record
+        # (batch_id = the outer request_id, for correlation) -- deferred
+        # until here, rather than inside _run_batch, so each one reflects
+        # whether the ONE combined reply actually reached the requester
+        # (reply_error/reply_message_id), exactly like a standalone
+        # request's own audit record does.
+        for item_state in state.batch_items:
+            item_state.reply_error = state.reply_error
+            item_state.reply_message_id = state.reply_message_id
+            _finalize_request_status(item_state, state_store)
+            _append_audit(audit_log, _audit_record(item_state, batch_id=state.parsed.request_id))
     return WebhookOutcome(200, state.outcome_reason)
 
 
@@ -368,6 +406,29 @@ def _run_request(
             return stage
         state_store.set_request_status(state.parsed.request_id, REQUEST_PROCESSING, state.sender)
         state.request_started = True
+
+        # `batch` is resolved entirely in app/request_parser.py into N
+        # ordinary ParsedRequests (state.parsed.batch_items); each one runs
+        # independently through the same Layers 1(request)-4 below, with
+        # its own dedupe/policy/execute/audit record and its own quota
+        # slot -- the OUTER batch request_id above is deduped and given a
+        # final status like any request, but never itself consumes a
+        # quota slot (nothing was actually executed under it directly).
+        # A problem with the batch ENVELOPE itself (too many items, an
+        # empty/missing 'requests' list) sets parse_error with batch_items
+        # left empty -- that must fall through to the parse_error_decision
+        # branch below like any other malformed request, not be read as
+        # "an empty batch that ran successfully".
+        if state.parsed.verb == "batch" and not state.parsed.parse_error:
+            stage = "layer4"
+            state.batch_items, state.output = _run_batch(
+                state, state_store=state_store, gmail_client_factory=gmail_client_factory,
+                calendar_client_factory=calendar_client_factory, drive_client_factory=drive_client_factory,
+                output_screen=output_screen,
+            )
+            state.reply_status, state.error_code, state.retryable = "completed", None, False
+            return stage
+
         state_store.record_request(state.sender, state.parsed.request_id)
 
         # ── Layer 3: policy ──────────────────────────────────────────────
@@ -532,6 +593,150 @@ def _status_for_decision(decision: PolicyDecision) -> tuple[str, str | None]:
     return decision.status, decision.error_code
 
 
+def _run_batch_item(
+    item_state: _RequestState,
+    *,
+    state_store,
+    injection_score: float | None,
+    gmail_client_factory: Callable[[], GmailClient],
+    calendar_client_factory: Callable[[], CalendarClient],
+    drive_client_factory: Callable[[], DriveClient],
+    output_screen: OutputScreen,
+) -> None:
+    """One batch item's Layers 1(request)-4, mirroring _run_request's
+    single-request flow exactly (dedupe, PROCESSING/EFFECT_DONE, policy,
+    execute) -- the only difference is `injection_score` is the shared
+    score the whole email was screened with once (see _run_batch's
+    docstring), never a fresh per-item Jev call, and output screening is
+    NOT done here (deferred to one combined call across every item, in
+    _run_batch, for the same reason: BATCH_MAX_ITEMS separate Jev calls in
+    one request risks the Cloud Run timeout). An exception here is caught
+    and turned into that item's own error status -- one item's failure
+    must not abort the rest of the batch."""
+    parsed = item_state.parsed
+    try:
+        if state_store.count_today(item_state.sender) >= MAX_REQUESTS_PER_DAY:
+            item_state.layer1 = "rate_limited"
+            item_state.reply_status, item_state.error_code = "error", "rate_limited"
+            return
+
+        prior = state_store.get_request_status_detail(parsed.request_id)
+        prior_status, prior_updated_at = prior if prior is not None else (None, None)
+        if is_duplicate_request_status(prior_status, prior_updated_at):
+            item_state.layer1 = "duplicate_request"
+            item_state.reply_status, item_state.error_code = "duplicate", "duplicate_request"
+            return
+        state_store.set_request_status(parsed.request_id, REQUEST_PROCESSING, item_state.sender)
+        item_state.request_started = True
+        state_store.record_request(item_state.sender, parsed.request_id)
+
+        if parsed.parse_error:
+            item_state.decision = parse_error_decision(parsed.verb, parsed.parse_error, parsed.parse_error_detail)
+        else:
+            item_state.decision = evaluate_policy(parsed.verb, parsed.params)
+            item_state.decision = apply_screen_gate(item_state.decision, injection_score, INJECTION_DENY_THRESHOLD)
+            item_state.decision = apply_extra_params_gate(item_state.decision, injection_score, INJECTION_DENY_THRESHOLD)
+
+        item_state.results = _execute(
+            item_state.decision, parsed, gmail_client_factory, calendar_client_factory, drive_client_factory,
+            invite_guard=_make_invite_guard(output_screen),
+        )
+        if item_state.results.wrote:
+            state_store.set_request_status(parsed.request_id, REQUEST_EFFECT_DONE, item_state.sender)
+
+        item_state.reply_status, item_state.error_code = _status_for_decision(item_state.decision)
+        item_state.retryable = False
+    except GatekeeperDenied as denied:
+        item_state.reply_status, item_state.error_code, item_state.retryable = "denied", denied.error_code, False
+    except Exception as exc:
+        failure = classify_failure(exc)
+        logger.exception("batch item %s failed (%s)", parsed.request_id, failure.code)
+        item_state.failure_code, item_state.failure_type = failure.code, type(exc).__name__
+        if item_state.results.wrote and item_state.decision is not None:
+            # Same rule as the top-level handler: the write already
+            # happened, so report it as done rather than inviting a
+            # resend that would only hit "duplicate" (effect_done).
+            item_state.reply_status, item_state.error_code = _status_for_decision(item_state.decision)
+            item_state.retryable = False
+        else:
+            item_state.reply_status, item_state.error_code, item_state.retryable = "error", failure.code, failure.retryable
+
+
+def _screen_batch_output(
+    output_screen: OutputScreen, item_states: list[_RequestState]
+) -> OutputScreenResult | None:
+    """One combined screen_items() call across every item's output,
+    namespaced `f"item{i}:{key}"` -- BATCH_MAX_ITEMS items cost one Jev
+    call instead of up to BATCH_MAX_ITEMS, the same fail-mode contract as
+    _screen_output."""
+    combined: dict[str, dict[str, str]] = {}
+    for i, item_state in enumerate(item_states):
+        for key, fields in _output_items(item_state.results).items():
+            combined[f"item{i}:{key}"] = fields
+    if not combined:
+        return None
+    try:
+        return output_screen.screen_items(combined)
+    except Exception:
+        logger.exception("batch output screen failed; applying fail mode %s", OUTPUT_SCREEN_FAIL_MODE)
+        return all_withheld(list(combined), fail_closed=OUTPUT_SCREEN_FAIL_MODE != "open")
+
+
+def _run_batch(
+    state: _RequestState,
+    *,
+    state_store,
+    gmail_client_factory: Callable[[], GmailClient],
+    calendar_client_factory: Callable[[], CalendarClient],
+    drive_client_factory: Callable[[], DriveClient],
+    output_screen: OutputScreen,
+) -> tuple[list[_RequestState], OutputScreenResult | None]:
+    """Runs every item in state.parsed.batch_items independently, each
+    through the exact same per-request pipeline a standalone request
+    uses (_run_batch_item) -- own dedupe, own policy decision, own
+    execution, own quota slot, own eventual audit record (appended by the
+    caller, app/handle_webhook, once the combined reply's send outcome is
+    known). Returns the finished per-item states plus the ONE combined
+    output-screen result (used for the outer reply's aggregate
+    withheld_count/screen, and scoped per item on each item_state.output
+    for render_batch_reply)."""
+    item_states: list[_RequestState] = []
+    for item_parsed in state.parsed.batch_items:
+        item_state = _RequestState(
+            message_id=state.message_id, sender=state.sender, parsed=item_parsed,
+            injection_score=state.injection_score, payload_injection_score=state.payload_injection_score,
+            injection_screen_status=state.injection_screen_status,
+        )
+        _run_batch_item(
+            item_state, state_store=state_store, injection_score=state.injection_score,
+            gmail_client_factory=gmail_client_factory, calendar_client_factory=calendar_client_factory,
+            drive_client_factory=drive_client_factory, output_screen=output_screen,
+        )
+        item_states.append(item_state)
+
+    combined_output = _screen_batch_output(output_screen, item_states)
+    for i, item_state in enumerate(item_states):
+        item_state.output = scoped_output(combined_output, f"item{i}") if combined_output is not None else None
+
+    return item_states, combined_output
+
+
+def _batch_item_input(item_state: _RequestState) -> BatchItemInput:
+    return BatchItemInput(
+        parsed_request=item_state.parsed,
+        status=item_state.reply_status,
+        error_code=item_state.error_code,
+        retryable=item_state.retryable,
+        detail=item_state.decision.reason if item_state.decision else None,
+        ignored_params=(
+            item_state.decision.ignored_params
+            if item_state.decision and item_state.reply_status == "completed" else ()
+        ),
+        output=item_state.output,
+        render_kwargs=item_state.results.render_kwargs(),
+    )
+
+
 def _unresolved_request(message_id: str) -> ParsedRequest:
     """Stand-in until (or if) Layer 2 resolves a real request -- the
     request_id is still stable per message, so a reply is always
@@ -549,14 +754,22 @@ def _send(state: _RequestState, agentmail_client: AgentMailClient, output_screen
     except Exception:
         logger.exception("could not compute requests_remaining_today for %s", state.sender)
     try:
-        body = render_reply(
-            state.parsed, state.reply_status, state.error_code,
-            retryable=state.retryable, detail=state.decision.reason if state.decision else None,
-            output=state.output,
-            ignored_params=state.decision.ignored_params if state.decision and state.reply_status == "completed" else (),
-            requests_remaining_today=requests_remaining_today,
-            **state.results.render_kwargs(),
-        )
+        if state.batch_items is not None:
+            body = render_batch_reply(
+                state.parsed.request_id,
+                [_batch_item_input(item_state) for item_state in state.batch_items],
+                combined_output=state.output,
+                requests_remaining_today=requests_remaining_today,
+            )
+        else:
+            body = render_reply(
+                state.parsed, state.reply_status, state.error_code,
+                retryable=state.retryable, detail=state.decision.reason if state.decision else None,
+                output=state.output,
+                ignored_params=state.decision.ignored_params if state.decision and state.reply_status == "completed" else (),
+                requests_remaining_today=requests_remaining_today,
+                **state.results.render_kwargs(),
+            )
     except Exception:
         logger.exception("rendering the reply for %s failed; sending a minimal reply", state.parsed.request_id)
         body = render_minimal_reply(
@@ -607,12 +820,20 @@ def _finalize_request_status(state: _RequestState, state_store) -> None:
         logger.exception("could not record final status %s for request %s", status, state.parsed.request_id)
 
 
-def _audit_record(state: _RequestState) -> AuditRecord:
+def _audit_record(state: _RequestState, *, batch_id: str | None = None) -> AuditRecord:
     results = state.results
-    parsed = state.parsed if state.layer1 != "rate_limited" else None
+    # A TOP-LEVEL request rate-limited before Layer 2 ever ran still has
+    # `state.parsed` set to the _unresolved_request() placeholder, not a
+    # real parse -- nulled out here so a rate-limited record never claims
+    # a request_id/verb it never actually resolved. A BATCH ITEM's
+    # `parsed` is always the real, already-parsed item (parsing happens
+    # once, for the whole batch, before any item's rate-cap check runs),
+    # so that exception doesn't apply to it.
+    parsed = state.parsed if (batch_id is not None or state.layer1 != "rate_limited") else None
     return AuditRecord(
         agentmail_message_id=state.message_id,
         sender=state.sender,
+        batch_id=batch_id,
         layer0_verdict="ok",
         layer1_verdict=state.layer1,
         parsed_request_id=parsed.request_id if parsed else None,
