@@ -87,13 +87,13 @@ What the refactor changes (one commit per phase on the branch):
 Facts about production (verified 2026-09-22 with `scripts/verify_audit_chain.py`):
 - **Instinct uses the protocol.** It sends daily fenced-block requests with unique request_ids,
   mostly `gmail.search`. Open item #1 (the Instinct protocol test) is effectively done.
-  - It once tried a verb that doesn't exist, `drive.capabilities` — a hint that a
-    capabilities/help verb would be useful.
+  - It once tried a verb that doesn't exist, `drive.capabilities` — now a real verb,
+    `capabilities` (see below), so that specific gap is closed once this deploys.
 - **The audit chain is intact** (65 entries).
 - **Never run live yet:** `calendar.create_event`/`update_event`/`delete_event` and
   `drive.create_file` have still never run live; the new e2e cases cover them.
 
-Tests: `uv run pytest -q`, 419 passing, fully offline (fakes behind Protocols), and run in CI.
+Tests: `uv run pytest -q`, 459 passing, fully offline (fakes behind Protocols), and run in CI.
 There are three live suites, all skipped unless `RUN_E2E=1`; they send real traffic, so run
 them deliberately:
 - `tests/test_e2e_live.py` sends real email through the deployed service. It now also covers:
@@ -102,9 +102,102 @@ them deliberately:
   - the calendar lifecycle, including containment and a freeform update;
   - the injection write gate;
   - a withheld code-bearing email;
-  - a meeting location set freeform then cleared via a block update.
+  - a meeting location set freeform then cleared via a block update;
+  - a two-item batch (a read + `capabilities`) replying once with both outcomes.
 - `tests/test_injection_screen_live.py` calls the real TypeSafe API.
 - `tests/test_sheets_live.py` uses the real Sheets API on scratch spreadsheets.
+
+## Second-round fixes (2026-09-23, same branch, still not deployed)
+
+A merged review of the refactor above — my own pass plus Instinct's own review of the branch,
+posted as the sole comment on PR #1 — found one real security gap and a list of smaller issues
+and protocol-UX gaps. All fixed on `refactor/hardening-2026-09` (one commit per item), on top of
+everything above, still undeployed. 459 tests passing (up from 419).
+
+- **Calendar invite-guard gap closed (the one real bug).** `update_event` only ran the invite
+  guard when `add_attendees` was given, but Google's `sendUpdates="all"` notifies EXISTING
+  attendees of ANY changed field — a title/location-only rename on an event that already had
+  guests reached them unscreened. The guard now fires whenever the resulting attendee list is
+  non-empty and title or location is changing, not just on new guests. Found independently by my
+  review and Instinct's.
+- **Attendee cap now covers the whole event, not just one request.** `EVENT_ATTENDEES_MAX` (10)
+  only checked the incoming `add_attendees` list; `update_event` now denies
+  (`too_many_attendees`) when the event's resulting total would exceed it.
+- **A malformed `AGENTMAIL_WEBHOOK_SECRET` no longer 500s.** `verify_signature`'s base64 decode
+  is now wrapped; a bad secret is a clean `invalid_webhook_secret` denial like every other
+  rejection branch, not an uncaught exception and an AgentMail retry storm.
+- **YAML no longer silently retypes string fields.** PyYAML's default resolver turned unquoted
+  `Off`/`No`/`Yes`/`On` into `bool` and an unquoted `H:MM` value into a sexagesimal `int` —
+  `title: Off` or an unquoted `start_time` would wrongly deny a well-formed request (fails safe,
+  not a security hole, but Instinct hit the `start_time` case in real use). `app/yaml_safe.py`'s
+  narrowed `SafeLoader` fixes this once, for every string field; normal ints/floats are
+  unaffected.
+- **`MAX_REQUESTS_PER_DAY` raised 50 → 100** (owner's decision): the new batch verb lets one
+  email consume many quota slots at once, and this cap is an abuse backstop, not a limit meant
+  to bind tightly. **Still only 100 in code — the live env var needs updating at deploy time.**
+- **A wedged `processing` status is no longer a permanent duplicate.** A process that died
+  mid-request (Cloud Run timeout, a deploy kill, OOM) after recording `processing` but before
+  finishing used to leave that request_id stuck as a duplicate forever, with resend replies
+  falsely claiming an earlier reply existed. A `processing` row older than
+  `PROCESSING_STALE_AFTER_SECONDS` (600s default) is no longer a duplicate; the resend actually
+  re-runs.
+- **URLs are no longer redacted from replies** (owner's decision, reversing the original
+  refactor's behavior): I want Instinct able to see and act on a link someone shared. Jev's
+  outbound "targets the reader" screen remains the defense against a link crafted to phish or
+  exfiltrate; the other three redactions (passwords, card numbers, one-time codes) are
+  unchanged, and their OTP check now looks across a PAIR of related fields (a Gmail
+  subject+snippet, an event title+location) instead of each in isolation, closing a gap where a
+  code split across the two could slip through.
+- **Truncated replies say how much was cut.** A reply hitting `REPLY_MAX_CHARS` used to show a
+  flat `[truncated]` while `result_count` still claimed the full count; it now truncates at the
+  last whole result (never mid-item) and reports `[showing N of M results]`.
+- **New `protocol_version` and `requests_remaining_today` fields**, first and eighth keys in
+  every status block — Instinct's own top ask, so it can tell which build answered during a
+  deploy transition, and budget its own daily usage. `protocol_version` is a git short sha, set
+  by a new `GIT_SHA` env var at deploy time (not baked into the image); `dev` locally/in tests.
+- **New `capabilities` verb** (read-only, no Google API call): reports `protocol_version`, the
+  daily quota, the batch item cap, and every verb's own params/bounds, read live from the same
+  `VERB_SPECS` registry `app/policy.py`'s validators use — can't drift from what's actually
+  enforced the way the hand-pasted standing rule below can. `IMPLEMENTED_VERBS`/`VERB_PARAMS`/
+  `WRITE_VERBS` are now all derived from that one registry instead of three separately
+  hand-maintained tables (a prior review flagged the old shape as a risk: a future verb added to
+  one but forgotten from `WRITE_VERBS` would silently fail OPEN on the injection-screen write
+  gate).
+- **New `batch` verb**: run 1–25 requests in one email, one combined reply. Each item is a
+  first-class request — own dedupe, own policy decision, own execution, own quota slot, own
+  eventual audit record (tagged with the outer request's id as the new `AuditRecord.batch_id`
+  field) — a batch is purely a parsing and reply-aggregation convenience, not a new execution
+  model. Resolved entirely in `app/request_parser.py`'s Layer 2 into N ordinary
+  `ParsedRequest`s; `"batch"` is never a real `Verb` the policy engine knows about, and it's
+  block-path only (no freeform form). Two things are deliberately NOT per-item, for cost and
+  latency: inbound injection screening (the whole batch block is screened once, like a single
+  request — a high score anywhere in it gates every WRITE item, the safe direction to be
+  imprecise in) and outbound screening (every item's output goes through one combined Jev call,
+  `app/output_screen.py`'s new `scoped_output()` splitting verdicts back out per item) — 25
+  separate Jev calls in one request would risk the Cloud Run timeout.
+- **`calendar.list_events` echoes its resolved date window** in the reply prose ("Found N
+  event(s) for Tue Sep 23"), matching what `create_event` already does for its resolved time —
+  `day_offset` resolves at PROCESSING time, not composition time, so an email sent near local
+  midnight can land on a different day than intended; this makes it checkable.
+- **Small architecture cleanups** (no behavior change except the one below): the
+  `apply_screen_gate`/`apply_extra_params_gate` threshold checks' opposite "no signal" handling
+  is now named explicitly instead of implicit in inverted comparisons; the control-character
+  regex and the `---GATEKEEPER-RESPONSE---`/`---END---` fence each went from being defined
+  separately in `policy.py`/`reply_guard.py` (or four times within `reply_guard.py`) to one
+  definition; the repeated `outcome_reason`/`layer1` writes at each early-return branch in
+  `pipeline.py` are now one `_early_return()` call. One efficiency change: the whole-reply Jev
+  re-screen in `_send()` (an audit-only calibration signal) is gone — every item was already
+  screened individually a few lines earlier, so `output_reply_sensitive`/`output_reply_injection`
+  now come from those already-computed verdicts instead of a second network round trip per
+  reply; `OutputScreen.screen_text()` is deleted as dead code. Left as-is: a calendar write's
+  title/location is still screened twice (once by the invite guard before the write, again by
+  the general output screen for the reply) — fixing that would mean threading a screening result
+  out through `CalendarClient.update_event`'s return shape, a bigger change than this cleanup
+  pass justified for an infrequent path (only calendar writes with attendees).
+- **`docs/PROTOCOL.md` fully updated**: the new fields, verbs, `too_many_attendees`, the
+  corrected sensitive-query description (financial searches were already allowed; the doc still
+  said otherwise), and a revised standing-rule paragraph for Instinct (not yet sent — that's
+  still Open item #2, now with more content to include).
 
 ## Write access design (2026-09-15, tightened 2026-09-22)
 
@@ -137,16 +230,22 @@ decisions, all mine, all deliberate:
 ## Open items (next steps, in order)
 
 1. **Deploy the refactor**, with my go-ahead, following docs/RUNBOOK.md's procedure: merge the
-   PR, clean pushed commit, `--labels=commit=<sha> --timeout=120 --max-instances=1`. Then:
+   PR, clean pushed commit, `--labels=commit=<sha> --timeout=120 --max-instances=1
+   --update-env-vars=GIT_SHA=<sha>`. Then:
+   - update the live `MAX_REQUESTS_PER_DAY` env var to 100 (code default was already wrong
+     before this deploy; don't let the live value stay at the old 50);
    - run `scripts/verify_audit_chain.py`, and check that new state-sheet rows land in column A;
-   - run the three live suites and archive each passing test's Gmail thread (rule below);
+   - run the three live suites (now including a batch case) and archive each passing test's
+     Gmail thread (rule below);
    - **calibrate the Jev thresholds** (`OUTPUT_SENSITIVE_THRESHOLD` 0.5,
      `OUTPUT_INJECTION_THRESHOLD` 0.7, `INJECTION_DENY_THRESHOLD` 0.85) from real scores in the
      audit log before trusting them;
    - pin `GOOGLE_DRIVE_FOLDER_ID` once the first live `drive.create_file` logs it.
-2. **Send Instinct the updated standing rule** (docs/PROTOCOL.md, last section): payload
-   sections, add/remove attendees, unknown params ignored (listed in `ignored_params`),
-   `retryable`, withheld items.
+2. **Send Instinct the updated standing rule** (docs/PROTOCOL.md, last section, now 11 points):
+   payload sections, add/remove attendees (+ the total-10 cap), unknown params ignored (listed
+   in `ignored_params`), `retryable`, withheld items, the `capabilities` verb, the `batch` verb,
+   `protocol_version`/`requests_remaining_today`, financial searches allowed, links no longer
+   stripped.
 3. Remove `roishik10@gmail.com` from `ALLOWED_SENDERS` (it was added for testing), and revoke
    Instinct's own Google access at myaccount.google.com/connections. The catch: the live e2e
    suite sends from that address, so it needs another sender first (or stays, knowingly).
@@ -154,7 +253,6 @@ decisions, all mine, all deliberate:
    rejection were ported; its Cloud Tasks queue was rejected (inline processing chosen). Delete
    it once the refactor is merged, with my OK.
 5. Later:
-   - a capabilities/help verb (Instinct already tried to discover one);
    - `drive.search` / `contacts.search`;
    - an injection test suite in CI (promptfoo/AgentDojo);
    - a daily digest;
@@ -178,37 +276,51 @@ under one process-wide lock) → `pipeline.handle_webhook`:
    answered (HTTP 202).
 1. `state_store.py` (Sheets): message dedupe (before anything else), request status and the
    daily cap. From here on, every path ends in one reply and one audit record
-   (`failures.py`).
+   (`failures.py`). A `processing` row older than `PROCESSING_STALE_AFTER_SECONDS` is treated as
+   abandoned, not a duplicate.
 2. `request_parser.py` works in order:
    - `split_email` pulls out payload sections first;
-   - exactly one fenced `---GATEKEEPER-REQUEST---` YAML block, with payload references
-     substituted;
+   - exactly one fenced `---GATEKEEPER-REQUEST---` YAML block (parsed with a narrowed
+     `yaml_safe.py` loader so unquoted `Off`/`No`/`9:00` stay strings, not bool/int), with
+     payload references substituted; `verb: batch` is resolved HERE into N ordinary
+     `ParsedRequest`s (`_parse_batch`) — never a real `Verb` the policy engine sees;
    - otherwise the quarantined `reader_llm.py` (Haiku 4.5, **no tools**, structured output,
-     `extra="forbid"`, two-stage: verb, then that verb's ≤7-field schema).
+     `extra="forbid"`, two-stage: verb, then that verb's ≤7-field schema). No batch form here.
 
    `injection_screen.py` (Jev) scores each part in between; see `jev.py` for the shared call
-   plumbing.
+   plumbing. A `batch` email's whole block is scored once, not per item.
 3. `policy.py`:
    - deny by default, bounded params;
+   - one `VERB_SPECS` registry per verb (params, write-or-not, bounds) that
+     `IMPLEMENTED_VERBS`/`VERB_PARAMS`/`WRITE_VERBS` are all derived from, and that the
+     `capabilities` verb reads back to Instinct;
    - unknown params are never read, and are tolerated only if Jev passes
      (`apply_extra_params_gate`);
-   - one-time-code and password-reset Gmail queries are refused;
+   - one-time-code and password-reset Gmail queries are refused (financial searches allowed);
    - `apply_screen_gate` for injected writes;
    - `parse_error_decision` for Layer 2 failures.
-4. Executors, one verb per request:
+4. Executors, one verb per request (or one per batch item):
    - `gmail_executor.py`: search (metadata only, batched) and create_draft (drafts only, never
      sends; threading headers);
    - `calendar_executor.py`: list, plus create/update/delete, contained to gatekeeper-tagged
-     events, additive guests, `sendUpdates="all"`;
-   - `drive_executor.py`: one app-owned folder.
-5. `output_screen.py` (Jev screens every item, flagged text withheld, fails closed), then
-   `reply_guard.py`:
+     events, additive guests capped at 10 total, `sendUpdates="all"`, the invite guard covering
+     both new guests AND a title/location change on an event that already has guests;
+   - `drive_executor.py`: one app-owned folder;
+   - `capabilities.py`: not really an executor — no API call, just reflects `VERB_SPECS` +
+     config back as data.
+5. `output_screen.py` (Jev screens every item, flagged text withheld, fails closed — a batch's
+   items are all screened in one combined call, then split back out per item with
+   `scoped_output()`), then `reply_guard.py`:
    - a **deterministic template**: no generative LLM sees Google data;
-   - regex redaction plus structural escaping;
-   - replies only to the verified sender, with no cc/bcc.
+   - regex redaction (passwords, card numbers, one-time codes — URLs are deliberately NOT
+     redacted, owner's decision) plus structural escaping;
+   - replies only to the verified sender, with no cc/bcc;
+   - `render_batch_reply` combines every batch item's own rendering into one reply.
 
 Audit: `audit_log.py` (sha256 hash chain in Sheets). It stores ids and counts for reads,
-ids plus recipient for writes, and scores/verdicts/failure codes, never literal content.
+ids plus recipient for writes, and scores/verdicts/failure codes, never literal content. A batch
+item's record carries `batch_id` (the outer request's id) so every item from one batch email can
+be correlated; the outer `batch` request itself also gets one record, `batch_id=None`.
 Health: `GET /health` (Cloud Run reserves `/healthz`).
 
 ## Infrastructure facts
@@ -219,7 +331,7 @@ Health: `GET /health` (Cloud Run reserves `/healthz`).
 | Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 60s live; the refactor's deploy raises it to 120s |
 | Runtime service account | `gatekeeper-run@data-gatekeeper-roishik.iam.gserviceaccount.com` (secretAccessor per secret only) |
 | Secret Manager | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `ANTHROPIC_API_KEY`, `AGENTMAIL_API_KEY`, `AGENTMAIL_WEBHOOK_SECRET`, `TYPESAFE_API_KEY` |
-| Env vars (non-secret) | `AGENTMAIL_INBOX_ID`/`GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to`, `ALLOWED_SENDERS=roishikler@mail.instinct.com,roishik10@gmail.com`, `OWNER_EMAIL=roishik10@gmail.com` (no longer used by the service after the refactor; the e2e tests use it), `OWNER_TIMEZONE=Asia/Jerusalem`, `MAX_REQUESTS_PER_DAY=50` (**not actually enforced before the refactor**: the state-sheet bug), `ANTHROPIC_MODEL=claude-haiku-4-5-20251001`, `AUDIT_LOG_BACKEND=sheets`, `STATE_STORE_BACKEND=sheets`. New tunables all default in code (`.env.example`): `READER_LLM_MAX_INPUT_CHARS`, `OUTPUT_*`, `JEV_*` |
+| Env vars (non-secret) | `AGENTMAIL_INBOX_ID`/`GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to`, `ALLOWED_SENDERS=roishikler@mail.instinct.com,roishik10@gmail.com`, `OWNER_EMAIL=roishik10@gmail.com` (no longer used by the service after the refactor; the e2e tests use it), `OWNER_TIMEZONE=Asia/Jerusalem`, `MAX_REQUESTS_PER_DAY=50` (**not actually enforced before the refactor**: the state-sheet bug; code default is now 100 as of the second-round fixes, but the LIVE value stays 50 until updated at deploy), `ANTHROPIC_MODEL=claude-haiku-4-5-20251001`, `AUDIT_LOG_BACKEND=sheets`, `STATE_STORE_BACKEND=sheets`. New tunables all default in code (`.env.example`): `READER_LLM_MAX_INPUT_CHARS`, `OUTPUT_*`, `JEV_*`, `PROCESSING_STALE_AFTER_SECONDS`. **Not yet set anywhere**: `GIT_SHA` (needed at deploy time for the new `protocol_version` reply field; defaults to `"dev"` if absent) |
 | Audit log sheet | `GOOGLE_SHEETS_LOG_SPREADSHEET_ID=1Ra4fpTY2ABoD39tLE4UJpT7FuJrauK-CrdcHVA2fmY8` |
 | State sheet | `GOOGLE_SHEETS_STATE_SPREADSHEET_ID=1TjTLHMi1k01K4JWkiHJZ7OGtb8C5-8WUAlH-4RDe2YA` (tabs: `messages`, `request_status`, `daily_counts`; legacy `requests` is dead) |
 | Drive write folder | `GOOGLE_DRIVE_FOLDER_ID` is still not set. The first live `drive.create_file` creates it and logs the id |
@@ -233,8 +345,11 @@ Health: `GET /health` (Cloud Run reserves `/healthz`).
 Only a clean, pushed commit (see docs/RUNBOOK.md for why):
 ```bash
 git status --porcelain && git push && SHA=$(git rev-parse --short HEAD)
-gcloud run deploy data-gatekeeper --project=data-gatekeeper-roishik --region=europe-west1 --source=. --labels=commit=$SHA --timeout=120 --max-instances=1 --quiet
+gcloud run deploy data-gatekeeper --project=data-gatekeeper-roishik --region=europe-west1 --source=. --labels=commit=$SHA --timeout=120 --max-instances=1 --update-env-vars=GIT_SHA=$SHA,MAX_REQUESTS_PER_DAY=100 --quiet
 ```
+`GIT_SHA` and the `MAX_REQUESTS_PER_DAY=100` bump are both new with the second-round fixes
+(2026-09-23) — without `GIT_SHA` set, every reply's `protocol_version` reads `dev`; without
+bumping the quota, the live value stays at the old 50 even though the code default is now 100.
 Env vars and secrets persist across source deploys. To change the allowlist (values contain
 commas, so use gcloud's custom delimiter):
 ```bash
@@ -281,5 +396,7 @@ classifier also blocks it without explicit approval. After every deploy, run
 - The old personal site deploy script (`personal_links-fixed/deploy.sh`) builds from the
   working tree. That repo had uncommitted WIP that was already live, so don't deploy it from
   a clean checkout.
-- Commit messages end with `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Public repo:
-  https://github.com/roishik/data-gatekeeper-agent
+- Commit messages end with a `Co-Authored-By:` trailer naming whichever Claude model made the
+  commit (Opus 5 through 2026-09-22; Sonnet 5 for the second-round fixes on 2026-09-23) —
+  match whatever the current session's own attribution instruction says, not a fixed model name.
+  Public repo: https://github.com/roishik/data-gatekeeper-agent

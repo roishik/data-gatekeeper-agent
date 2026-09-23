@@ -169,7 +169,8 @@ git status --porcelain            # must print nothing
 git push                          # the commit being deployed must be on GitHub
 SHA=$(git rev-parse --short HEAD)
 gcloud run deploy data-gatekeeper --project=data-gatekeeper-roishik --region=europe-west1 \
-  --source=. --labels=commit=$SHA --timeout=120 --max-instances=1 --quiet
+  --source=. --labels=commit=$SHA --timeout=120 --max-instances=1 \
+  --update-env-vars=GIT_SHA=$SHA,MAX_REQUESTS_PER_DAY=100 --quiet
 ```
 
 - `--labels=commit=$SHA` makes "which commit is live?" answerable with
@@ -178,6 +179,13 @@ gcloud run deploy data-gatekeeper --project=data-gatekeeper-roishik --region=eur
   Gmail, Jev and the reply in sequence must never be killed mid-write.
 - `--max-instances=1` is part of the audit chain's single-writer guarantee
   (see `app/main.py`).
+- `GIT_SHA=$SHA` (new, 2026-09-23): every reply's `protocol_version` field
+  reads this env var, falling back to `"dev"` if it's never set. Without
+  it, Instinct can't tell a deploy happened from the reply alone.
+- `MAX_REQUESTS_PER_DAY=100` (raised from 50, 2026-09-23, owner's decision):
+  the code default changed too, but a live env var always wins over the
+  code default on redeploy, so this must be set explicitly at least once
+  or the live service stays at 50.
 
 To change the allowlist (values contain commas, so use gcloud's custom
 delimiter). This widens who can reach the owner's data, so it's the
