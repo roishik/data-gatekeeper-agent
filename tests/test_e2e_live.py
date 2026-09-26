@@ -558,3 +558,194 @@ def test_e2e_batch_of_two_reads_runs_both_and_replies_once():
     assert f"request_id: {item2_id}" in reply_body
     assert "gmail.search (read)" in reply_body
     assert "capabilities (read)" in reply_body
+
+
+# ── Calendar extensions (2026-09-25): calendar selection, overnight/all-day
+# events, a past window with a query. Added because the offline tests use
+# fakes for Google, and three things about the real API were assumptions:
+# the private `gatekeeper` tag being readable on a SHARED calendar's copy of
+# an event (update/delete only work if it is), events.patch accepting nulls
+# when an event switches between all-day and timed, and `q` search.
+#
+# The family-calendar test writes to a calendar other people share: the
+# event is created with no attendees (nothing is invited or emailed by this
+# service) and deleted again at the end, but a member's own notification
+# settings could still show it to them briefly. Which calendar is picked by
+# name (E2E_CALENDAR_NAME, default "למשפחה"); the test skips if there is no
+# such calendar.
+
+FAMILY_CALENDAR_NAME = os.environ.get("E2E_CALENDAR_NAME", "למשפחה")
+
+
+def _calendar_api():
+    from googleapiclient.discovery import build
+
+    from app.google_auth_helper import build_google_credentials
+
+    return build("calendar", "v3", credentials=build_google_credentials([_CALENDAR_EVENTS_SCOPE]), cache_discovery=False)
+
+
+def _listed_calendars(body: str) -> list[tuple[str, str, str]]:
+    """(name, access role, calendar_id) for every line of a list_calendars reply."""
+    return re.findall(r"^- (.*?) — access: (\w+) \(calendar_id: (\S+?)\)$", body, re.M)
+
+
+def _event_id_and_calendar(body: str) -> tuple[str, str]:
+    match = re.search(r"\(event_id: ([A-Za-z0-9_]+), calendar_id: ([^)\s]+)\)", body)
+    assert match, body
+    return match.group(1), match.group(2)
+
+
+def test_e2e_list_calendars_and_the_family_calendar_lifecycle():
+    """list_calendars -> create a 19-hour overnight event on the family
+    calendar (no attendees) -> read it back through the Calendar API ->
+    list_events on that calendar with a query -> update it all-day, then back
+    to timed (the patch-with-nulls assumption) -> delete it there."""
+    _require_config()
+
+    list_id = _new_request_id("cals")
+    _send_from_owner(f"gatekeeper e2e cals {list_id}", _block(list_id, "calendar.list_calendars", ""))
+    listed, listed_body = _wait_for_reply(list_id)
+    assert listed["status"] == "completed", listed
+    calendars = _listed_calendars(listed_body)
+    assert any(role == "owner" for _, role, _ in calendars), listed_body
+    family = [cal_id for name, _, cal_id in calendars if FAMILY_CALENDAR_NAME in name]
+    if not family:
+        pytest.skip(f"no writable calendar named {FAMILY_CALENDAR_NAME!r}: {[n for n, _, _ in calendars]}")
+    family_id = family[0]
+
+    api = _calendar_api()
+    event_id = None
+    try:
+        create_id = _new_request_id("fam-create")
+        _send_from_owner(
+            f"gatekeeper e2e fam-create {create_id}",
+            _block(create_id, "calendar.create_event",
+                   "  title: '[gatekeeper-e2e] family lifecycle'\n  day_offset: 40\n  start_time: '16:00'\n"
+                   f"  end_day_offset: 41\n  end_time: '11:00'\n  calendar_id: {family_id}\n"),
+        )
+        created, created_body = _wait_for_reply(create_id)
+        assert created["status"] == "completed", created
+        event_id, reported_calendar = _event_id_and_calendar(created_body)
+        assert reported_calendar == family_id
+
+        raw = api.events().get(calendarId=family_id, eventId=event_id).execute()
+        start, end = raw["start"]["dateTime"], raw["end"]["dateTime"]
+        assert start[11:16] == "16:00" and end[11:16] == "11:00", (start, end)
+        assert not raw.get("attendees")  # nobody was invited
+        assert raw["extendedProperties"]["private"]["gatekeeper"] == "1"
+
+        query_id = _new_request_id("fam-list")
+        _send_from_owner(
+            f"gatekeeper e2e fam-list {query_id}",
+            _block(query_id, "calendar.list_events",
+                   f"  day_offset: 40\n  days: 2\n  calendar_id: {family_id}\n  query: gatekeeper-e2e\n"),
+        )
+        queried, queried_body = _wait_for_reply(query_id)
+        assert queried["status"] == "completed", queried
+        assert event_id in queried_body and f"calendar_id: {family_id}" in queried_body
+
+        # Switching kinds goes through events.patch's nested-merge semantics.
+        allday_id = _new_request_id("fam-allday")
+        _send_from_owner(
+            f"gatekeeper e2e fam-allday {allday_id}",
+            _block(allday_id, "calendar.update_event", f"  event_id: {event_id}\n  calendar_id: {family_id}\n  all_day: true\n"),
+        )
+        allday, _ = _wait_for_reply(allday_id)
+        assert allday["status"] == "completed", allday  # also proves the tag is readable on the shared calendar
+        raw = api.events().get(calendarId=family_id, eventId=event_id).execute()
+        assert "date" in raw["start"] and "dateTime" not in raw["start"], raw["start"]
+        assert raw["end"]["date"] > raw["start"]["date"]
+
+        timed_id = _new_request_id("fam-timed")
+        _send_from_owner(
+            f"gatekeeper e2e fam-timed {timed_id}",
+            _block(timed_id, "calendar.update_event",
+                   f"  event_id: {event_id}\n  calendar_id: {family_id}\n  all_day: false\n  start_time: '10:00'\n  duration_minutes: 60\n"),
+        )
+        timed, _ = _wait_for_reply(timed_id)
+        assert timed["status"] == "completed", timed
+        raw = api.events().get(calendarId=family_id, eventId=event_id).execute()
+        assert "dateTime" in raw["start"] and "date" not in raw["start"], raw["start"]
+
+        delete_id = _new_request_id("fam-delete")
+        _send_from_owner(
+            f"gatekeeper e2e fam-delete {delete_id}",
+            _block(delete_id, "calendar.delete_event", f"  event_id: {event_id}\n  calendar_id: {family_id}\n"),
+        )
+        deleted, _ = _wait_for_reply(delete_id)
+        assert deleted["status"] == "completed", deleted
+        assert api.events().get(calendarId=family_id, eventId=event_id).execute().get("status") == "cancelled"
+        event_id = None
+    finally:
+        if event_id:
+            api.events().delete(calendarId=family_id, eventId=event_id).execute()
+
+
+def test_e2e_all_day_multi_day_event_and_a_past_window_with_a_query():
+    """All-day on the PRIMARY calendar (the owner's own: nobody else sees
+    it): 3 days, last day included -> Google's exclusive end -> deleted. Then
+    a year-long look-back with a query, which must come back completed with
+    the years spelled out."""
+    _require_config()
+    api = _calendar_api()
+    event_id = None
+    try:
+        create_id = _new_request_id("allday-create")
+        _send_from_owner(
+            f"gatekeeper e2e allday-create {create_id}",
+            _block(create_id, "calendar.create_event",
+                   "  title: '[gatekeeper-e2e] all-day span'\n  day_offset: 300\n  all_day: true\n  end_day_offset: 302\n"),
+        )
+        created, created_body = _wait_for_reply(create_id)
+        assert created["status"] == "completed", created
+        assert "(all day)" in created_body and " to " in created_body, created_body
+        event_id, _ = _event_id_and_calendar(created_body)
+        raw = api.events().get(calendarId="primary", eventId=event_id).execute()
+        first, exclusive_end = raw["start"]["date"], raw["end"]["date"]
+        from datetime import date, timedelta
+
+        assert date.fromisoformat(exclusive_end) - date.fromisoformat(first) == timedelta(days=3), (first, exclusive_end)
+
+        delete_id = _new_request_id("allday-delete")
+        _send_from_owner(f"gatekeeper e2e allday-delete {delete_id}", _block(delete_id, "calendar.delete_event", f"  event_id: {event_id}\n"))
+        deleted, _ = _wait_for_reply(delete_id)
+        assert deleted["status"] == "completed", deleted
+        event_id = None
+    finally:
+        if event_id:
+            api.events().delete(calendarId="primary", eventId=event_id).execute()
+
+    past_id = _new_request_id("past")
+    _send_from_owner(
+        f"gatekeeper e2e past {past_id}",
+        _block(past_id, "calendar.list_events", "  day_offset: -365\n  days: 366\n  query: gatekeeper-e2e\n  max_results: 5\n"),
+    )
+    past, past_body = _wait_for_reply(past_id)
+    assert past["status"] == "completed", past
+    assert re.search(r"for \w{3} \w{3} \d{2} \d{4} - \w{3} \w{3} \d{2} \d{4}", past_body), past_body
+
+
+def test_e2e_freeform_list_calendars_and_last_week_through_the_reader_llm():
+    """The reader LLM's verb enum grew (calendar.list_calendars) and its
+    calendar prompt learned negative offsets -- neither had ever run against
+    the real model."""
+    _require_config()
+
+    cals_id = _new_request_id("free-cals")
+    _send_from_owner(
+        f"gatekeeper e2e free-cals {cals_id}",
+        f"Which calendars can you write to? List them with their ids.\n\nPlease use request_id {cals_id} for this request.\n",
+    )
+    cals, cals_body = _wait_for_reply(cals_id)
+    assert cals["status"] == "completed", cals
+    assert _listed_calendars(cals_body), cals_body
+
+    week_id = _new_request_id("free-lastweek")
+    _send_from_owner(
+        f"gatekeeper e2e free-lastweek {week_id}",
+        f"What was on my calendar last week?\n\nPlease use request_id {week_id} for this request.\n",
+    )
+    week, week_body = _wait_for_reply(week_id)
+    assert week["status"] == "completed", week
+    assert re.search(r"(Found \d+ event\(s\)|No events found) for ", week_body), week_body

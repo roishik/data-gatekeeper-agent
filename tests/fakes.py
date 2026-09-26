@@ -10,7 +10,7 @@ half of that contract.
 from __future__ import annotations
 
 from app.agentmail_client import ReplyResult
-from app.calendar_executor import CalendarEvent
+from app.calendar_executor import CalendarEvent, CalendarInfo, unusable_calendar_reason
 from app.drive_executor import DriveFileResult
 from app.failures import GatekeeperDenied
 from app.injection_screen import InboundScreenResult
@@ -88,12 +88,21 @@ class FakeCalendarClient:
     can assert on the resolved time_min/time_max/max_results instead of
     branching fake behavior on them. create_event/update_event echo the
     given fields back into a CalendarEvent instead of returning a fixed
-    result, since tests need to check exactly what was created/changed."""
+    result, since tests need to check exactly what was created/changed.
+
+    `calendars` is what list_calendars returns. `writable_calendar_ids`, when
+    given, is the set of non-primary calendar ids the fake will accept for a
+    write -- anything else is refused the way GoogleCalendarClient refuses a
+    calendar the account can't write to; left as None, every id is accepted."""
 
     def __init__(self, results: list[CalendarEvent] | None = None, foreign_event_ids: set[str] | None = None,
                  existing_title: str = "(unchanged)", existing_location: str = "",
-                 existing_attendees: tuple[str, ...] = ()):
+                 existing_attendees: tuple[str, ...] = (),
+                 calendars: list[CalendarInfo] | None = None,
+                 writable_calendar_ids: set[str] | None = None):
         self.results = results if results is not None else []
+        self.calendars = calendars if calendars is not None else []
+        self.writable_calendar_ids = None if writable_calendar_ids is None else set(writable_calendar_ids)
         self.calls: list[dict] = []
         # Event ids the fake treats as NOT created by the gatekeeper.
         self.foreign_event_ids = set(foreign_event_ids or ())
@@ -104,26 +113,52 @@ class FakeCalendarClient:
         # event that already has guests (see GoogleCalendarClient.update_event).
         self.existing_attendees = tuple(existing_attendees)
 
-    def list_events(self, time_min: str, time_max: str, max_results: int) -> list[CalendarEvent]:
-        self.calls.append({"time_min": time_min, "time_max": time_max, "max_results": max_results})
+    def _check_writable(self, calendar_id: str) -> None:
+        if calendar_id != "primary" and self.writable_calendar_ids is not None \
+                and calendar_id not in self.writable_calendar_ids:
+            raise GatekeeperDenied("invalid_params", unusable_calendar_reason(write=True))
+
+    def list_calendars(self) -> list[CalendarInfo]:
+        self.calls.append({"op": "list_calendars"})
+        return list(self.calendars)
+
+    def list_events(
+        self, time_min: str, time_max: str, max_results: int,
+        calendar_id: str | None = None, query: str | None = None,
+    ) -> list[CalendarEvent]:
+        self.calls.append({
+            "time_min": time_min, "time_max": time_max, "max_results": max_results,
+            "calendar_id": calendar_id, "query": query,
+        })
         return self.results[:max_results]
 
     def create_event(
-        self, title: str, day_offset: int, start_time: str, duration_minutes: int, attendees: tuple[str, ...],
-        request_id: str = "", location: str = "",
+        self, title: str, day_offset: int, start_time: str | None, duration_minutes: int | None,
+        attendees: tuple[str, ...], request_id: str = "", location: str = "", *,
+        calendar_id: str = "primary", end_day_offset: int | None = None,
+        end_time: str | None = None, all_day: bool = False,
     ) -> CalendarEvent:
+        self._check_writable(calendar_id)
         self.calls.append(
             {
                 "op": "create_event", "title": title, "day_offset": day_offset,
                 "start_time": start_time, "duration_minutes": duration_minutes, "attendees": attendees,
-                "request_id": request_id, "location": location,
+                "request_id": request_id, "location": location, "calendar_id": calendar_id,
+                "end_day_offset": end_day_offset, "end_time": end_time, "all_day": all_day,
             }
         )
+        if all_day:
+            start = f"2026-01-{1 + day_offset:02d}"
+            end = f"2026-01-{2 + (day_offset if end_day_offset is None else end_day_offset):02d}"
+        else:
+            start = f"2026-01-{1 + day_offset:02d}T{start_time}:00+02:00"
+            end = (
+                f"2026-01-{1 + end_day_offset:02d}T{end_time}:00+02:00"
+                if end_day_offset is not None else start
+            )
         return CalendarEvent(
-            event_id="event_created_1", summary=title,
-            start=f"2026-01-0{1 + day_offset}T{start_time}:00+02:00",
-            end=f"2026-01-0{1 + day_offset}T{start_time}:00+02:00",
-            all_day=False, attendee_count=len(attendees), location=location,
+            event_id="event_created_1", summary=title, start=start, end=end,
+            all_day=all_day, attendee_count=len(attendees), location=location, calendar_id=calendar_id,
         )
 
     def update_event(
@@ -137,7 +172,13 @@ class FakeCalendarClient:
         remove_attendees: tuple[str, ...] = (),
         invite_guard=None,
         location: str | None = None,
+        *,
+        calendar_id: str = "primary",
+        end_day_offset: int | None = None,
+        end_time: str | None = None,
+        all_day: bool | None = None,
     ) -> CalendarEvent:
+        self._check_writable(calendar_id)
         # Mirrors GoogleCalendarClient's containment check and invite guard:
         # the guard fires whenever the resulting attendee list is
         # non-empty AND title/location is changing (not only when a new
@@ -158,6 +199,8 @@ class FakeCalendarClient:
                 "op": "update_event", "event_id": event_id, "title": title, "day_offset": day_offset,
                 "start_time": start_time, "duration_minutes": duration_minutes,
                 "add_attendees": add_attendees, "remove_attendees": remove_attendees, "location": location,
+                "calendar_id": calendar_id, "end_day_offset": end_day_offset, "end_time": end_time,
+                "all_day": all_day,
             }
         )
         return CalendarEvent(
@@ -165,12 +208,14 @@ class FakeCalendarClient:
             start="2026-01-01T10:00:00+02:00", end="2026-01-01T10:30:00+02:00",
             all_day=False, attendee_count=len(add_attendees),
             location=location if location is not None else self.existing_location,
+            calendar_id=calendar_id,
         )
 
-    def delete_event(self, event_id: str) -> None:
+    def delete_event(self, event_id: str, calendar_id: str = "primary") -> None:
+        self._check_writable(calendar_id)
         if event_id in self.foreign_event_ids:
             raise GatekeeperDenied("not_gatekeeper_event")
-        self.calls.append({"op": "delete_event", "event_id": event_id})
+        self.calls.append({"op": "delete_event", "event_id": event_id, "calendar_id": calendar_id})
 
 
 class FakeDriveClient:

@@ -62,8 +62,8 @@ from typing import Any, Callable
 
 from app.agentmail_client import AgentMailClient
 from app.audit_log import AuditLog, AuditRecord
-from app.calendar_executor import CalendarClient, CalendarEvent
-from app.calendar_window import format_window_range, resolve_window
+from app.calendar_executor import CalendarClient, CalendarEvent, CalendarInfo
+from app.calendar_window import format_window_range, resolve_window, window_spans_other_years
 from app.capabilities import CapabilitiesInfo, build_capabilities_info
 from app.config import AGENTMAIL_INBOX_ID, INJECTION_DENY_THRESHOLD, MAX_REQUESTS_PER_DAY, OUTPUT_SCREEN_FAIL_MODE, OWNER_TIMEZONE
 from app.drive_executor import DriveClient, DriveFileResult
@@ -81,6 +81,7 @@ from app.output_screen import (
     OutputScreen,
     OutputScreenResult,
     all_withheld,
+    calendar_key,
     event_key,
     gmail_key,
     scoped_output,
@@ -88,6 +89,7 @@ from app.output_screen import (
 from app.policy import (
     CalendarCreateEventParams,
     CalendarDeleteEventParams,
+    CalendarListCalendarsParams,
     CalendarListEventsParams,
     CalendarUpdateEventParams,
     CapabilitiesParams,
@@ -130,6 +132,8 @@ class ExecutionResults:
     gmail_results: list[GmailResult] | None = None
     calendar_results: list[CalendarEvent] | None = None
     calendar_window_label: str | None = None  # calendar.list_events' resolved date range, for the reply prose
+    calendar_show_year: bool = False  # the window reaches outside this year: the reply spells years out
+    calendars: list[CalendarInfo] | None = None  # calendar.list_calendars
     draft_result: DraftResult | None = None
     created_event: CalendarEvent | None = None
     updated_event: CalendarEvent | None = None
@@ -146,6 +150,8 @@ class ExecutionResults:
             "gmail_results": self.gmail_results,
             "calendar_results": self.calendar_results,
             "calendar_window_label": self.calendar_window_label,
+            "calendar_show_year": self.calendar_show_year,
+            "calendars": self.calendars,
             "draft_result": self.draft_result,
             "created_event": self.created_event,
             "updated_event": self.updated_event,
@@ -178,6 +184,11 @@ class _RequestState:
     failure_code: str | None = None
     failure_stage: str | None = None
     failure_type: str | None = None
+    # Our own reason for an execution-time refusal (a GatekeeperDenied), so a
+    # denial the requester can fix -- e.g. an unusable calendar_id -- says what
+    # to fix. Only ever shown for the codes reply_guard._EXPLAINED_DENIALS
+    # lists; security refusals stay generic there.
+    denial_detail: str | None = None
     reply_message_id: str | None = None
     reply_error: str | None = None
     outcome_reason: str = "processed"
@@ -319,6 +330,7 @@ def handle_webhook(
         )
     except GatekeeperDenied as denied:
         state.reply_status, state.error_code, state.retryable = "denied", denied.error_code, False
+        state.denial_detail = denied.reason or None
     except Exception as exc:
         failure = classify_failure(exc)
         stage = getattr(exc, "_gatekeeper_stage", stage)
@@ -531,6 +543,8 @@ def _output_items(results: ExecutionResults) -> dict[str, dict[str, str]]:
         items[gmail_key(i)] = {"from": r.sender, "subject": r.subject, "date": r.date, "snippet": r.snippet}
     for i, e in enumerate(results.calendar_results or []):
         items[event_key(i)] = {"title": e.summary, "location": e.location}
+    for i, c in enumerate(results.calendars or []):
+        items[calendar_key(i)] = {"name": c.name}
     if results.created_event:
         items[CREATED_EVENT_KEY] = {"title": results.created_event.summary, "location": results.created_event.location}
     if results.updated_event:
@@ -576,29 +590,39 @@ def _execute(
         results.draft_result = gmail_client_factory().create_draft(
             to=params.to, subject=params.subject, body=params.body, thread_id=params.thread_id,
         )
+    elif isinstance(params, CalendarListCalendarsParams):
+        results.calendars = calendar_client_factory().list_calendars()
     elif isinstance(params, CalendarListEventsParams):
         window = resolve_window(params.day_offset, params.days, OWNER_TIMEZONE)
         results.calendar_results = calendar_client_factory().list_events(
             time_min=window.time_min, time_max=window.time_max, max_results=params.max_results,
+            calendar_id=params.calendar_id, query=params.query,
         )
-        results.calendar_window_label = format_window_range(window.time_min, window.time_max, OWNER_TIMEZONE)
+        # A window in the past, or a wide one, can reach another year: the
+        # reply then says which (see calendar_window.window_spans_other_years).
+        results.calendar_show_year = window_spans_other_years(window.time_min, window.time_max, OWNER_TIMEZONE)
+        results.calendar_window_label = format_window_range(
+            window.time_min, window.time_max, OWNER_TIMEZONE, with_year=results.calendar_show_year,
+        )
     elif isinstance(params, CalendarCreateEventParams):
         if params.attendees:
             invite_guard(params.title, params.location)
         results.created_event = calendar_client_factory().create_event(
             title=params.title, day_offset=params.day_offset, start_time=params.start_time,
             duration_minutes=params.duration_minutes, attendees=params.attendees, request_id=parsed.request_id,
-            location=params.location,
+            location=params.location, calendar_id=params.calendar_id, end_day_offset=params.end_day_offset,
+            end_time=params.end_time, all_day=params.all_day,
         )
     elif isinstance(params, CalendarUpdateEventParams):
         results.updated_event = calendar_client_factory().update_event(
             event_id=params.event_id, title=params.title, day_offset=params.day_offset,
             start_time=params.start_time, duration_minutes=params.duration_minutes,
             add_attendees=params.add_attendees, remove_attendees=params.remove_attendees,
-            invite_guard=invite_guard, location=params.location,
+            invite_guard=invite_guard, location=params.location, calendar_id=params.calendar_id,
+            end_day_offset=params.end_day_offset, end_time=params.end_time, all_day=params.all_day,
         )
     elif isinstance(params, CalendarDeleteEventParams):
-        calendar_client_factory().delete_event(event_id=params.event_id)
+        calendar_client_factory().delete_event(event_id=params.event_id, calendar_id=params.calendar_id)
         results.deleted_event_id = params.event_id
     elif isinstance(params, DriveCreateFileParams):
         results.drive_file_result = drive_client_factory().create_file(name=params.name, content=params.content)
@@ -661,6 +685,7 @@ def _run_batch_item(
         item_state.retryable = False
     except GatekeeperDenied as denied:
         item_state.reply_status, item_state.error_code, item_state.retryable = "denied", denied.error_code, False
+        item_state.denial_detail = denied.reason or None
     except Exception as exc:
         failure = classify_failure(exc)
         logger.exception("batch item %s failed at %s (%s)", parsed.request_id, stage, failure.code)
@@ -777,13 +802,19 @@ def _run_batch(
     return item_states, combined_output
 
 
+def _reply_detail(state: _RequestState) -> str | None:
+    """Why a request was denied, in our own words: the policy decision's
+    reason, or else the executor's."""
+    return (state.decision.reason if state.decision else None) or state.denial_detail
+
+
 def _batch_item_input(item_state: _RequestState) -> BatchItemInput:
     return BatchItemInput(
         parsed_request=item_state.parsed,
         status=item_state.reply_status,
         error_code=item_state.error_code,
         retryable=item_state.retryable,
-        detail=item_state.decision.reason if item_state.decision else None,
+        detail=_reply_detail(item_state),
         ignored_params=(
             item_state.decision.ignored_params
             if item_state.decision and item_state.reply_status == "completed" else ()
@@ -824,7 +855,7 @@ def _send(state: _RequestState, agentmail_client: AgentMailClient, state_store) 
         else:
             body = render_reply(
                 state.parsed, state.reply_status, state.error_code,
-                retryable=state.retryable, detail=state.decision.reason if state.decision else None,
+                retryable=state.retryable, detail=_reply_detail(state),
                 output=state.output,
                 ignored_params=state.decision.ignored_params if state.decision and state.reply_status == "completed" else (),
                 requests_remaining_today=requests_remaining_today,
@@ -922,11 +953,16 @@ def _audit_record(state: _RequestState, *, batch_id: str | None = None) -> Audit
         result_count=(
             len(results.gmail_results or [])
             + len(results.calendar_results or [])
+            + len(results.calendars or [])
             + sum(1 for r in (results.draft_result, results.created_event, results.updated_event,
                               results.deleted_event_id, results.drive_file_result) if r)
         ),
         gmail_message_ids=tuple(r.message_id for r in results.gmail_results or ()),
         calendar_event_ids=tuple(e.event_id for e in results.calendar_results or ()),
+        # The calendar a calendar verb was aimed at (an opaque id, like the
+        # event ids): an event id alone doesn't say which calendar it's on.
+        # None for every other verb, and for a list_events that named none.
+        calendar_id=getattr(state.decision.params, "calendar_id", None) if state.decision else None,
         reply_message_id=state.reply_message_id,
         reply_error=state.reply_error,
         output_screen_status=state.output.status if state.output else None,

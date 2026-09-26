@@ -8,7 +8,16 @@ the audit trail. Background and decisions: `README.md` (the "Decided" list) and 
 Request/response format: `docs/PROTOCOL.md`. How to run, deploy, verify and kill it:
 `docs/RUNBOOK.md`.
 
-## Current state (as of 2026-09-23)
+## Current state (as of 2026-09-26)
+
+**The calendar extensions are deployed (2026-09-26): live revision `data-gatekeeper-00017-lf4`,
+built from `feat/calendar-extensions-2026-09` at `503a25c` (`GIT_SHA=503a25c`,
+`MAX_REQUESTS_PER_DAY=100`).** That branch is pushed but NOT yet merged into `main` (no PR opened
+yet), so `main` is behind the live service. Rollback target: `data-gatekeeper-00016-crq` (`64e8f6f`).
+After the deploy: `/health` 200, `/docs` 404, env vars as expected, and the audit chain verified
+intact at 108 entries. The three live checks against real Google are still owed (see "Calendar
+extensions" below). The section that follows describes the state as of 2026-09-23 and is otherwise
+unchanged.
 
 **The hardening refactor is merged and deployed (2026-09-23).** PR #1
 (`refactor/hardening-2026-09`) was merged into `main` as merge commit `a97906e`. The live
@@ -108,7 +117,7 @@ the deploy):
   `calendar.update_event` on the old revision (the update was allowed, 2026-09-23).
   `calendar.delete_event` and `drive.create_file` have never run live; the e2e suite covers them.
 
-Tests: `uv run pytest -q`, 468 passing, fully offline (fakes behind Protocols), and run in CI.
+Tests: `uv run pytest -q`, 637 passing, fully offline (fakes behind Protocols), and run in CI.
 There are three live suites, all skipped unless `RUN_E2E=1`; they send real traffic, so run
 them deliberately:
 - `tests/test_e2e_live.py` sends real email through the deployed service. It now also covers:
@@ -224,6 +233,68 @@ everything above. 468 tests passing (up from 419).
   said otherwise), and a revised standing-rule paragraph for Instinct (not yet sent — that's
   still Open item #2, now with more content to include).
 
+## Calendar extensions (2026-09-25; deployed 2026-09-26 as `00017-lf4`)
+
+Instinct hit these gaps in production on `protocol_version 64e8f6f` (writing to the shared family
+calendar "למשפחה", a 19-hour overnight event, finding past meetings). All in `app/`, 637 tests
+passing (up from 468). Details for the requester: `docs/PROTOCOL.md` (standing rule points 12–14).
+- **Calendar selection.** New read verb `calendar.list_calendars` (id, name, access role of every
+  calendar the account can WRITE to). Optional `calendar_id` on `list_events`/`create_event`/
+  `update_event`/`delete_event`. Anything but `primary` must be in the account's own calendar list
+  with enough access (`_resolve_calendar`: owner/writer to write, reader+ to read), else
+  `invalid_params` and nothing happens — the requester can only name what `list_calendars` reports.
+  **No new OAuth scope:** `calendar.readonly` does the lookup, `calendar.events` the write; a
+  non-primary write just requests both. Containment is per calendar: update/delete still require
+  the private `gatekeeper=1` tag on the event's copy on THAT calendar.
+- **Deliberate deviation from the request:** it said a missing `calendar_id` means "primary". For
+  writes that's true. For `list_events` a missing id still reads EVERY calendar switched on in
+  Google Calendar (what it did before, and what the family calendar relies on); only a given id
+  narrows it. Primary-only would have silently dropped family events from existing requests.
+- **Overnight / multi-day / all-day.** `end_day_offset` + `end_time` as an alternative to
+  `duration_minutes` (both → denied; 19h example works), and `all_day: true` with `day_offset` and
+  optional `end_day_offset` (the LAST day, inclusive; Google's exclusive end is added in
+  `resolve_all_day_range`). At most 14 days either way (`EVENT_SPAN_MAX_DAYS`). `update_event`
+  keeps whatever it isn't told to change (a day move keeps the length; `all_day` omitted keeps the
+  kind). **`all_day: true` in YAML arrives as the string `"true"`** (`yaml_safe.py` drops the bool
+  resolver), so the validator accepts real bools and the strings `true`/`false`, nothing else.
+- **Past range.** `list_events` `day_offset` −365..13, `days` 1..366 (was 0..13 and 1..7), plus
+  `query` (Google's `q`: title, description, location, attendees; only title/time/location/attendee
+  count come back). A window reaching outside the current year prints years in the label and on
+  every event line. Chosen over from_date/to_date because it keeps dates out of the plain-text path.
+- **No invites without attendees.** An insert with no attendees is sent `sendUpdates="none"`
+  (equivalent for an event with no guests, but structural). The invite guard is unchanged.
+- **Side changes needed to make it usable:** list/create/update replies show `calendar_id` next to
+  `event_id`; multi-day all-day events render as a range; an executor-time `invalid_params` denial
+  now surfaces its reason in the reply (`GatekeeperDenied.reason` → `denial_detail`, only for codes
+  in `_EXPLAINED_DENIALS`); `AuditRecord.calendar_id` (old chain entries lack the key and still
+  verify — `verify_chain` hashes the stored dict); calendar NAMES are a new attacker-influenced
+  text channel and go through the output screen (`calendar:{i}` keys) and `safe_display`.
+- **Freeform (plain-text) path:** only `calendar.list_calendars` (verb enum) and negative
+  `day_offset` ("last week") were added. The new params are block-only: `_CalendarUpdateFields`
+  is at the 7-field ceiling and `_CalendarCreateFields` would go over it. The extra prompt text for
+  "yesterday"/"last week" is NOT verified against the real Haiku model.
+- **`protocol_version`** is the deployed git short sha (`GIT_SHA`), so it changes at each deploy by
+  itself — there is nothing to bump in code. It is `503a25c` since 2026-09-26.
+- **STILL UNVERIFIED against real Google (fakes only; deployed, live check owed):** (1) the private
+  `gatekeeper` tag is readable on a shared calendar's copy of an event, so update/delete work there
+  (if not, they fail as `not_gatekeeper_event`, never a wrong edit); (2) `events.patch` accepts
+  `dateTime: null` / `date: null` when turning an event all-day ↔ timed (`_timing_body`);
+  (3) `q` matches attendees/descriptions as documented; also the reader LLM's new verb and
+  "last week" prompt against the real Haiku model. Three live tests for exactly these are written
+  in `tests/test_e2e_live.py` (`test_e2e_list_calendars_and_the_family_calendar_lifecycle`,
+  `..._all_day_multi_day_event_and_a_past_window_with_a_query`,
+  `..._freeform_list_calendars_and_last_week_through_the_reader_llm`) but have NOT been run: the
+  first attempt on 2026-09-26 skipped (no Google credentials in the environment), and running them
+  needs the owner's Google credentials exported into the test process plus a write to the shared
+  family calendar (no attendees, deleted again), which the auto-mode classifier blocked without an
+  explicit permission. Run them deliberately:
+  `RUN_E2E=1 uv run pytest tests/test_e2e_live.py -k "family_calendar_lifecycle or all_day_multi_day or freeform_list_calendars" -v`
+  (with GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN, OWNER_EMAIL, GATEKEEPER_INBOX_ADDRESS set).
+- **Owner's decisions (2026-09-26):** (a) NO extra screening for content written to a shared
+  calendar without attendees — the invite guard stays attendee-triggered, as built; (b) the
+  `query` param stays as built, including that it lets Instinct test whether an event's
+  description/attendees contain a string even though they're never returned.
+
 ## Write access design (2026-09-15, tightened 2026-09-22)
 
 I asked for write access and walked through the security trade-offs before building. Key
@@ -261,11 +332,12 @@ decisions, all mine, all deliberate:
      `OUTPUT_INJECTION_THRESHOLD` 0.7, `INJECTION_DENY_THRESHOLD` 0.85) from real scores in the
      audit log before trusting them. The e2e run gave the first data points: ordinary requests
      scored 0.05–0.31, and the deliberate injection 0.99.
-2. **Send Instinct the updated standing rule** (docs/PROTOCOL.md, last section, now 11 points):
+2. **Send Instinct the updated standing rule** (docs/PROTOCOL.md, last section, now 14 points):
    payload sections, add/remove attendees (+ the total-10 cap), unknown params ignored (listed
    in `ignored_params`), `retryable`, withheld items, the `capabilities` verb, the `batch` verb,
    `protocol_version`/`requests_remaining_today`, financial searches allowed, links no longer
-   stripped.
+   stripped, and (2026-09-25, after that deploy) calendars/`calendar_id`, multi-day and all-day
+   events, looking back with `query`.
 3. Remove `roishik10@gmail.com` from `ALLOWED_SENDERS` (it was added for testing), and revoke
    Instinct's own Google access at myaccount.google.com/connections. The catch: the live e2e
    suite sends from that address, so it needs another sender first (or stays, knowingly).
@@ -342,9 +414,11 @@ under one process-wide lock) → `pipeline.handle_webhook`:
 4. Executors, one verb per request (or one per batch item):
    - `gmail_executor.py`: search (metadata only, batched) and create_draft (drafts only, never
      sends; threading headers);
-   - `calendar_executor.py`: list, plus create/update/delete, contained to gatekeeper-tagged
-     events, additive guests capped at 10 total, `sendUpdates="all"`, the invite guard covering
-     both new guests AND a title/location change on an event that already has guests;
+   - `calendar_executor.py`: list_calendars, list, plus create/update/delete, each on `primary`
+     or a calendar the account can write to (`calendar_id`), contained to gatekeeper-tagged
+     events, additive guests capped at 10 total, `sendUpdates="all"` (`"none"` when a create has
+     no guests), the invite guard covering both new guests AND a title/location change on an event
+     that already has guests; timed, overnight/multi-day (≤14 days) and all-day events;
    - `drive_executor.py`: one app-owned folder;
    - `capabilities.py`: not really an executor — no API call, just reflects `VERB_SPECS` +
      config back as data.
@@ -368,7 +442,7 @@ Health: `GET /health` (Cloud Run reserves `/healthz`).
 | Thing | Value |
 |---|---|
 | GCP project / region | `data-gatekeeper-roishik` / `europe-west1` (billing linked) |
-| Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 120s. Live revision `data-gatekeeper-00016-crq` (commit label `64e8f6f`) |
+| Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 120s. Live revision `data-gatekeeper-00017-lf4` (commit label `503a25c`, from branch `feat/calendar-extensions-2026-09`); rollback target `00016-crq` (`64e8f6f`) |
 | Runtime service account | `gatekeeper-run@data-gatekeeper-roishik.iam.gserviceaccount.com` (secretAccessor per secret only) |
 | Secret Manager | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `ANTHROPIC_API_KEY`, `AGENTMAIL_API_KEY`, `AGENTMAIL_WEBHOOK_SECRET`, `TYPESAFE_API_KEY` |
 | Env vars (non-secret) | `AGENTMAIL_INBOX_ID`/`GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to`, `ALLOWED_SENDERS=roishikler@mail.instinct.com,roishik10@gmail.com`, `OWNER_EMAIL=roishik10@gmail.com` (no longer used by the service after the refactor; the e2e tests use it), `OWNER_TIMEZONE=Asia/Jerusalem`, `MAX_REQUESTS_PER_DAY=100` (raised from 50 at the 2026-09-23 deploy; the cap wasn't actually enforced before the refactor because of the state-sheet bug), `ANTHROPIC_MODEL=claude-haiku-4-5-20251001`, `AUDIT_LOG_BACKEND=sheets`, `STATE_STORE_BACKEND=sheets`. New tunables all default in code (`.env.example`): `READER_LLM_MAX_INPUT_CHARS`, `OUTPUT_*`, `JEV_*`, `PROCESSING_STALE_AFTER_SECONDS`. `GIT_SHA` (the deployed commit's short sha, set by every deploy command; it's the replies' `protocol_version`, and defaults to `"dev"` if absent) |

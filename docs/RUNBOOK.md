@@ -49,12 +49,15 @@ screens are no-ops and behave as if the feature didn't exist.
 ([PROTOCOL.md](PROTOCOL.md)).
 
 Implemented verbs: `gmail.search`, `gmail.create_draft`,
-`calendar.list_events`, `calendar.create_event`, `calendar.update_event`,
-`calendar.delete_event`, `drive.create_file`. `calendar.list_events`
-resolves relative day language ("today"/"tomorrow"/"this week") to a
-`day_offset`/`days` pair purely in Python, in the timezone set by
-`OWNER_TIMEZONE` (default `Asia/Jerusalem`) — see
-`app/calendar_window.py`. `drive.search` and `contacts.search` still
+`calendar.list_calendars`, `calendar.list_events`, `calendar.create_event`,
+`calendar.update_event`, `calendar.delete_event`, `drive.create_file`.
+`calendar.list_events` resolves relative day language
+("today"/"tomorrow"/"this week"/"last week") to a `day_offset`/`days` pair
+purely in Python, in the timezone set by `OWNER_TIMEZONE` (default
+`Asia/Jerusalem`) — see `app/calendar_window.py`. Calendar verbs take an
+optional `calendar_id`; anything but `primary` must be in the account's own
+calendar list with enough access (no new OAuth scope: `calendar.readonly`
+does the lookup, `calendar.events` the write). `drive.search` and `contacts.search` still
 return `not_implemented`.
 
 **Write verbs, by owner's explicit choice (see CLAUDE.md):**

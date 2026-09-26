@@ -48,6 +48,7 @@ from app.config import SENSITIVE_QUERY_TERMS
 class Verb(str, Enum):
     GMAIL_SEARCH = "gmail.search"
     GMAIL_CREATE_DRAFT = "gmail.create_draft"
+    CALENDAR_LIST_CALENDARS = "calendar.list_calendars"
     CALENDAR_LIST_EVENTS = "calendar.list_events"
     CALENDAR_CREATE_EVENT = "calendar.create_event"
     CALENDAR_UPDATE_EVENT = "calendar.update_event"
@@ -75,17 +76,24 @@ NEWER_THAN_DAYS_MIN = 1
 NEWER_THAN_DAYS_MAX = 365
 
 # calendar.list_events bounds. Deliberately three small bounded integers
-# and NOTHING date-shaped -- see app/calendar_window.py's docstring for
+# (plus an optional calendar id and search text) and NOTHING date-shaped --
+# see app/calendar_window.py's docstring for
 # why: the reader LLM (Layer 2) never has to parse, produce, or reason
 # about an actual date or timezone, only pick a small integer, which is
 # the "low-capacity output type" principle (research/03 section 2.4)
 # applied to a brand-new verb rather than just gmail.search's.
+#
+# The window may reach back a year (negative day_offset = the past): finding
+# a past meeting with a counterparty needs a wide window, so `days` is wide
+# too. Both stay small integers -- "last week" is day_offset=-7, days=7, which
+# the plain-text reader can say without ever writing a date. What limits a
+# reply's size is max_results, not the window.
 CAL_DAY_OFFSET_DEFAULT = 0  # 0 = today
-CAL_DAY_OFFSET_MIN = 0
+CAL_DAY_OFFSET_MIN = -365
 CAL_DAY_OFFSET_MAX = 13
 CAL_DAYS_DEFAULT = 1
 CAL_DAYS_MIN = 1
-CAL_DAYS_MAX = 7
+CAL_DAYS_MAX = 366
 CAL_MAX_RESULTS_DEFAULT = 10
 CAL_MAX_RESULTS_MIN = 1
 CAL_MAX_RESULTS_MAX = 25
@@ -131,7 +139,21 @@ EVENT_DAY_OFFSET_MAX = 365
 EVENT_DURATION_MIN_MINUTES = 5
 EVENT_DURATION_MAX_MINUTES = 480  # 8 hours
 EVENT_ATTENDEES_MAX = 10
+# A multi-day or all-day event's whole length. Timed: end minus start is at
+# most 14 x 24 hours. All-day: at most 14 calendar days, the last day included.
+EVENT_SPAN_MAX_DAYS = 14
+# end_day_offset may sit up to a full span after the latest possible start.
+EVENT_END_DAY_OFFSET_MAX = EVENT_DAY_OFFSET_MAX + EVENT_SPAN_MAX_DAYS
 EVENT_ID_MAX_CHARS = 1024  # Google's documented maximum
+# "primary" is Google's alias for the account's own calendar. Any other
+# calendar_id is only ever accepted if it appears in the account's own
+# calendar list with enough access (app/calendar_executor.py) -- the shape
+# check below only keeps junk out of the API call, it authorizes nothing.
+PRIMARY_CALENDAR_ID = "primary"
+CALENDAR_ID_MAX_CHARS = 256
+# Real ids: an email address, `<hex>@group.calendar.google.com`,
+# `en.usa#holiday@group.v.calendar.google.com`, or `primary`.
+_CALENDAR_ID_RE = re.compile(r"^[A-Za-z0-9._%+#@=-]+$")
 # Google event ids are base32hex (a-v, 0-9); a recurring event's instance
 # id appends `_<timestamp>` (e.g. `abc123_20260922T100000Z`). Nothing else
 # is ever a valid id, so nothing else is ever passed to the API.
@@ -160,20 +182,39 @@ class GmailCreateDraftParams:
 
 
 @dataclass(frozen=True)
+class CalendarListCalendarsParams:
+    """No fields: lists the calendars this account can write to. A
+    dataclass anyway, for the same reason CapabilitiesParams is one."""
+
+
+@dataclass(frozen=True)
 class CalendarListEventsParams:
     day_offset: int = CAL_DAY_OFFSET_DEFAULT
     days: int = CAL_DAYS_DEFAULT
     max_results: int = CAL_MAX_RESULTS_DEFAULT
+    # None = every calendar switched on in Google Calendar (the behavior
+    # before calendar_id existed) -- NOT the same as "primary".
+    calendar_id: str | None = None
+    # Free-text match Google applies to title, description, location and
+    # attendees (events.list `q`).
+    query: str | None = None
 
 
 @dataclass(frozen=True)
 class CalendarCreateEventParams:
     title: str
     day_offset: int
-    start_time: str  # "HH:MM", owner's local time
-    duration_minutes: int
+    # A timed event has a start_time and EITHER duration_minutes OR the
+    # end_day_offset + end_time pair; an all_day event has none of the three
+    # (end_day_offset, when given, is its last day, inclusive).
+    start_time: str | None = None  # "HH:MM", owner's local time
+    duration_minutes: int | None = None
     attendees: tuple[str, ...] = ()
     location: str = ""
+    end_day_offset: int | None = None
+    end_time: str | None = None
+    all_day: bool = False
+    calendar_id: str = PRIMARY_CALENDAR_ID
 
 
 @dataclass(frozen=True)
@@ -189,11 +230,17 @@ class CalendarUpdateEventParams:
     # there is deliberately no "replace the whole list" field any more.
     add_attendees: tuple[str, ...] = ()
     remove_attendees: tuple[str, ...] = ()
+    end_day_offset: int | None = None
+    end_time: str | None = None
+    # None = keep the event's current kind; True/False converts it.
+    all_day: bool | None = None
+    calendar_id: str = PRIMARY_CALENDAR_ID
 
 
 @dataclass(frozen=True)
 class CalendarDeleteEventParams:
     event_id: str
+    calendar_id: str = PRIMARY_CALENDAR_ID
 
 
 @dataclass(frozen=True)
@@ -223,6 +270,7 @@ class PolicyDecision:
     params: (
         GmailSearchParams
         | GmailCreateDraftParams
+        | CalendarListCalendarsParams
         | CalendarListEventsParams
         | CalendarCreateEventParams
         | CalendarUpdateEventParams
@@ -302,27 +350,54 @@ VERB_SPECS: dict[Verb, VerbSpec] = {
             "thread_id: string, optional, from a prior gmail.search reply's thread_id",
         ),
     ),
-    Verb.CALENDAR_LIST_EVENTS: VerbSpec(
-        verb=Verb.CALENDAR_LIST_EVENTS,
-        param_names=frozenset({"day_offset", "days", "max_results"}),
+    Verb.CALENDAR_LIST_CALENDARS: VerbSpec(
+        verb=Verb.CALENDAR_LIST_CALENDARS,
+        param_names=frozenset(),
         is_write=False,
         param_bounds=(
-            f"day_offset: int, {CAL_DAY_OFFSET_MIN}-{CAL_DAY_OFFSET_MAX}, default {CAL_DAY_OFFSET_DEFAULT}",
-            f"days: int, {CAL_DAYS_MIN}-{CAL_DAYS_MAX}, default {CAL_DAYS_DEFAULT}",
+            "no params; returns calendar_id, name and access role (owner or writer) for every calendar "
+            "this account can write to -- the ids to use as calendar_id below",
+        ),
+    ),
+    Verb.CALENDAR_LIST_EVENTS: VerbSpec(
+        verb=Verb.CALENDAR_LIST_EVENTS,
+        param_names=frozenset({"day_offset", "days", "max_results", "calendar_id", "query"}),
+        is_write=False,
+        param_bounds=(
+            f"day_offset: int, {CAL_DAY_OFFSET_MIN} to {CAL_DAY_OFFSET_MAX}, default {CAL_DAY_OFFSET_DEFAULT} "
+            "(0 = today, negative = the past)",
+            f"days: int, {CAL_DAYS_MIN}-{CAL_DAYS_MAX}, default {CAL_DAYS_DEFAULT} (window length from day_offset)",
             f"max_results: int, {CAL_MAX_RESULTS_MIN}-{CAL_MAX_RESULTS_MAX}, default {CAL_MAX_RESULTS_DEFAULT}",
+            f"calendar_id: string, optional, max {CALENDAR_ID_MAX_CHARS} chars; omit to read every calendar switched on "
+            f"in Google Calendar; '{PRIMARY_CALENDAR_ID}' or an id from calendar.list_calendars to read just that one",
+            f"query: string, optional, max {QUERY_MAX_CHARS} chars, one line; free-text match on title, description, "
+            "location and attendees (only title/time/location/attendee count are returned)",
         ),
     ),
     Verb.CALENDAR_CREATE_EVENT: VerbSpec(
         verb=Verb.CALENDAR_CREATE_EVENT,
-        param_names=frozenset({"title", "day_offset", "start_time", "duration_minutes", "attendees", "location"}),
+        param_names=frozenset({
+            "title", "day_offset", "start_time", "duration_minutes", "attendees", "location",
+            "end_day_offset", "end_time", "all_day", "calendar_id",
+        }),
         is_write=True,
         param_bounds=(
             f"title: string, required, max {EVENT_TITLE_MAX_CHARS} chars",
-            f"day_offset: int, {EVENT_DAY_OFFSET_MIN}-{EVENT_DAY_OFFSET_MAX}, required",
-            "start_time: string 'HH:MM', required, owner's local time",
-            f"duration_minutes: int, {EVENT_DURATION_MIN_MINUTES}-{EVENT_DURATION_MAX_MINUTES}, required",
-            f"attendees: list of email strings, up to {EVENT_ATTENDEES_MAX}, optional",
+            f"day_offset: int, {EVENT_DAY_OFFSET_MIN}-{EVENT_DAY_OFFSET_MAX}, required (the start day; the first day if all_day)",
+            "start_time: string 'HH:MM', owner's local time, required unless all_day",
+            f"duration_minutes: int, {EVENT_DURATION_MIN_MINUTES}-{EVENT_DURATION_MAX_MINUTES}; required unless all_day, "
+            "unless end_day_offset + end_time is given instead (never both)",
+            f"end_day_offset: int, {EVENT_DAY_OFFSET_MIN}-{EVENT_END_DAY_OFFSET_MAX}, optional; with end_time, an "
+            "alternative to duration_minutes for an overnight or multi-day event "
+            f"(end must be at least {EVENT_DURATION_MIN_MINUTES} minutes after the start and no more than "
+            f"{EVENT_SPAN_MAX_DAYS} days). For all_day it is the LAST day, inclusive",
+            "end_time: string 'HH:MM', optional, only together with end_day_offset (never with all_day)",
+            f"all_day: true or false, optional (default false); true takes day_offset and an optional end_day_offset, "
+            f"at most {EVENT_SPAN_MAX_DAYS} days including the last, and no start_time, end_time or duration_minutes",
+            f"attendees: list of email strings, up to {EVENT_ATTENDEES_MAX}, optional (no invite is sent without attendees)",
             f"location: string, max {EVENT_LOCATION_MAX_CHARS} chars, optional",
+            f"calendar_id: string, optional, default '{PRIMARY_CALENDAR_ID}'; otherwise an id from calendar.list_calendars "
+            "(a calendar this account can write to)",
         ),
     ),
     Verb.CALENDAR_UPDATE_EVENT: VerbSpec(
@@ -330,14 +405,25 @@ VERB_SPECS: dict[Verb, VerbSpec] = {
         param_names=frozenset({
             "event_id", "title", "day_offset", "start_time", "duration_minutes",
             "location", "add_attendees", "remove_attendees",
+            "end_day_offset", "end_time", "all_day", "calendar_id",
         }),
         is_write=True,
         param_bounds=(
             f"event_id: string, required, max {EVENT_ID_MAX_CHARS} chars",
+            f"calendar_id: string, optional, default '{PRIMARY_CALENDAR_ID}': the calendar the event is on "
+            "(list_events replies show it); only events the gatekeeper created can be changed",
             f"title: string, optional, max {EVENT_TITLE_MAX_CHARS} chars",
             f"day_offset: int, {EVENT_DAY_OFFSET_MIN}-{EVENT_DAY_OFFSET_MAX}, optional",
             "start_time: string 'HH:MM', optional",
-            f"duration_minutes: int, {EVENT_DURATION_MIN_MINUTES}-{EVENT_DURATION_MAX_MINUTES}, optional",
+            f"duration_minutes: int, {EVENT_DURATION_MIN_MINUTES}-{EVENT_DURATION_MAX_MINUTES}, optional "
+            "(not together with end_day_offset)",
+            f"end_day_offset: int, {EVENT_DAY_OFFSET_MIN}-{EVENT_END_DAY_OFFSET_MAX}, optional; with end_time it moves the "
+            f"event's end (whole event at most {EVENT_SPAN_MAX_DAYS} days); for an all-day event it is the last day, inclusive",
+            "end_time: string 'HH:MM', optional, only together with end_day_offset (not for an all-day event)",
+            "all_day: true or false, optional; omitted keeps the event as it is. true makes it an all-day event "
+            "(no start_time, end_time or duration_minutes); false makes an all-day event timed "
+            "(then start_time and duration_minutes, or end_day_offset + end_time, are required). "
+            "Changing only day_offset keeps the event's length",
             f"location: string, max {EVENT_LOCATION_MAX_CHARS} chars, optional (\"\" clears it, omitted leaves it alone)",
             f"add_attendees: list of email strings, optional, event total capped at {EVENT_ATTENDEES_MAX}",
             "remove_attendees: list of email strings, optional",
@@ -345,9 +431,13 @@ VERB_SPECS: dict[Verb, VerbSpec] = {
     ),
     Verb.CALENDAR_DELETE_EVENT: VerbSpec(
         verb=Verb.CALENDAR_DELETE_EVENT,
-        param_names=frozenset({"event_id"}),
+        param_names=frozenset({"event_id", "calendar_id"}),
         is_write=True,
-        param_bounds=(f"event_id: string, required, max {EVENT_ID_MAX_CHARS} chars",),
+        param_bounds=(
+            f"event_id: string, required, max {EVENT_ID_MAX_CHARS} chars",
+            f"calendar_id: string, optional, default '{PRIMARY_CALENDAR_ID}': the calendar the event is on; "
+            "only events the gatekeeper created can be deleted",
+        ),
     ),
     Verb.DRIVE_CREATE_FILE: VerbSpec(
         verb=Verb.DRIVE_CREATE_FILE,
@@ -540,6 +630,9 @@ def _evaluate_known_params(verb: Verb, params: dict[str, Any]) -> PolicyDecision
     if verb == Verb.GMAIL_CREATE_DRAFT:
         return _evaluate_gmail_create_draft(params)
 
+    if verb == Verb.CALENDAR_LIST_CALENDARS:
+        return PolicyDecision(status="allowed", verb=verb, params=CalendarListCalendarsParams())
+
     if verb == Verb.CALENDAR_LIST_EVENTS:
         return _evaluate_calendar_list_events(params)
 
@@ -701,10 +794,24 @@ def _evaluate_calendar_list_events(params: dict[str, Any]) -> PolicyDecision:
             reason=f"'max_results' must be between {CAL_MAX_RESULTS_MIN} and {CAL_MAX_RESULTS_MAX}",
         )
 
+    calendar_id: str | None = None
+    if "calendar_id" in params:
+        calendar_id, err = _validate_calendar_id(params["calendar_id"])
+        if err:
+            return _deny(verb, err)
+
+    query: str | None = None
+    if "query" in params:
+        query, err = _validate_calendar_query(params["query"])
+        if err:
+            return _deny(verb, err)
+
     return PolicyDecision(
         status="allowed",
         verb=verb,
-        params=CalendarListEventsParams(day_offset=day_offset, days=days, max_results=max_results),
+        params=CalendarListEventsParams(
+            day_offset=day_offset, days=days, max_results=max_results, calendar_id=calendar_id, query=query,
+        ),
     )
 
 
@@ -733,10 +840,39 @@ def _validate_day_offset(value: Any) -> tuple[int | None, str | None]:
     return value, None
 
 
-def _validate_start_time(value: Any) -> tuple[str | None, str | None]:
-    if not isinstance(value, str) or not _TIME_RE.match(value):
-        return None, "'start_time' must be an 'HH:MM' string"
+def _validate_end_day_offset(value: Any) -> tuple[int | None, str | None]:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None, "'end_day_offset' must be an integer"
+    if not (EVENT_DAY_OFFSET_MIN <= value <= EVENT_END_DAY_OFFSET_MAX):
+        return None, f"'end_day_offset' must be between {EVENT_DAY_OFFSET_MIN} and {EVENT_END_DAY_OFFSET_MAX}"
     return value, None
+
+
+def _validate_time_of_day(value: Any, name: str) -> tuple[str | None, str | None]:
+    if not isinstance(value, str) or not _TIME_RE.match(value):
+        return None, f"'{name}' must be an 'HH:MM' string"
+    return value, None
+
+
+def _validate_start_time(value: Any) -> tuple[str | None, str | None]:
+    return _validate_time_of_day(value, "start_time")
+
+
+def _validate_end_time(value: Any) -> tuple[str | None, str | None]:
+    return _validate_time_of_day(value, "end_time")
+
+
+def _validate_all_day(value: Any) -> tuple[bool | None, str | None]:
+    """A true boolean, or the strings "true"/"false". The second form is
+    deliberate, not a coercion of arbitrary text: app/yaml_safe.py drops
+    YAML's bool resolver (so `title: Off` stays a string), which means an
+    unquoted `all_day: true` in a request block ARRIVES as the string
+    "true". Nothing else -- not "yes", "1", or a number -- is accepted."""
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true", None
+    return None, "'all_day' must be true or false"
 
 
 def _validate_duration(value: Any) -> tuple[int | None, str | None]:
@@ -788,6 +924,115 @@ def _validate_event_id(value: Any) -> tuple[str | None, str | None]:
     return value.strip(), None
 
 
+def _validate_calendar_id(value: Any) -> tuple[str | None, str | None]:
+    """Shape only -- see PRIMARY_CALENDAR_ID above. Whether the account can
+    actually read or write the calendar is decided at execution time,
+    against the account's own calendar list."""
+    if not isinstance(value, str) or not value.strip():
+        return None, "'calendar_id' must be a non-empty string"
+    calendar_id = value.strip()
+    if len(calendar_id) > CALENDAR_ID_MAX_CHARS:
+        return None, f"'calendar_id' exceeds {CALENDAR_ID_MAX_CHARS} characters"
+    if not _CALENDAR_ID_RE.match(calendar_id):
+        return None, "'calendar_id' is not a valid calendar id (use one from calendar.list_calendars, or 'primary')"
+    return calendar_id, None
+
+
+def _validate_calendar_query(value: Any) -> tuple[str | None, str | None]:
+    if not isinstance(value, str) or not value.strip():
+        return None, "'query' must be a non-empty string"
+    if not _is_single_line(value):
+        return None, "'query' must be a single line with no control characters"
+    if len(value) > QUERY_MAX_CHARS:
+        return None, f"'query' exceeds {QUERY_MAX_CHARS} characters"
+    return value.strip(), None
+
+
+# ── Event span rules ──────────────────────────────────────────────────────
+# One definition of "how long may an event be", used here on what a request
+# says AND by app/calendar_executor.py on what an update resolves to once the
+# parts a request left out are filled in from the existing event.
+
+
+def minute_of_day(hhmm: str) -> int:
+    hour, _, minute = hhmm.partition(":")
+    return int(hour) * 60 + int(minute)
+
+
+def timed_span_minutes(day_offset: int, start_time: str, end_day_offset: int, end_time: str) -> int:
+    """Wall-clock minutes from (day_offset, start_time) to (end_day_offset,
+    end_time). Pure arithmetic on the requested numbers -- no clock, no
+    timezone -- so Layer 3 can check it before anything is resolved."""
+    return (end_day_offset - day_offset) * 24 * 60 + minute_of_day(end_time) - minute_of_day(start_time)
+
+
+def timed_span_problem(minutes: int) -> str | None:
+    if minutes < EVENT_DURATION_MIN_MINUTES:
+        return f"the event must end at least {EVENT_DURATION_MIN_MINUTES} minutes after it starts"
+    if minutes > EVENT_SPAN_MAX_DAYS * 24 * 60:
+        return f"the event may span at most {EVENT_SPAN_MAX_DAYS} days"
+    return None
+
+
+def all_day_span_problem(first_day_offset: int, last_day_offset: int) -> str | None:
+    """`last_day_offset` is the event's last day, INCLUDED."""
+    if last_day_offset < first_day_offset:
+        return "'end_day_offset' must not be before 'day_offset'"
+    if last_day_offset - first_day_offset + 1 > EVENT_SPAN_MAX_DAYS:
+        return f"an all-day event may span at most {EVENT_SPAN_MAX_DAYS} days (the last day included)"
+    return None
+
+
+def _new_event_timing(
+    params: dict[str, Any], day_offset: int, all_day: bool
+) -> tuple[dict[str, Any] | None, str | None]:
+    """create_event's timing fields: ({start_time, duration_minutes,
+    end_day_offset, end_time}, None) or (None, reason). A timed event has a
+    start_time and exactly one of duration_minutes / end_day_offset+end_time;
+    an all-day event has none of the time-of-day fields."""
+    if all_day:
+        clash = [name for name in ("start_time", "end_time", "duration_minutes") if name in params]
+        if clash:
+            return None, f"an all_day event has no time of day: remove {', '.join(clash)}"
+        end_day_offset = day_offset  # a single day unless end_day_offset says otherwise
+        if "end_day_offset" in params:
+            end_day_offset, err = _validate_end_day_offset(params["end_day_offset"])
+            if err or end_day_offset is None:
+                return None, err or "'end_day_offset' must be an integer"
+        problem = all_day_span_problem(day_offset, end_day_offset)
+        if problem:
+            return None, problem
+        return {"start_time": None, "duration_minutes": None, "end_day_offset": end_day_offset, "end_time": None}, None
+
+    start_time, err = _validate_start_time(params.get("start_time"))
+    if err or start_time is None:
+        return None, err or "'start_time' must be an 'HH:MM' string"
+
+    has_duration = "duration_minutes" in params
+    has_end = "end_day_offset" in params or "end_time" in params
+    if has_duration and has_end:
+        return None, "give either duration_minutes or end_day_offset + end_time, not both"
+    if has_duration:
+        duration_minutes, err = _validate_duration(params["duration_minutes"])
+        if err or duration_minutes is None:
+            return None, err or "'duration_minutes' must be an integer"
+        return {"start_time": start_time, "duration_minutes": duration_minutes, "end_day_offset": None, "end_time": None}, None
+    if has_end:
+        if "end_day_offset" not in params or "end_time" not in params:
+            return None, "'end_day_offset' and 'end_time' must be given together"
+        end_day_offset, err = _validate_end_day_offset(params["end_day_offset"])
+        if err or end_day_offset is None:
+            return None, err or "'end_day_offset' must be an integer"
+        end_time, err = _validate_end_time(params["end_time"])
+        if err or end_time is None:
+            return None, err or "'end_time' must be an 'HH:MM' string"
+        problem = timed_span_problem(timed_span_minutes(day_offset, start_time, end_day_offset, end_time))
+        if problem:
+            return None, problem
+        return {"start_time": start_time, "duration_minutes": None, "end_day_offset": end_day_offset, "end_time": end_time}, None
+    return None, "'duration_minutes' (or 'end_day_offset' + 'end_time') is required for a timed event"
+
+
 def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
     verb = Verb.CALENDAR_CREATE_EVENT
 
@@ -800,11 +1045,11 @@ def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
     if err:
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
 
-    start_time, err = _validate_start_time(params.get("start_time"))
+    all_day, err = _validate_all_day(params.get("all_day", False))
     if err:
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
 
-    duration_minutes, err = _validate_duration(params.get("duration_minutes"))
+    calendar_id, err = _validate_calendar_id(params.get("calendar_id", PRIMARY_CALENDAR_ID))
     if err:
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
 
@@ -820,17 +1065,48 @@ def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
     # Each validator's (value, err) contract guarantees value is not None
     # here; checked explicitly rather than with `assert`, which `python -O`
     # strips -- deny-by-default must not depend on interpreter flags.
-    if title is None or day_offset is None or start_time is None or duration_minutes is None or location is None:
+    if title is None or day_offset is None or all_day is None or location is None or calendar_id is None:
         return _deny(verb, "validated value missing")
+
+    timing, err = _new_event_timing(params, day_offset, all_day)
+    if err or timing is None:
+        return _deny(verb, err or "validated timing missing")
 
     return PolicyDecision(
         status="allowed",
         verb=verb,
         params=CalendarCreateEventParams(
-            title=title, day_offset=day_offset, start_time=start_time,
-            duration_minutes=duration_minutes, attendees=attendees or (), location=location,
+            title=title, day_offset=day_offset, attendees=attendees or (), location=location,
+            all_day=all_day, calendar_id=calendar_id, **timing,
         ),
     )
+
+
+def _update_timing_problem(updates: dict[str, Any]) -> str | None:
+    """The cross-field rules for update_event's timing fields, as far as the
+    request ALONE decides them. What an update leaves out comes from the
+    existing event, so anything that depends on it (e.g. whether an
+    end_day_offset alone belongs to an all-day or a timed event) is finished
+    by app/calendar_executor.py."""
+    all_day = updates.get("all_day")  # True, False, or None when omitted
+    if all_day is True:
+        clash = [name for name in ("start_time", "end_time", "duration_minutes") if name in updates]
+        if clash:
+            return f"an all_day event has no time of day: remove {', '.join(clash)}"
+        if "day_offset" in updates and "end_day_offset" in updates:
+            return all_day_span_problem(updates["day_offset"], updates["end_day_offset"])
+        return None
+    if "end_time" in updates and "end_day_offset" not in updates:
+        return "'end_time' must be given together with 'end_day_offset'"
+    if "duration_minutes" in updates and "end_day_offset" in updates:
+        return "give either duration_minutes or end_day_offset + end_time, not both"
+    if all_day is False and "end_day_offset" in updates and "end_time" not in updates:
+        return "'end_day_offset' and 'end_time' must be given together for a timed event"
+    if all(name in updates for name in ("day_offset", "start_time", "end_day_offset", "end_time")):
+        return timed_span_problem(
+            timed_span_minutes(updates["day_offset"], updates["start_time"], updates["end_day_offset"], updates["end_time"])
+        )
+    return None
 
 
 def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
@@ -841,12 +1117,19 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
     if err:
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
 
+    calendar_id, err = _validate_calendar_id(params.get("calendar_id", PRIMARY_CALENDAR_ID))
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
     updates: dict[str, Any] = {}
     for field_name, validator in (
         ("title", _validate_title),
         ("day_offset", _validate_day_offset),
         ("start_time", _validate_start_time),
         ("duration_minutes", _validate_duration),
+        ("end_day_offset", _validate_end_day_offset),
+        ("end_time", _validate_end_time),
+        ("all_day", _validate_all_day),
         ("location", _validate_location),
     ):
         if field_name not in params:
@@ -869,15 +1152,25 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
     if both:
         return _deny(verb, "an address can't be in both add_attendees and remove_attendees")
 
+    timing_problem = _update_timing_problem(updates)
+    if timing_problem:
+        return _deny(verb, timing_problem)
+
     if not updates:
         return PolicyDecision(
             status="denied", verb=verb, error_code="invalid_params",
-            reason="at least one of title/day_offset/start_time/duration_minutes/location/add_attendees/remove_attendees must be given",
+            reason=(
+                "at least one of title/day_offset/start_time/duration_minutes/end_day_offset/end_time/all_day/"
+                "location/add_attendees/remove_attendees must be given"
+            ),
         )
 
-    if event_id is None:
+    if event_id is None or calendar_id is None:
         return _deny(verb, "validated event_id missing")
-    return PolicyDecision(status="allowed", verb=verb, params=CalendarUpdateEventParams(event_id=event_id, **updates))
+    return PolicyDecision(
+        status="allowed", verb=verb,
+        params=CalendarUpdateEventParams(event_id=event_id, calendar_id=calendar_id, **updates),
+    )
 
 
 def _evaluate_calendar_delete_event(params: dict[str, Any]) -> PolicyDecision:
@@ -888,9 +1181,15 @@ def _evaluate_calendar_delete_event(params: dict[str, Any]) -> PolicyDecision:
     if err:
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
 
-    if event_id is None:
+    calendar_id, err = _validate_calendar_id(params.get("calendar_id", PRIMARY_CALENDAR_ID))
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
+    if event_id is None or calendar_id is None:
         return _deny(verb, "validated event_id missing")
-    return PolicyDecision(status="allowed", verb=verb, params=CalendarDeleteEventParams(event_id=event_id))
+    return PolicyDecision(
+        status="allowed", verb=verb, params=CalendarDeleteEventParams(event_id=event_id, calendar_id=calendar_id)
+    )
 
 
 def _evaluate_drive_create_file(params: dict[str, Any]) -> PolicyDecision:
