@@ -5,7 +5,9 @@
 > dedupe and rate cap → deterministic request block (or a quarantined, tool-less reader LLM for
 > plain text) → deny-by-default policy → one executor → reply, with a hash-chained audit log.
 > - Verbs: `gmail.search`, `gmail.create_draft` (drafts only, never sent),
->   `calendar.list_events`/`create_event`/`update_event`/`delete_event`, `drive.create_file`.
+>   `calendar.list_calendars`/`list_events`/`create_event`/`update_event`/`delete_event`
+>   (any calendar the account can write to, multi-day and all-day events),
+>   `drive.create_file`.
 > - Calendar writes are autonomous by the owner's choice, contained to events the gatekeeper
 >   created itself.
 > - TypeSafe's Jev classifier screens every inbound part for prompt injection, and every
