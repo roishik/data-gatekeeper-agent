@@ -12,8 +12,9 @@ Request/response format: `docs/PROTOCOL.md`. How to run, deploy, verify and kill
 
 **The calendar extensions are deployed (2026-09-26): live revision `data-gatekeeper-00017-lf4`,
 built from `feat/calendar-extensions-2026-09` at `503a25c` (`GIT_SHA=503a25c`,
-`MAX_REQUESTS_PER_DAY=100`).** That branch is pushed but NOT yet merged into `main` (no PR opened
-yet), so `main` is behind the live service. Rollback target: `data-gatekeeper-00016-crq` (`64e8f6f`).
+`MAX_REQUESTS_PER_DAY=100`).** Merged into `main` as PR #6 (merge commit `07da6ee`, 2026-09-26);
+after `503a25c` the branch only added docs and tests, so the deployed app code equals `main`'s.
+Rollback target: `data-gatekeeper-00016-crq` (`64e8f6f`).
 After the deploy: `/health` 200, `/docs` 404, env vars as expected, and the audit chain verified
 intact at 108 entries. The three live checks against real Google are still owed (see "Calendar
 extensions" below). The section that follows describes the state as of 2026-09-23 and is otherwise
