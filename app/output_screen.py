@@ -7,6 +7,8 @@ What gets screened, item by item (each is its own Jev call, chunked if
 long -- app/jev.py):
   - each gmail.search result: sender, subject, date, snippet;
   - each calendar.list_events result: title, location;
+  - each calendar.list_calendars result: the calendar's name (free text that
+    whoever shared the calendar chose);
   - each write verb's echo: the draft's recipient/subject, the created or
     updated event's title, the Drive file's name.
 
@@ -87,6 +89,10 @@ def gmail_key(index: int) -> str:
 
 def event_key(index: int) -> str:
     return f"event:{index}"
+
+
+def calendar_key(index: int) -> str:
+    return f"calendar:{index}"
 
 
 # What "sensitive" means here is deliberately NARROW (owner's rule,

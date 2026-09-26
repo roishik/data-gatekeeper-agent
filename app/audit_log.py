@@ -89,6 +89,10 @@ _FIELD_ORDER = [
     # human-readable content" split as everything else.
     "draft_id", "draft_to", "created_event_id", "updated_event_id",
     "deleted_event_id", "drive_file_id",
+    # The calendar a calendar verb targeted (added 2026-09-25) -- an opaque
+    # id, like the event ids. Entries written before this existed simply lack
+    # the key; verify_chain hashes each entry's stored dict, so they still verify.
+    "calendar_id",
 ]
 
 
@@ -146,6 +150,7 @@ class AuditRecord:
     updated_event_id: str | None = None
     deleted_event_id: str | None = None
     drive_file_id: str | None = None
+    calendar_id: str | None = None
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 

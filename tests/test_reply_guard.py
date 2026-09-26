@@ -529,3 +529,22 @@ def test_error_and_duplicate_replies_explain_themselves():
     assert "not found" in final and "retryable: false" in final
     dup = render_reply(parsed, "duplicate", "duplicate_request")
     assert "already received" in dup and "status: duplicate" in dup
+
+
+def test_render_reply_list_calendars_truncates_at_a_whole_calendar_and_says_how_many():
+    from app.calendar_executor import CalendarInfo
+
+    count = (REPLY_MAX_CHARS // 200) + 30
+    calendars = [
+        CalendarInfo(calendar_id=f"cal{i}@group.calendar.google.com", name="n" * 150, access_role="writer")
+        for i in range(count)
+    ]
+    parsed = ParsedRequest(request_id="req_cals", verb="calendar.list_calendars", params={}, source="block")
+    body = render_reply(parsed, "completed", None, calendars=calendars)
+
+    import re as _re
+
+    shown, total = map(int, _re.search(r"\[showing (\d+) of (\d+) results\]", body).groups())
+    assert total == count and 0 < shown < count
+    assert body.count("(calendar_id: ") == shown  # whole lines only, never cut mid-calendar
+    assert f"result_count: {count}" in body and "---END---" in body

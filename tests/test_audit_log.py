@@ -119,3 +119,25 @@ def test_append_many_chains_exactly_like_one_at_a_time(tmp_path):
     # The next single append still chains on from the last batched one.
     many.append(_record(agentmail_message_id="m3"))
     assert verify_chain(many.all_entries())
+
+
+def test_a_chain_written_before_calendar_id_existed_still_verifies_and_can_be_extended(tmp_path):
+    """The production chain has entries with no `calendar_id` key (it was
+    added 2026-09-25). verify_chain hashes each entry's STORED record, so
+    those entries must keep verifying, and new entries with the key must
+    chain on after them."""
+    import json
+
+    old_record = json.loads(json.dumps(JSONLAuditLog(tmp_path / "scratch.jsonl").append(_record())["record"]))
+    del old_record["calendar_id"]  # exactly what an entry written before the field looked like
+    old_entry = {"record": old_record, "prev_hash": GENESIS_HASH, "hash": compute_entry_hash(old_record, GENESIS_HASH)}
+    path = tmp_path / "log.jsonl"
+    path.write_text(json.dumps(old_entry) + "\n")
+
+    log = JSONLAuditLog(path)  # reloads the old chain's last hash
+    log.append(_record(calendar_id="family123@group.calendar.google.com"))
+
+    entries = log.all_entries()
+    assert "calendar_id" not in entries[0]["record"]
+    assert entries[1]["record"]["calendar_id"] == "family123@group.calendar.google.com"
+    assert verify_chain(entries)

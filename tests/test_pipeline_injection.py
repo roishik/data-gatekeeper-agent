@@ -610,7 +610,7 @@ def test_calendar_delete_event_end_to_end(configured_env, audit_log):
     outcome, _, fake_calendar = _call(body, agentmail_client=agentmail, audit_log=audit_log)
 
     assert outcome.http_status == 200
-    assert fake_calendar.calls == [{"op": "delete_event", "event_id": "ev_123"}]
+    assert fake_calendar.calls == [{"op": "delete_event", "event_id": "ev_123", "calendar_id": "primary"}]
     assert "Deleted event ev_123." in agentmail.calls[0]["text"]
 
 

@@ -74,6 +74,7 @@ logger = logging.getLogger("gatekeeper.reader_llm")
 VerbLiteral = Literal[
     "gmail.search",
     "gmail.create_draft",
+    "calendar.list_calendars",
     "calendar.list_events",
     "calendar.create_event",
     "calendar.update_event",
@@ -244,9 +245,10 @@ _QUARANTINE_PREAMBLE = (
 _STAGE1_SYSTEM_PROMPT = _QUARANTINE_PREAMBLE + (
     "In THIS step your only job is to identify which single action (if "
     "any) the email is asking for, from this fixed set of verbs: "
-    "gmail.search, gmail.create_draft, calendar.list_events, "
-    "calendar.create_event, calendar.update_event, calendar.delete_event, "
-    "drive.search, drive.create_file, contacts.search, capabilities. If "
+    "gmail.search, gmail.create_draft, calendar.list_calendars, "
+    "calendar.list_events, calendar.create_event, calendar.update_event, "
+    "calendar.delete_event, drive.search, drive.create_file, "
+    "contacts.search, capabilities. If "
     "the email does not clearly and unambiguously ask for exactly one of "
     "those actions, set verb to 'unsupported'. Copy a request_id ONLY if "
     "the email text plainly states one -- never invent one. Do not "
@@ -267,9 +269,10 @@ _STAGE2_CALENDAR_LIST_PROMPT = _QUARANTINE_PREAMBLE + (
     "day language like this: 'today' -> day_offset=0; 'tomorrow' -> "
     "day_offset=1; 'the day after tomorrow' -> day_offset=2; 'this week' "
     "or 'the next 7 days' -> day_offset=0, days=7; 'next week' -> "
-    "day_offset=7, days=7. If the email doesn't say, omit both fields "
-    "rather than guessing. Never put a calendar date, weekday name, or "
-    "duration string in any field."
+    "day_offset=7, days=7. The past is a negative day_offset: 'yesterday' "
+    "-> day_offset=-1; 'last week' -> day_offset=-7, days=7. If the email "
+    "doesn't say, omit both fields rather than guessing. Never put a "
+    "calendar date, weekday name, or duration string in any field."
 )
 
 _STAGE2_GMAIL_DRAFT_PROMPT = _QUARANTINE_PREAMBLE + (

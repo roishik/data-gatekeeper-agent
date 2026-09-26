@@ -52,7 +52,7 @@ from dataclasses import dataclass
 import yaml
 
 from app.agentmail_client import AgentMailClient, ReplyResult
-from app.calendar_executor import CalendarEvent
+from app.calendar_executor import CalendarEvent, CalendarInfo
 from app.calendar_window import format_event_range
 from app.capabilities import CapabilitiesInfo
 from app.config import GIT_SHA, OWNER_TIMEZONE, REPLY_MAX_CHARS
@@ -65,6 +65,7 @@ from app.output_screen import (
     UPDATED_EVENT_KEY,
     WITHHELD_TEXT,
     OutputScreenResult,
+    calendar_key,
     event_key,
     gmail_key,
 )
@@ -215,6 +216,16 @@ def _format_event_title_location(summary: str, location: str, *, is_withheld: bo
     return title, location_suffix
 
 
+def _event_ref(event: CalendarEvent) -> str:
+    """"(event_id: X, calendar_id: Y)" -- both are opaque Google tokens,
+    structurally escaped only (never through redact(), which would mangle a
+    digit run). The calendar_id is what a follow-up update/delete on an event
+    that isn't on the primary calendar has to name, so it's shown wherever the
+    event_id is."""
+    calendar = f", calendar_id: {sanitize_output(event.calendar_id)}" if event.calendar_id else ""
+    return f"(event_id: {sanitize_output(event.event_id)}{calendar})"
+
+
 @dataclass(frozen=True)
 class _ProseResult:
     lines: list[str]
@@ -230,6 +241,8 @@ def _build_prose(
     gmail_results: list[GmailResult] | None = None,
     calendar_results: list[CalendarEvent] | None = None,
     calendar_window_label: str | None = None,
+    calendar_show_year: bool = False,
+    calendars: list[CalendarInfo] | None = None,
     clarification_question: str | None = None,
     draft_result: DraftResult | None = None,
     created_event: CalendarEvent | None = None,
@@ -249,6 +262,7 @@ def _build_prose(
     result_count = (
         len(gmail_results or [])
         + len(calendar_results or [])
+        + len(calendars or [])
         + (1 if draft_result else 0)
         + (1 if created_event else 0)
         + (1 if updated_event else 0)
@@ -285,8 +299,8 @@ def _build_prose(
             for i, e in enumerate(calendar_results):
                 # The time comes from Google's structured start/end, never free
                 # text, so it's kept even when the item's text is withheld.
-                when = format_event_range(e.start, e.end, e.all_day, OWNER_TIMEZONE)
-                event_id = f"(event_id: {sanitize_output(e.event_id)})"
+                when = format_event_range(e.start, e.end, e.all_day, OWNER_TIMEZONE, calendar_show_year)
+                event_id = _event_ref(e)
                 if withheld(event_key(i)):
                     prose_lines.append(f"- {WITHHELD_TEXT} — {when} {event_id}")
                     continue
@@ -297,6 +311,25 @@ def _build_prose(
                 prose_lines.append(f"- {title} — {when}{location}{attendees} {event_id}")
         else:
             prose_lines.append(f"No events found{when_label}.")
+    elif status == "completed" and parsed_request.verb == "calendar.list_calendars":
+        if calendars:
+            prose_lines.append(f"Found {len(calendars)} calendar(s) this account can write to:")
+            item_lines_start = len(prose_lines)
+            item_lines_total = len(calendars)
+            for i, c in enumerate(calendars):
+                # The name is free text whoever shared the calendar chose, so it
+                # is screened and redacted like an event title; the id and the
+                # role are Google's own tokens and are kept either way.
+                name = WITHHELD_TEXT if withheld(calendar_key(i)) else (safe_display(c.name) or "(no name)")
+                primary = " (primary calendar)" if c.primary else ""
+                prose_lines.append(
+                    f"- {name}{primary} — access: {sanitize_output(c.access_role)} "
+                    f"(calendar_id: {sanitize_output(c.calendar_id)})"
+                )
+            if output is not None and output.status == "degraded":
+                prose_lines.append("(Content screening was unavailable for some items, so their text was withheld.)")
+        else:
+            prose_lines.append("No calendars this account can write to were found.")
     elif status == "completed" and parsed_request.verb == "calendar.create_event" and created_event:
         # Title and location are screened as ONE item (app/pipeline.py's
         # _output_items), so a flagged event hides both together rather
@@ -306,14 +339,14 @@ def _build_prose(
         )
         when = format_event_range(created_event.start, created_event.end, created_event.all_day, OWNER_TIMEZONE)
         attendees = f", invited {created_event.attendee_count} attendee(s)" if created_event.attendee_count else ""
-        prose_lines.append(f"Created event {title} — {when}{location}{attendees} (event_id: {sanitize_output(created_event.event_id)}).")
+        prose_lines.append(f"Created event {title} — {when}{location}{attendees} {_event_ref(created_event)}.")
     elif status == "completed" and parsed_request.verb == "calendar.update_event" and updated_event:
         title, location = _format_event_title_location(
             updated_event.summary, updated_event.location, is_withheld=withheld(UPDATED_EVENT_KEY)
         )
         when = format_event_range(updated_event.start, updated_event.end, updated_event.all_day, OWNER_TIMEZONE)
         attendees = f", {updated_event.attendee_count} attendee(s)" if updated_event.attendee_count else ""
-        prose_lines.append(f"Updated event {title} — {when}{location}{attendees} (event_id: {sanitize_output(updated_event.event_id)}).")
+        prose_lines.append(f"Updated event {title} — {when}{location}{attendees} {_event_ref(updated_event)}.")
     elif status == "completed" and parsed_request.verb == "calendar.delete_event" and deleted_event_id:
         prose_lines.append(f"Deleted event {sanitize_output(deleted_event_id)}.")
     elif status == "completed" and parsed_request.verb == "gmail.create_draft" and draft_result:
@@ -491,6 +524,8 @@ def render_reply(
     gmail_results: list[GmailResult] | None = None,
     calendar_results: list[CalendarEvent] | None = None,
     calendar_window_label: str | None = None,
+    calendar_show_year: bool = False,
+    calendars: list[CalendarInfo] | None = None,
     clarification_question: str | None = None,
     draft_result: DraftResult | None = None,
     created_event: CalendarEvent | None = None,
@@ -514,6 +549,7 @@ def render_reply(
     prose_result = _build_prose(
         parsed_request, status, error_code,
         gmail_results=gmail_results, calendar_results=calendar_results, calendar_window_label=calendar_window_label,
+        calendar_show_year=calendar_show_year, calendars=calendars,
         clarification_question=clarification_question, draft_result=draft_result, created_event=created_event,
         updated_event=updated_event, deleted_event_id=deleted_event_id, drive_file_result=drive_file_result,
         capabilities=capabilities, retryable=retryable, detail=detail, output=output, ignored_params=ignored_params,

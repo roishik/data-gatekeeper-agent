@@ -130,14 +130,14 @@ def test_calendar_list_events_today_and_tomorrow():
     assert tomorrow.status == "allowed" and tomorrow.params.day_offset == 1
 
 
-@pytest.mark.parametrize("day_offset", [-1, -5, 14, 100])
+@pytest.mark.parametrize("day_offset", [-366, -1000, 14, 100])
 def test_calendar_day_offset_out_of_bounds_denied(day_offset):
     decision = evaluate_policy("calendar.list_events", {"day_offset": day_offset})
     assert decision.status == "denied"
     assert decision.error_code == "invalid_params"
 
 
-@pytest.mark.parametrize("day_offset", [0, 13])
+@pytest.mark.parametrize("day_offset", [-365, -1, 0, 13])  # negative = the past, back a year
 def test_calendar_day_offset_boundary_values_allowed(day_offset):
     decision = evaluate_policy("calendar.list_events", {"day_offset": day_offset})
     assert decision.status == "allowed"
@@ -153,14 +153,14 @@ def test_calendar_day_offset_bool_denied():
     assert decision.status == "denied"
 
 
-@pytest.mark.parametrize("days", [0, -1, 8, 30])
+@pytest.mark.parametrize("days", [0, -1, 367, 1000])
 def test_calendar_days_out_of_bounds_denied(days):
     decision = evaluate_policy("calendar.list_events", {"days": days})
     assert decision.status == "denied"
     assert decision.error_code == "invalid_params"
 
 
-@pytest.mark.parametrize("days", [1, 7])
+@pytest.mark.parametrize("days", [1, 7, 366])
 def test_calendar_days_boundary_values_allowed(days):
     decision = evaluate_policy("calendar.list_events", {"days": days})
     assert decision.status == "allowed"
@@ -186,7 +186,7 @@ def test_calendar_params_has_no_recipient_or_date_string_field():
     ever carry a recipient, verb override, or a literal date/timestamp
     string an injected instruction might try to plant."""
     field_names = {f.name for f in dataclasses.fields(CalendarListEventsParams)}
-    assert field_names == {"day_offset", "days", "max_results"}
+    assert field_names == {"day_offset", "days", "max_results", "calendar_id", "query"}
 
 
 def test_calendar_extra_params_are_never_read_only_listed():
@@ -605,7 +605,7 @@ def test_verb_specs_cover_every_implemented_verb_exactly():
     from app.policy import VERB_SPECS
 
     assert set(VERB_SPECS.keys()) == {
-        Verb.GMAIL_SEARCH, Verb.GMAIL_CREATE_DRAFT, Verb.CALENDAR_LIST_EVENTS,
+        Verb.GMAIL_SEARCH, Verb.GMAIL_CREATE_DRAFT, Verb.CALENDAR_LIST_CALENDARS, Verb.CALENDAR_LIST_EVENTS,
         Verb.CALENDAR_CREATE_EVENT, Verb.CALENDAR_UPDATE_EVENT, Verb.CALENDAR_DELETE_EVENT,
         Verb.DRIVE_CREATE_FILE, Verb.CAPABILITIES,
     }
@@ -637,6 +637,7 @@ def test_every_implemented_verb_ignores_unknown_parameters():
     valid = {
         "gmail.search": {"query": "invoice"},
         "gmail.create_draft": {"to": "a@example.com", "subject": "Hi", "body": "Hello"},
+        "calendar.list_calendars": {},
         "calendar.list_events": {},
         "calendar.create_event": {"title": "Meet", "day_offset": 1, "start_time": "10:00", "duration_minutes": 30},
         "calendar.update_event": {"event_id": "e1", "title": "Moved"},
