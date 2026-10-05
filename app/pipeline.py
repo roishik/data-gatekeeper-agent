@@ -516,22 +516,26 @@ def _inbound_screen_parts(subject: str, parts: EmailParts) -> tuple[dict[str, st
     return screen, request_names
 
 
-def _make_invite_guard(output_screen: OutputScreen) -> Callable[[str, str], None]:
-    """A calendar event with attendees sends its title AND location to
-    third parties the moment it's written, with no human review -- so both
-    are screened first, and a flagged (or, failing closed, unscreenable)
-    title/location refuses the write. See app/output_screen.py."""
+def _make_invite_guard(output_screen: OutputScreen) -> Callable[[str, str, str], None]:
+    """A calendar event with attendees sends its title, location AND
+    description to third parties the moment it's written, with no human
+    review -- so all three are screened first, as one item, and a flagged
+    (or, failing closed, unscreenable) one refuses the write. Nothing is
+    silently dropped: the whole write is refused. See app/output_screen.py."""
 
-    def guard(title: str, location: str) -> None:
+    def guard(title: str, location: str, description: str) -> None:
         try:
-            result = output_screen.screen_items({INVITE_KEY: {"title": title, "location": location}})
+            result = output_screen.screen_items(
+                {INVITE_KEY: {"title": title, "location": location, "description": description}}
+            )
         except Exception:
-            logger.exception("invite title/location screen failed")
+            logger.exception("invite title/location/description screen failed")
             result = all_withheld([INVITE_KEY], fail_closed=OUTPUT_SCREEN_FAIL_MODE != "open")
         if result.is_withheld(INVITE_KEY):
             raise GatekeeperDenied(
                 "sensitive_content_refused",
-                "the event title or location was flagged as sensitive (or could not be screened) and the event has attendees",
+                "the event title, location or description was flagged as sensitive (or could not be screened) "
+                "and the event has attendees",
             )
 
     return guard
@@ -574,7 +578,7 @@ def _execute(
     calendar_client_factory: Callable[[], CalendarClient],
     drive_client_factory: Callable[[], DriveClient],
     *,
-    invite_guard: Callable[[str, str], None],
+    invite_guard: Callable[[str, str, str], None],
 ) -> ExecutionResults:
     """Layer 4: only for an allowed verb -- exactly one verb, read or
     write, runs per request."""
@@ -606,12 +610,13 @@ def _execute(
         )
     elif isinstance(params, CalendarCreateEventParams):
         if params.attendees:
-            invite_guard(params.title, params.location)
+            invite_guard(params.title, params.location, params.description)
         results.created_event = calendar_client_factory().create_event(
             title=params.title, day_offset=params.day_offset, start_time=params.start_time,
             duration_minutes=params.duration_minutes, attendees=params.attendees, request_id=parsed.request_id,
             location=params.location, calendar_id=params.calendar_id, end_day_offset=params.end_day_offset,
             end_time=params.end_time, all_day=params.all_day,
+            description=params.description, reminder_minutes=params.reminder_minutes,
         )
     elif isinstance(params, CalendarUpdateEventParams):
         results.updated_event = calendar_client_factory().update_event(
@@ -620,6 +625,7 @@ def _execute(
             add_attendees=params.add_attendees, remove_attendees=params.remove_attendees,
             invite_guard=invite_guard, location=params.location, calendar_id=params.calendar_id,
             end_day_offset=params.end_day_offset, end_time=params.end_time, all_day=params.all_day,
+            description=params.description,
         )
     elif isinstance(params, CalendarDeleteEventParams):
         calendar_client_factory().delete_event(event_id=params.event_id, calendar_id=params.calendar_id)

@@ -40,10 +40,10 @@ NoOpOutputScreen (no TYPESAFE_API_KEY, i.e. local dev and tests) screens
 nothing and withholds nothing -- status "disabled".
 
 Calendar invites (`invite_guard`): an event created or updated WITH
-attendees sends its title to third parties immediately, with no human
-review. The pipeline screens that title first and refuses the write
-(`sensitive_content_refused`) if it's flagged -- or if it can't be
-screened, same fail-closed rule.
+attendees sends its title, location and description to third parties
+immediately, with no human review. The pipeline screens all three first, as
+one item, and refuses the write (`sensitive_content_refused`) if it's
+flagged -- or if it can't be screened, same fail-closed rule.
 
 Invariant note (CLAUDE.md): this sends Google content -- email metadata and
 snippets, calendar titles and locations -- to TypeSafe. That's an

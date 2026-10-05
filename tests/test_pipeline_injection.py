@@ -829,7 +829,7 @@ def test_create_event_with_attendees_screens_the_location_before_inviting(config
         "  location: Room 4B\n  attendees: [dana@example.com]\n---END---\n"
     )
     _call_calendar(text, calendar, audit_log, output_screen=screen)
-    assert screen.item_calls[0]["invite"] == {"title": "Coffee", "location": "Room 4B"}
+    assert screen.item_calls[0]["invite"] == {"title": "Coffee", "location": "Room 4B", "description": ""}
     assert calendar.calls[0]["location"] == "Room 4B"
 
 

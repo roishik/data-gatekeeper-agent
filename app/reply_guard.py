@@ -200,6 +200,18 @@ def redact(text: str, *, otp_context: str | None = None) -> str:
     return text
 
 
+def _event_write_details(event: CalendarEvent) -> str:
+    """Numbers only, read off what Google stored: the description's length
+    (never its text -- enough to confirm nothing was cut) and the event's own
+    popup reminder, if it has one."""
+    details = ""
+    if event.description_chars:
+        details += f", description {event.description_chars} chars"
+    if event.popup_reminder_minutes is not None:
+        details += f", popup reminder {event.popup_reminder_minutes} min before"
+    return details
+
+
 def _format_event_title_location(summary: str, location: str, *, is_withheld: bool) -> tuple[str, str]:
     """Shared by the create_event/update_event reply branches, which used
     to repeat this exact withheld-check / quote / redact sequence with
@@ -339,14 +351,16 @@ def _build_prose(
         )
         when = format_event_range(created_event.start, created_event.end, created_event.all_day, OWNER_TIMEZONE)
         attendees = f", invited {created_event.attendee_count} attendee(s)" if created_event.attendee_count else ""
-        prose_lines.append(f"Created event {title} — {when}{location}{attendees} {_event_ref(created_event)}.")
+        details = _event_write_details(created_event)
+        prose_lines.append(f"Created event {title} — {when}{location}{attendees}{details} {_event_ref(created_event)}.")
     elif status == "completed" and parsed_request.verb == "calendar.update_event" and updated_event:
         title, location = _format_event_title_location(
             updated_event.summary, updated_event.location, is_withheld=withheld(UPDATED_EVENT_KEY)
         )
         when = format_event_range(updated_event.start, updated_event.end, updated_event.all_day, OWNER_TIMEZONE)
         attendees = f", {updated_event.attendee_count} attendee(s)" if updated_event.attendee_count else ""
-        prose_lines.append(f"Updated event {title} — {when}{location}{attendees} {_event_ref(updated_event)}.")
+        details = _event_write_details(updated_event)
+        prose_lines.append(f"Updated event {title} — {when}{location}{attendees}{details} {_event_ref(updated_event)}.")
     elif status == "completed" and parsed_request.verb == "calendar.delete_event" and deleted_event_id:
         prose_lines.append(f"Deleted event {sanitize_output(deleted_event_id)}.")
     elif status == "completed" and parsed_request.verb == "gmail.create_draft" and draft_result:
@@ -432,7 +446,7 @@ def _build_prose(
             )
         elif error_code == "sensitive_content_refused":
             prose_lines.append(
-                "This request was refused: the event has attendees, and its title or location was "
+                "This request was refused: the event has attendees, and its title, location or description was "
                 "flagged as sensitive (or could not be checked), so nothing was sent to them."
             )
         elif error_code == "not_gatekeeper_event":

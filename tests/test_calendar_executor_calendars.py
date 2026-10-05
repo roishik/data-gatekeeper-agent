@@ -478,5 +478,5 @@ def test_update_the_invite_guard_still_covers_an_event_on_another_calendar_with_
     seen: list[tuple[str, str]] = []
     events = _WriteEvents(get_result={**TIMED_19H, "attendees": [{"email": "guest@example.com"}]})
     _update(_client(_Service(events))[0], title="New title", calendar_id=FAMILY,
-            invite_guard=lambda t, l: seen.append((t, l)))
+            invite_guard=lambda t, l, d: seen.append((t, l)))
     assert seen == [("New title", "")]

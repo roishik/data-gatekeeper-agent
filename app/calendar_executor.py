@@ -69,6 +69,20 @@ invite guard as the title, not through app/reply_guard.py's redaction
 what Google itself sends out). On update_event, `None` leaves the
 location untouched and `""` clears it.
 
+`description` (added 2026-10-05, Instinct's request) follows the same
+rules as `location`: written verbatim (multi-line, links intact), screened
+by the invite guard together with the title and location whenever
+attendees will see it, `None` leaves it alone on update and `""` clears
+it. Reading it back stays off: list_events never returns a description,
+and create/update echo only its LENGTH (`description_chars`), so a
+requester can confirm nothing was cut without the text coming back.
+
+`reminder_minutes` (create_event only, added 2026-10-05) sets one popup
+reminder on the event (`reminders.useDefault=false` plus a single popup
+override). Omitted, the `reminders` key isn't sent and the calendar's
+defaults apply, as before. It is a Google Calendar setting on the event and
+nothing more -- this service schedules nothing.
+
 Choosing a calendar (added 2026-09-25)
 --------------------------------------
 Every event verb takes an optional `calendar_id`. Writes default to
@@ -177,6 +191,10 @@ class CalendarEvent:
     # follow-up update/delete has to name to reach an event that isn't on the
     # primary calendar. "" only when a caller didn't set it.
     calendar_id: str = ""
+    # Write echoes only (create/update): the LENGTH of the description Google
+    # stored, never its text, and the popup reminder it stored, if any.
+    description_chars: int = 0
+    popup_reminder_minutes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +232,7 @@ class CalendarClient(Protocol):
         attendees: tuple[str, ...], request_id: str, location: str = "", *,
         calendar_id: str = PRIMARY_CALENDAR_ID, end_day_offset: int | None = None,
         end_time: str | None = None, all_day: bool = False,
+        description: str = "", reminder_minutes: int | None = None,
     ) -> CalendarEvent: ...
     def update_event(
         self,
@@ -224,13 +243,14 @@ class CalendarClient(Protocol):
         duration_minutes: int | None,
         add_attendees: tuple[str, ...],
         remove_attendees: tuple[str, ...],
-        invite_guard: Callable[[str, str], None],
+        invite_guard: Callable[[str, str, str], None],
         location: str | None = None,
         *,
         calendar_id: str = PRIMARY_CALENDAR_ID,
         end_day_offset: int | None = None,
         end_time: str | None = None,
         all_day: bool | None = None,
+        description: str | None = None,
     ) -> CalendarEvent: ...
     def delete_event(self, event_id: str, calendar_id: str = PRIMARY_CALENDAR_ID) -> None: ...
 
@@ -356,6 +376,7 @@ class GoogleCalendarClient:
         attendees: tuple[str, ...], request_id: str, location: str = "", *,
         calendar_id: str = PRIMARY_CALENDAR_ID, end_day_offset: int | None = None,
         end_time: str | None = None, all_day: bool = False,
+        description: str = "", reminder_minutes: int | None = None,
     ) -> CalendarEvent:
         service = self._service(_write_scopes(calendar_id))
         target = _resolve_calendar(service, calendar_id, write=True)
@@ -371,6 +392,12 @@ class GoogleCalendarClient:
                 "private": {GATEKEEPER_TAG_KEY: GATEKEEPER_TAG_VALUE, GATEKEEPER_REQUEST_ID_KEY: request_id},
             },
         }
+        # Both keys only when asked for, so a request without them sends
+        # exactly the body it did before they existed.
+        if description:
+            body["description"] = description
+        if reminder_minutes is not None:
+            body["reminders"] = {"useDefault": False, "overrides": [{"method": "popup", "minutes": reminder_minutes}]}
         # Attendees get a real invite email immediately (sendUpdates="all"),
         # by the owner's explicit choice (CLAUDE.md) -- there is no approval
         # step for this verb. With NO attendees nothing is sent at all
@@ -401,13 +428,14 @@ class GoogleCalendarClient:
         duration_minutes: int | None,
         add_attendees: tuple[str, ...],
         remove_attendees: tuple[str, ...],
-        invite_guard: Callable[[str, str], None],
+        invite_guard: Callable[[str, str, str], None],
         location: str | None = None,
         *,
         calendar_id: str = PRIMARY_CALENDAR_ID,
         end_day_offset: int | None = None,
         end_time: str | None = None,
         all_day: bool | None = None,
+        description: str | None = None,
     ) -> CalendarEvent:
         service = self._service(_write_scopes(calendar_id))
         target = _resolve_calendar(service, calendar_id, write=True)
@@ -417,6 +445,8 @@ class GoogleCalendarClient:
             body["summary"] = title
         if location is not None:
             body["location"] = location
+        if description is not None:
+            body["description"] = description
 
         merged_attendees: list[dict] | None = None
         if add_attendees or remove_attendees:
@@ -428,19 +458,23 @@ class GoogleCalendarClient:
                 )
             body["attendees"] = merged_attendees
 
-        # The invite guard screens title+location before either reaches a
-        # real attendee. It must run whenever the patch will actually
+        # The invite guard screens title+location+description before any of
+        # them reaches a real attendee. It must run whenever the patch will actually
         # notify someone: new guests are always notified (add_attendees),
         # and sendUpdates="all" below notifies EXISTING guests of ANY
-        # changed field too -- so a title/location-only rename on an
+        # changed field too -- so a title/location/description-only edit on an
         # event that already has guests is just as much an "invite" as
         # adding one. Guarding only on add_attendees (the original
         # 2026-09-22 implementation) missed that second case entirely.
         resulting_attendees = merged_attendees if merged_attendees is not None else (existing.get("attendees") or [])
-        if resulting_attendees and (add_attendees or title is not None or location is not None):
+        # A new guest receives the event's existing text as well, so what
+        # the request leaves unchanged is screened too.
+        changes_text = title is not None or location is not None or description is not None
+        if resulting_attendees and (add_attendees or changes_text):
             invite_guard(
                 title if title is not None else (existing.get("summary") or ""),
                 location if location is not None else (existing.get("location") or ""),
+                description if description is not None else (existing.get("description") or ""),
             )
 
         timing_fields = (day_offset, start_time, duration_minutes, end_day_offset, end_time, all_day)
@@ -594,7 +628,22 @@ def _event_from_raw(event: dict, calendar_id: str = "") -> CalendarEvent:
         attendee_count=len(event.get("attendees", []) or []),
         location=event.get("location", "") or "",
         calendar_id=calendar_id,
+        description_chars=len(event.get("description", "") or ""),
+        popup_reminder_minutes=_popup_reminder_minutes(event),
     )
+
+
+def _popup_reminder_minutes(event: dict) -> int | None:
+    """The event's own popup reminder, if it overrides the calendar's
+    defaults with one (what create_event's reminder_minutes sets)."""
+    reminders = event.get("reminders") or {}
+    if reminders.get("useDefault", True):
+        return None
+    for override in reminders.get("overrides") or []:
+        minutes = override.get("minutes")
+        if override.get("method") == "popup" and isinstance(minutes, int) and not isinstance(minutes, bool):
+            return minutes
+    return None
 
 
 def _is_all_day(event: dict) -> bool:
