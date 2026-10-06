@@ -3,9 +3,11 @@
 The single reference for how a requester (Instinct) talks to the
 gatekeeper. Everything here is enforced in code: the parser is
 `app/request_parser.py`, the per-verb rules are `app/policy.py`, and the
-reply format is `app/reply_guard.py`. Last updated 2026-09-25 (the calendar
-extensions below are in the code from that date; they go live at the next
-deploy, when `protocol_version` changes -- see "Capabilities").
+reply format is `app/reply_guard.py`. Last updated 2026-10-05: calendar
+event `description` and `reminder_minutes` are in the code from that date
+and go live at the next deploy, when `protocol_version` changes (see
+"Capabilities"). The 2026-09-25 calendar extensions are live since
+`503a25c`.
 
 ## Sending a request
 
@@ -48,7 +50,7 @@ params:
 
 ### Payload sections, for long text
 
-A draft body or file content goes in its own section **outside** the YAML,
+A draft body, file content or event description goes in its own section **outside** the YAML,
 copied byte for byte. Indentation, blank lines, quotes and colons all
 survive, and no model ever reads it.
 
@@ -71,8 +73,9 @@ Any text at all goes here, verbatim.
 
 - The name after `PAYLOAD-` is 1–32 letters, digits, `_` or `-`. The
   reference (`---PAYLOAD-1---`) must match it exactly.
-- Only `gmail.create_draft`'s `body` and `drive.create_file`'s `content` can
-  take a payload.
+- Only `gmail.create_draft`'s `body`, `drive.create_file`'s `content` and
+  `calendar.create_event`/`calendar.update_event`'s `description` can take a
+  payload.
 - These are all `invalid_payload`:
   - a reference to a payload that isn't in the email;
   - two payloads with the same name;
@@ -91,16 +94,18 @@ Any text at all goes here, verbatim.
 | `gmail.create_draft` | `to` (one address), `subject` (≤200, one line), `body` (≤20,000, may be a payload), optional `thread_id` | Creates a **draft only**. It is never sent; the owner reviews and sends it. With `thread_id` (copied from a `gmail.search` reply) the draft is a reply in that conversation. Use a `Re: …` subject. |
 | `calendar.list_calendars` | none | Every calendar this account can **write to** (access `owner` or `writer`), primary first: `calendar_id`, name and access role. These ids are the values `calendar_id` accepts below. A calendar's name is free text whoever shared it chose, so it is screened like an event title (a flagged one shows `[withheld: flagged as sensitive]` but keeps its id and role). |
 | `calendar.list_events` | `day_offset` −365–13 (0 = today, negative = the past), `days` 1–366 (default 1), `max_results` 1–25 (default 10), optional `calendar_id`, optional `query` (≤200, one line) | With no `calendar_id`: all calendars switched on in Google Calendar, deduped. With one (`primary`, or an id from `calendar.list_calendars` or an earlier list reply): just that calendar. `query` is Google's free-text match on title, description, location and attendees; only title, time, location and attendee count are ever returned. Days are in the owner's timezone (Asia/Jerusalem) and are resolved when the request is PROCESSED, not when it was sent -- the reply's prose states the actual resolved date range ("Found 2 event(s) for Tue Sep 23"), so an email sent near local midnight can be double-checked. A window that reaches outside the current year states years ("Thu Sep 25 2025 - Fri Sep 25 2026") and so does every event line. Each event includes its `event_id` and the `calendar_id` it is on. To look back over the past year for a name: `day_offset: -365`, `days: 366`, `query: Dana`. |
-| `calendar.create_event` | `title` (≤200, one line), `day_offset` 0–365, then **either** a timed event -- `start_time` `"HH:MM"` (24h, owner's local time) plus `duration_minutes` 5–480 **or** `end_day_offset` + `end_time` (never both) -- **or** `all_day: true`. Optional `location` (≤500, one line), `attendees` (≤10 addresses), `calendar_id` (default `primary`) | Attendees get a real invite immediately, including the location. With attendees, the title AND location are screened first and either being sensitive refuses the write (`sensitive_content_refused`). **No attendees, no invite** -- on any calendar (nothing is mailed at all). `end_day_offset` + `end_time` is for overnight and multi-day events: `day_offset: 6`, `start_time: "16:00"`, `end_day_offset: 7`, `end_time: "11:00"` is 19 hours. The event must end at least 5 minutes after it starts and last at most 14 days. **All-day:** give `day_offset` and, for several days, `end_day_offset` -- the **last day, included** (`day_offset: 6`, `end_day_offset: 8` is three days) -- at most 14 days, and no `start_time`, `end_time` or `duration_minutes`. `all_day: true` is accepted as the YAML word `true`. |
-| `calendar.update_event` | `event_id`, optional `calendar_id` (default `primary`; the calendar the event is on), plus at least one of `title`, `day_offset`, `start_time`, `duration_minutes`, `end_day_offset` + `end_time`, `all_day`, `location`, `add_attendees`, `remove_attendees` (≤10 each) | **Only events the gatekeeper created** (`not_gatekeeper_event` otherwise -- on any calendar). Guests are added or removed; existing guests you don't mention are untouched. There is no field that replaces the whole guest list. Omit `location` to leave it as is; send `location: ""` to clear it. **`location`, and every calendar/multi-day/all-day field, is only accepted via the block protocol, not a plain-text request** (see below). If the event already has guests, changing the title or location screens it the same way adding a guest does — an event never gets an unscreened title/location once it has attendees, whether they were added just now or earlier. The event's total guest count (existing + added) is capped at 10 — spreading additions across several requests doesn't raise the cap. **Timing:** whatever you leave out is kept from the existing event. Changing only `day_offset` moves the event and keeps its length (hours for a timed event, days for an all-day one); `end_day_offset` (+ `end_time`) moves the end. `all_day` omitted keeps the event as it is; `all_day: true` makes it all-day (no time fields), `all_day: false` makes an all-day event timed (then `start_time` and `duration_minutes`, or `end_day_offset` + `end_time`, are required). Same 14-day cap as create. |
+| `calendar.create_event` | `title` (≤200, one line), `day_offset` 0–365, then **either** a timed event -- `start_time` `"HH:MM"` (24h, owner's local time) plus `duration_minutes` 5–480 **or** `end_day_offset` + `end_time` (never both) -- **or** `all_day: true`. Optional `location` (≤500, one line), `description` (≤2000, multi-line), `reminder_minutes` 1–1440, `attendees` (≤10 addresses), `calendar_id` (default `primary`) | Attendees get a real invite immediately, including the location and description. With attendees, the title, location AND description are screened first and any of them being sensitive refuses the whole write (`sensitive_content_refused`) -- nothing is written with a field dropped. `description` is stored exactly as sent (line breaks and links intact, never cut: over 2000 chars is `invalid_params`); the reply confirms its length (`description N chars`), never echoes the text. `reminder_minutes` sets one popup reminder that many minutes before the start instead of the calendar's default reminders; omitted, the defaults apply. It's only a Google Calendar setting on the event. **No attendees, no invite** -- on any calendar (nothing is mailed at all). `end_day_offset` + `end_time` is for overnight and multi-day events: `day_offset: 6`, `start_time: "16:00"`, `end_day_offset: 7`, `end_time: "11:00"` is 19 hours. The event must end at least 5 minutes after it starts and last at most 14 days. **All-day:** give `day_offset` and, for several days, `end_day_offset` -- the **last day, included** (`day_offset: 6`, `end_day_offset: 8` is three days) -- at most 14 days, and no `start_time`, `end_time` or `duration_minutes`. `all_day: true` is accepted as the YAML word `true`. |
+| `calendar.update_event` | `event_id`, optional `calendar_id` (default `primary`; the calendar the event is on), plus at least one of `title`, `day_offset`, `start_time`, `duration_minutes`, `end_day_offset` + `end_time`, `all_day`, `location`, `description` (≤2000, multi-line), `add_attendees`, `remove_attendees` (≤10 each) | **Only events the gatekeeper created** (`not_gatekeeper_event` otherwise -- on any calendar). Guests are added or removed; existing guests you don't mention are untouched. There is no field that replaces the whole guest list. Omit `location` or `description` to leave it as is; send `""` to clear it. `reminder_minutes` is create-only (on update it's ignored and listed in `ignored_params`). **`location`, `description`, and every calendar/multi-day/all-day field, is only accepted via the block protocol, not a plain-text request** (see below). If the event already has guests, changing the title, location or description screens all three the same way adding a guest does (and adding a guest screens the event's existing text too) — an event never gets unscreened text once it has attendees, whether they were added just now or earlier. The event's total guest count (existing + added) is capped at 10 — spreading additions across several requests doesn't raise the cap. **Timing:** whatever you leave out is kept from the existing event. Changing only `day_offset` moves the event and keeps its length (hours for a timed event, days for an all-day one); `end_day_offset` (+ `end_time`) moves the end. `all_day` omitted keeps the event as it is; `all_day: true` makes it all-day (no time fields), `all_day: false` makes an all-day event timed (then `start_time` and `duration_minutes`, or `end_day_offset` + `end_time`, are required). Same 14-day cap as create. |
 | `calendar.delete_event` | `event_id`, optional `calendar_id` (default `primary`) | Only events the gatekeeper created. Guests get a cancellation. |
 | `drive.create_file` | `name` (≤200, one line), `content` (≤100,000, may be a payload) | A plain-text file in the gatekeeper's own Drive folder. |
 | `drive.search`, `contacts.search` | none | `not_implemented`. |
 | `capabilities` | none (any given are ignored) | Read-only, no Google API call. Returns `protocol_version`, the daily quota, the batch item cap, and every verb above with its own params and bounds — see "Capabilities" below. Works on both the block and plain-text paths. |
 | `batch` | `requests`: a list of 1–25 `{request_id, verb, params}` mappings, each shaped like a top-level request | Runs every item independently and replies once, combining all their outcomes. Block protocol only — see "Batch requests" below. |
 
-Single-line fields reject line breaks and control characters. `body` and
-`content` allow newlines and tabs only.
+Single-line fields reject line breaks and control characters. `body`,
+`content` and `description` allow newlines and tabs only. Use a payload
+section for a multi-line `description`: an inline YAML `|` block keeps the
+lines too, but the payload is the byte-exact path.
 
 **Plain-text `location` support.** `calendar.create_event`'s `location` can
 be extracted from a plain-text request ("set up coffee tomorrow at 9am in
@@ -122,9 +127,9 @@ calendar. Replies for created, updated and listed events show the event's
 `calendar.list_events` **without** `calendar_id` still reads every calendar
 switched on, not only the primary one.
 
-**Block-only fields.** `calendar_id`, `end_day_offset`, `end_time` and
-`all_day` (and `query` on `list_events`) are extracted from a request block
-only. A plain-text calendar request still works for the fields it always had;
+**Block-only fields.** `calendar_id`, `end_day_offset`, `end_time`,
+`all_day`, `description` and `reminder_minutes` (and `query` on `list_events`)
+are extracted from a request block only. A plain-text calendar request still works for the fields it always had;
 its extractor is also told that "last week" is a negative `day_offset`, but a
 block is the reliable way to ask for anything precise, and the only way to use
 the new fields.
@@ -192,7 +197,7 @@ to work around this.
 | `invalid_payload` | denied | A payload problem. The reply says which. |
 | `too_long_for_freeform` | denied | A plain-text request was too long. Resend as a block, with long text in a payload section. |
 | `sensitive_query_refused` | denied | The search asked for a one-time code or a password reset. Financial searches (e.g. a credit card statement) are allowed. |
-| `sensitive_content_refused` | denied | A calendar title or location that would be sent to attendees was flagged -- either because a new guest is being added, or because the event already has guests and the title/location is changing. No invite went out. |
+| `sensitive_content_refused` | denied | A calendar title, location or description that would be sent to attendees was flagged -- either because a new guest is being added, or because the event already has guests and the title/location/description is changing. Nothing was written and no invite went out. |
 | `not_gatekeeper_event` | denied | The event wasn't created by the gatekeeper, so it can't be changed or deleted here. |
 | `too_many_attendees` | denied | The event's total guest count (existing + this request's additions) would exceed 10. |
 | `invalid_params` (calendar) | denied | Also: a `calendar_id` that isn't `primary` or a calendar this account can write to (or, for `list_events`, read); an all-day event given a time of day; both `duration_minutes` and an end; or an event that would end before it starts, last under 5 minutes or over 14 days. The reply's Detail says which. |
@@ -283,9 +288,9 @@ params:
 
 Paste to Instinct (e.g. over WhatsApp) when the protocol changes:
 
-> Standing rule for the gatekeeper at roi.shikler@agentmail.to, updated 2026-09-25:
+> Standing rule for the gatekeeper at roi.shikler@agentmail.to, updated 2026-10-05:
 > 1. Always use exactly one ---GATEKEEPER-REQUEST--- block per email, with a new unique request_id each time. Reusing a request_id after changing anything about the request gets you the OLD result back as `duplicate`, not a re-run -- any change means a new id.
-> 2. For long text (a draft body or file content), don't put it in the YAML. Write `body: ---PAYLOAD-1---` (or `content:` for drive.create_file) and add the text below the block between `---GATEKEEPER-PAYLOAD-1---` and `---END-PAYLOAD-1---`, each marker on its own line.
+> 2. For long or multi-line text (a draft body, file content or event description), don't put it in the YAML. Write `body: ---PAYLOAD-1---` (or `content:` for drive.create_file, `description:` for calendar events) and add the text below the block between `---GATEKEEPER-PAYLOAD-1---` and `---END-PAYLOAD-1---`, each marker on its own line.
 > 3. To change a meeting's guests, use calendar.update_event with add_attendees / remove_attendees. There is no field that replaces the whole guest list. You can only update or delete events the gatekeeper created. An event's total guest count is capped at 10, whether they arrived in one request or several.
 > 4. calendar.create_event and calendar.update_event both take an optional location (set it, or send `location: ""` to clear it on update). Changing an existing event's location needs a GATEKEEPER-REQUEST block, not a plain-text request.
 > 5. Stick to the params listed for each verb. Any other param is ignored, and the reply lists it under ignored_params; don't assume it took effect.
@@ -298,3 +303,4 @@ Paste to Instinct (e.g. over WhatsApp) when the protocol changes:
 > 12. Calendars: `calendar.list_calendars` returns every calendar you can write to, with its calendar_id. Pass `calendar_id` on create_event / update_event / delete_event to use one (the family calendar is not the primary); leave it out for the primary calendar. Updating or deleting an event that isn't on the primary calendar needs its calendar_id too (list_events replies show it next to each event_id). list_events with no calendar_id still reads all my calendars. An event with no attendees never sends an invite, on any calendar.
 > 13. Multi-day and all-day events (block protocol only): give `end_day_offset` + `end_time` INSTEAD of duration_minutes for an overnight or multi-day event (day 6 at 16:00 to day 7 at 11:00 is `day_offset: 6`, `start_time: "16:00"`, `end_day_offset: 7`, `end_time: "11:00"`), never both. For an all-day event send `all_day: true` with `day_offset` and, for several days, `end_day_offset` (the LAST day, included) and no times. Nothing may last more than 14 days.
 > 14. list_events can look back up to 365 days (negative day_offset; `days` up to 366) and takes an optional `query` that matches title, description, location and attendees -- e.g. `day_offset: -365`, `days: 366`, `query: Dana` finds past meetings with Dana.
+> 15. calendar.create_event and calendar.update_event take an optional `description` (up to 2000 characters; line breaks and links are kept exactly; send it as a payload section if it has more than one line). On update, leave it out to keep it, send `description: ""` to clear it. If the event has attendees, the description is screened with the title and location and a flagged one refuses the whole request (`sensitive_content_refused`). The reply shows only its length, not the text. create_event also takes `reminder_minutes` (1-1440) for one popup reminder; leave it out for the calendar's default reminders.

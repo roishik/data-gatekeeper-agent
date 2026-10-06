@@ -749,3 +749,48 @@ def test_e2e_freeform_list_calendars_and_last_week_through_the_reader_llm():
     week, week_body = _wait_for_reply(week_id)
     assert week["status"] == "completed", week
     assert re.search(r"(Found \d+ event\(s\)|No events found) for ", week_body), week_body
+
+
+_E2E_DESCRIPTION = (
+    "Agenda:\n"
+    "\t1. Budget review\n"
+    "\n"
+    "Join: https://meet.example.com/abc-defg-hij?pwd=a1b2&lang=he#start\n"
+    "  -- bring the printout"
+)
+
+
+def test_e2e_event_description_and_popup_reminder_then_cleared():
+    """Added 2026-10-05: create on the primary calendar with a multi-line
+    description (payload rail) and a popup reminder, check both on the real
+    event, then clear the description with a block update. No attendees:
+    nothing is invited. The event is deleted afterwards."""
+    _require_config()
+    create_id = _new_request_id("cal-desc-create")
+    body = _block(
+        create_id, "calendar.create_event",
+        "  title: '[gatekeeper-e2e] description test'\n  day_offset: 300\n  start_time: '09:00'\n"
+        "  duration_minutes: 15\n  description: ---PAYLOAD-notes---\n  reminder_minutes: 25\n",
+    ) + f"\n---GATEKEEPER-PAYLOAD-notes---\n{_E2E_DESCRIPTION}\n---END-PAYLOAD-notes---\n"
+    _send_from_owner(f"gatekeeper e2e cal-desc-create {create_id}", body)
+    created, created_body = _wait_for_reply(create_id)
+    assert created["status"] == "completed", created
+    assert f"description {len(_E2E_DESCRIPTION)} chars" in created_body, created_body
+    assert "popup reminder 25 min before" in created_body, created_body
+    event_id, _ = _event_id_and_calendar(created_body)
+
+    calendar = _calendar_api()
+    try:
+        event = calendar.events().get(calendarId="primary", eventId=event_id).execute()
+        assert event.get("description") == _E2E_DESCRIPTION
+        assert event.get("reminders") == {"useDefault": False, "overrides": [{"method": "popup", "minutes": 25}]}
+
+        clear_id = _new_request_id("cal-desc-clear")
+        _send_from_owner(f"gatekeeper e2e cal-desc-clear {clear_id}",
+                         _block(clear_id, "calendar.update_event", f"  event_id: {event_id}\n  description: ''\n"))
+        cleared, cleared_body = _wait_for_reply(clear_id)
+        assert cleared["status"] == "completed", cleared
+        assert "description " not in cleared_body.split("---GATEKEEPER-RESPONSE---")[0]
+        assert calendar.events().get(calendarId="primary", eventId=event_id).execute().get("description", "") == ""
+    finally:
+        calendar.events().delete(calendarId="primary", eventId=event_id).execute()

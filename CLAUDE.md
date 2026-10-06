@@ -296,6 +296,30 @@ passing (up from 468). Details for the requester: `docs/PROTOCOL.md` (standing r
   `query` param stays as built, including that it lets Instinct test whether an event's
   description/attendees contain a string even though they're never returned.
 
+## Event description and popup reminder (2026-10-05, not deployed)
+
+Instinct asked for both. Uncommitted working-tree change on `main`, not deployed; 684 tests passing
+(up from 637). Details for the requester: `docs/PROTOCOL.md` (standing rule point 15).
+- **`description`** on `calendar.create_event`/`update_event`: ≤2000 chars
+  (`EVENT_DESCRIPTION_MAX_CHARS`), multi-line, stored exactly as sent (no strip, never cut: over
+  the cap is `invalid_params`). It can travel on the payload rail (`PAYLOAD_PARAMS`). Update:
+  omitted leaves it, `""` clears it. Block-only: not in the reader LLM's freeform schemas.
+- **Screening:** it joins the invite guard. The guard is now `(title, location, description)`,
+  screened as one Jev item. It still fires only when attendees will see the text: on create,
+  when there are attendees; on update, when the resulting guest list is non-empty and
+  title/location/description changes, or when guests are added. **One tightening:** adding a
+  guest now also screens the event's EXISTING description (the new guest receives it), which
+  previously wasn't looked at. Without attendees nothing extra is screened (decision (a) of
+  2026-09-26 stands).
+- **Replies never echo the description text.** `list_events` still never reads it; create/update
+  replies show `description N chars` (`CalendarEvent.description_chars`, read off Google's
+  response) so Instinct can confirm nothing was cut.
+- **`reminder_minutes`** (create only, 1–1440): sends `reminders.useDefault=false` with one popup
+  override; omitted, no `reminders` key is sent (calendar defaults, as before). The reply shows
+  `popup reminder N min before`. On update it's an unknown param (`ignored_params`).
+- **Unverified live:** that Google returns `description` and `reminders` in the insert/patch
+  response the way the fake does (only affects the reply's echo, not the write).
+
 ## Write access design (2026-09-15, tightened 2026-09-22)
 
 I asked for write access and walked through the security trade-offs before building. Key
@@ -333,12 +357,13 @@ decisions, all mine, all deliberate:
      `OUTPUT_INJECTION_THRESHOLD` 0.7, `INJECTION_DENY_THRESHOLD` 0.85) from real scores in the
      audit log before trusting them. The e2e run gave the first data points: ordinary requests
      scored 0.05–0.31, and the deliberate injection 0.99.
-2. **Send Instinct the updated standing rule** (docs/PROTOCOL.md, last section, now 14 points):
+2. **Send Instinct the updated standing rule** (docs/PROTOCOL.md, last section, now 15 points):
    payload sections, add/remove attendees (+ the total-10 cap), unknown params ignored (listed
    in `ignored_params`), `retryable`, withheld items, the `capabilities` verb, the `batch` verb,
    `protocol_version`/`requests_remaining_today`, financial searches allowed, links no longer
    stripped, and (2026-09-25, after that deploy) calendars/`calendar_id`, multi-day and all-day
-   events, looking back with `query`.
+   events, looking back with `query`, and (2026-10-05, after the next deploy) event
+   `description` and `reminder_minutes`.
 3. Remove `roishik10@gmail.com` from `ALLOWED_SENDERS` (it was added for testing), and revoke
    Instinct's own Google access at myaccount.google.com/connections. The catch: the live e2e
    suite sends from that address, so it needs another sender first (or stays, knowingly).

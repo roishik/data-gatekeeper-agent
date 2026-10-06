@@ -46,8 +46,9 @@ reader LLM ever touch it:
 the text before looking for a request block, so nothing inside a payload
 can ever be parsed as (or shadow) a request. A param whose value is exactly
 `---PAYLOAD-<name>---` is replaced with that payload's text -- and only
-`body` (gmail.create_draft) and `content` (drive.create_file) may reference
-one. Everything else about a payload -- a missing reference target, a
+`body` (gmail.create_draft), `content` (drive.create_file) and
+`description` (calendar.create_event/update_event, added 2026-10-05) may
+reference one. Everything else about a payload -- a missing reference target, a
 duplicate name, an unreferenced payload, a reference from any other field
 -- is `invalid_payload`. Layer 3 then validates the substituted text like
 any other value. This moves FEWER bytes through an LLM than before, so it
@@ -100,6 +101,8 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 PAYLOAD_PARAMS: dict[str, frozenset[str]] = {
     "gmail.create_draft": frozenset({"body"}),
     "drive.create_file": frozenset({"content"}),
+    "calendar.create_event": frozenset({"description"}),
+    "calendar.update_event": frozenset({"description"}),
 }
 # Upper bound on one payload before Layer 3's per-field caps even apply --
 # keeps a pathological email from being chunked through the injection

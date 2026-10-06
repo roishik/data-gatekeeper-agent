@@ -231,7 +231,7 @@ def _write_client(service):
     return client
 
 
-def _no_guard(title: str, location: str) -> None:
+def _no_guard(title: str, location: str, description: str) -> None:
     return None
 
 
@@ -343,10 +343,10 @@ def test_adding_guests_runs_the_invite_guard_on_the_title_and_location_they_will
     events = _WriteEvents(get_result={**_OWN, "summary": "Existing title", "location": "Existing room"})
     client = _write_client(_WriteService(events))
 
-    _update(client, add_attendees=("a@example.com",), invite_guard=lambda t, l: seen.append((t, l)))
-    _update(client, title="Renamed", add_attendees=("b@example.com",), invite_guard=lambda t, l: seen.append((t, l)))
-    _update(client, location="New room", add_attendees=("c@example.com",), invite_guard=lambda t, l: seen.append((t, l)))
-    _update(client, remove_attendees=("a@example.com",), invite_guard=lambda t, l: seen.append((t, l)))  # no new guest, no guard
+    _update(client, add_attendees=("a@example.com",), invite_guard=lambda t, l, d: seen.append((t, l)))
+    _update(client, title="Renamed", add_attendees=("b@example.com",), invite_guard=lambda t, l, d: seen.append((t, l)))
+    _update(client, location="New room", add_attendees=("c@example.com",), invite_guard=lambda t, l, d: seen.append((t, l)))
+    _update(client, remove_attendees=("a@example.com",), invite_guard=lambda t, l, d: seen.append((t, l)))  # no new guest, no guard
 
     assert seen == [
         ("Existing title", "Existing room"),  # unchanged title/location, still screened before the invite
@@ -367,7 +367,7 @@ def test_update_event_title_only_on_event_with_existing_attendees_runs_the_invit
     })
     client = _write_client(_WriteService(events))
 
-    _update(client, title="New title", invite_guard=lambda t, l: seen.append((t, l)))
+    _update(client, title="New title", invite_guard=lambda t, l, d: seen.append((t, l)))
 
     assert seen == [("New title", "Existing room")]
 
@@ -380,7 +380,7 @@ def test_update_event_location_only_on_event_with_existing_attendees_runs_the_in
     })
     client = _write_client(_WriteService(events))
 
-    _update(client, location="New room", invite_guard=lambda t, l: seen.append((t, l)))
+    _update(client, location="New room", invite_guard=lambda t, l, d: seen.append((t, l)))
 
     assert seen == [("Existing title", "New room")]
 
@@ -396,7 +396,7 @@ def test_update_event_time_only_change_on_event_with_attendees_does_not_run_the_
     })
     client = _write_client(_WriteService(events))
 
-    _update(client, start_time="14:00", invite_guard=lambda t, l: seen.append((t, l)))
+    _update(client, start_time="14:00", invite_guard=lambda t, l, d: seen.append((t, l)))
 
     assert seen == []
 
@@ -406,7 +406,7 @@ def test_update_event_title_change_without_attendees_does_not_run_the_guard():
     events = _WriteEvents(get_result=dict(_OWN))  # no attendees key at all
     client = _write_client(_WriteService(events))
 
-    _update(client, title="New title", invite_guard=lambda t, l: seen.append((t, l)))
+    _update(client, title="New title", invite_guard=lambda t, l, d: seen.append((t, l)))
 
     assert seen == []
 
@@ -423,7 +423,7 @@ def test_update_event_refuses_when_merged_attendees_would_exceed_the_cap():
 
 
 def test_a_refused_invite_guard_stops_the_patch():
-    def refuse(title: str, location: str) -> None:
+    def refuse(title: str, location: str, description: str) -> None:
         raise GatekeeperDenied("sensitive_content_refused")
 
     events = _WriteEvents()

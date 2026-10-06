@@ -97,6 +97,7 @@ class FakeCalendarClient:
 
     def __init__(self, results: list[CalendarEvent] | None = None, foreign_event_ids: set[str] | None = None,
                  existing_title: str = "(unchanged)", existing_location: str = "",
+                 existing_description: str = "",
                  existing_attendees: tuple[str, ...] = (),
                  calendars: list[CalendarInfo] | None = None,
                  writable_calendar_ids: set[str] | None = None):
@@ -108,6 +109,7 @@ class FakeCalendarClient:
         self.foreign_event_ids = set(foreign_event_ids or ())
         self.existing_title = existing_title
         self.existing_location = existing_location
+        self.existing_description = existing_description
         # Emails already on the event before this update -- lets tests
         # exercise the invite guard on a title/location-only change to an
         # event that already has guests (see GoogleCalendarClient.update_event).
@@ -137,6 +139,7 @@ class FakeCalendarClient:
         attendees: tuple[str, ...], request_id: str = "", location: str = "", *,
         calendar_id: str = "primary", end_day_offset: int | None = None,
         end_time: str | None = None, all_day: bool = False,
+        description: str = "", reminder_minutes: int | None = None,
     ) -> CalendarEvent:
         self._check_writable(calendar_id)
         self.calls.append(
@@ -145,6 +148,7 @@ class FakeCalendarClient:
                 "start_time": start_time, "duration_minutes": duration_minutes, "attendees": attendees,
                 "request_id": request_id, "location": location, "calendar_id": calendar_id,
                 "end_day_offset": end_day_offset, "end_time": end_time, "all_day": all_day,
+                "description": description, "reminder_minutes": reminder_minutes,
             }
         )
         if all_day:
@@ -159,6 +163,7 @@ class FakeCalendarClient:
         return CalendarEvent(
             event_id="event_created_1", summary=title, start=start, end=end,
             all_day=all_day, attendee_count=len(attendees), location=location, calendar_id=calendar_id,
+            description_chars=len(description), popup_reminder_minutes=reminder_minutes,
         )
 
     def update_event(
@@ -177,6 +182,7 @@ class FakeCalendarClient:
         end_day_offset: int | None = None,
         end_time: str | None = None,
         all_day: bool | None = None,
+        description: str | None = None,
     ) -> CalendarEvent:
         self._check_writable(calendar_id)
         # Mirrors GoogleCalendarClient's containment check and invite guard:
@@ -188,11 +194,12 @@ class FakeCalendarClient:
             raise GatekeeperDenied("not_gatekeeper_event")
         resulting_has_attendees = bool(add_attendees or self.existing_attendees)
         if resulting_has_attendees and invite_guard is not None and (
-            add_attendees or title is not None or location is not None
+            add_attendees or title is not None or location is not None or description is not None
         ):
             invite_guard(
                 title if title is not None else self.existing_title,
                 location if location is not None else self.existing_location,
+                description if description is not None else self.existing_description,
             )
         self.calls.append(
             {
@@ -200,15 +207,16 @@ class FakeCalendarClient:
                 "start_time": start_time, "duration_minutes": duration_minutes,
                 "add_attendees": add_attendees, "remove_attendees": remove_attendees, "location": location,
                 "calendar_id": calendar_id, "end_day_offset": end_day_offset, "end_time": end_time,
-                "all_day": all_day,
+                "all_day": all_day, "description": description,
             }
         )
+        resulting_description = description if description is not None else self.existing_description
         return CalendarEvent(
             event_id=event_id, summary=title or self.existing_title,
             start="2026-01-01T10:00:00+02:00", end="2026-01-01T10:30:00+02:00",
             all_day=False, attendee_count=len(add_attendees),
             location=location if location is not None else self.existing_location,
-            calendar_id=calendar_id,
+            calendar_id=calendar_id, description_chars=len(resulting_description),
         )
 
     def delete_event(self, event_id: str, calendar_id: str = "primary") -> None:

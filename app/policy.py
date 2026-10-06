@@ -134,6 +134,15 @@ EVENT_TITLE_MAX_CHARS = 200
 # longer than a title, but still one line (added 2026-09-22, owner's
 # request: Instinct couldn't send a meeting location at all before this).
 EVENT_LOCATION_MAX_CHARS = 500
+# The event's description (added 2026-10-05, Instinct's request): notes,
+# agenda, links. Multi-line, so it may travel on the payload rail
+# (app/request_parser.py). Like title and location, Google delivers it to
+# attendees verbatim, so it goes through the same invite guard.
+EVENT_DESCRIPTION_MAX_CHARS = 2000
+# One popup reminder on a created event (added 2026-10-05). Only a Google
+# Calendar setting on the event -- nothing here schedules anything.
+EVENT_REMINDER_MIN_MINUTES = 1
+EVENT_REMINDER_MAX_MINUTES = 1440  # 24 hours
 EVENT_DAY_OFFSET_MIN = 0
 EVENT_DAY_OFFSET_MAX = 365
 EVENT_DURATION_MIN_MINUTES = 5
@@ -215,6 +224,9 @@ class CalendarCreateEventParams:
     end_time: str | None = None
     all_day: bool = False
     calendar_id: str = PRIMARY_CALENDAR_ID
+    description: str = ""
+    # None = the calendar's default reminders, exactly as before this field.
+    reminder_minutes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -235,6 +247,8 @@ class CalendarUpdateEventParams:
     # None = keep the event's current kind; True/False converts it.
     all_day: bool | None = None
     calendar_id: str = PRIMARY_CALENDAR_ID
+    # Same rule as location: None = leave it alone; "" = clear it.
+    description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -378,7 +392,7 @@ VERB_SPECS: dict[Verb, VerbSpec] = {
         verb=Verb.CALENDAR_CREATE_EVENT,
         param_names=frozenset({
             "title", "day_offset", "start_time", "duration_minutes", "attendees", "location",
-            "end_day_offset", "end_time", "all_day", "calendar_id",
+            "end_day_offset", "end_time", "all_day", "calendar_id", "description", "reminder_minutes",
         }),
         is_write=True,
         param_bounds=(
@@ -396,6 +410,10 @@ VERB_SPECS: dict[Verb, VerbSpec] = {
             f"at most {EVENT_SPAN_MAX_DAYS} days including the last, and no start_time, end_time or duration_minutes",
             f"attendees: list of email strings, up to {EVENT_ATTENDEES_MAX}, optional (no invite is sent without attendees)",
             f"location: string, max {EVENT_LOCATION_MAX_CHARS} chars, optional",
+            f"description: string, max {EVENT_DESCRIPTION_MAX_CHARS} chars, optional; multi-line and links kept as sent "
+            "(use the payload rail for multi-line text); screened with the title and location when the event has attendees",
+            f"reminder_minutes: int, {EVENT_REMINDER_MIN_MINUTES}-{EVENT_REMINDER_MAX_MINUTES}, optional; one popup reminder "
+            "that many minutes before the start, instead of the calendar's default reminders (omitted keeps the defaults)",
             f"calendar_id: string, optional, default '{PRIMARY_CALENDAR_ID}'; otherwise an id from calendar.list_calendars "
             "(a calendar this account can write to)",
         ),
@@ -405,7 +423,7 @@ VERB_SPECS: dict[Verb, VerbSpec] = {
         param_names=frozenset({
             "event_id", "title", "day_offset", "start_time", "duration_minutes",
             "location", "add_attendees", "remove_attendees",
-            "end_day_offset", "end_time", "all_day", "calendar_id",
+            "end_day_offset", "end_time", "all_day", "calendar_id", "description",
         }),
         is_write=True,
         param_bounds=(
@@ -425,6 +443,8 @@ VERB_SPECS: dict[Verb, VerbSpec] = {
             "(then start_time and duration_minutes, or end_day_offset + end_time, are required). "
             "Changing only day_offset keeps the event's length",
             f"location: string, max {EVENT_LOCATION_MAX_CHARS} chars, optional (\"\" clears it, omitted leaves it alone)",
+            f"description: string, max {EVENT_DESCRIPTION_MAX_CHARS} chars, optional (\"\" clears it, omitted leaves it "
+            "alone); multi-line and links kept as sent (use the payload rail for multi-line text)",
             f"add_attendees: list of email strings, optional, event total capped at {EVENT_ATTENDEES_MAX}",
             "remove_attendees: list of email strings, optional",
         ),
@@ -914,6 +934,31 @@ def _validate_location(value: Any) -> tuple[str | None, str | None]:
     return value.strip(), None
 
 
+def _validate_description(value: Any) -> tuple[str | None, str | None]:
+    """Multi-line, and kept exactly as sent -- no strip(), no truncation:
+    an over-long description is refused, never cut. "" means "no
+    description" on create and "clear it" on update. Reaches attendees
+    verbatim, so app/pipeline.py's invite guard screens it together with
+    the title and location (see _validate_location)."""
+    if not isinstance(value, str):
+        return None, "'description' must be a string"
+    if len(value) > EVENT_DESCRIPTION_MAX_CHARS:
+        return None, f"'description' exceeds {EVENT_DESCRIPTION_MAX_CHARS} characters (got {len(value)})"
+    if not _is_clean_multi_line(value):
+        return None, "'description' may not contain control characters other than tab and newline"
+    return value, None
+
+
+def _validate_reminder_minutes(value: Any) -> tuple[int | None, str | None]:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None, "'reminder_minutes' must be an integer"
+    if not (EVENT_REMINDER_MIN_MINUTES <= value <= EVENT_REMINDER_MAX_MINUTES):
+        return None, (
+            f"'reminder_minutes' must be between {EVENT_REMINDER_MIN_MINUTES} and {EVENT_REMINDER_MAX_MINUTES}"
+        )
+    return value, None
+
+
 def _validate_event_id(value: Any) -> tuple[str | None, str | None]:
     if not isinstance(value, str) or not value.strip():
         return None, "'event_id' is required and must be a non-empty string"
@@ -1062,10 +1107,23 @@ def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
     if err:
         return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
 
+    description, err = _validate_description(params.get("description", ""))
+    if err:
+        return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
+    reminder_minutes: int | None = None
+    if "reminder_minutes" in params:
+        reminder_minutes, err = _validate_reminder_minutes(params["reminder_minutes"])
+        if err:
+            return PolicyDecision(status="denied", verb=verb, error_code="invalid_params", reason=err)
+
     # Each validator's (value, err) contract guarantees value is not None
     # here; checked explicitly rather than with `assert`, which `python -O`
     # strips -- deny-by-default must not depend on interpreter flags.
-    if title is None or day_offset is None or all_day is None or location is None or calendar_id is None:
+    if (
+        title is None or day_offset is None or all_day is None or location is None or calendar_id is None
+        or description is None
+    ):
         return _deny(verb, "validated value missing")
 
     timing, err = _new_event_timing(params, day_offset, all_day)
@@ -1077,7 +1135,8 @@ def _evaluate_calendar_create_event(params: dict[str, Any]) -> PolicyDecision:
         verb=verb,
         params=CalendarCreateEventParams(
             title=title, day_offset=day_offset, attendees=attendees or (), location=location,
-            all_day=all_day, calendar_id=calendar_id, **timing,
+            all_day=all_day, calendar_id=calendar_id, description=description,
+            reminder_minutes=reminder_minutes, **timing,
         ),
     )
 
@@ -1131,6 +1190,7 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
         ("end_time", _validate_end_time),
         ("all_day", _validate_all_day),
         ("location", _validate_location),
+        ("description", _validate_description),
     ):
         if field_name not in params:
             continue
@@ -1161,7 +1221,7 @@ def _evaluate_calendar_update_event(params: dict[str, Any]) -> PolicyDecision:
             status="denied", verb=verb, error_code="invalid_params",
             reason=(
                 "at least one of title/day_offset/start_time/duration_minutes/end_day_offset/end_time/all_day/"
-                "location/add_attendees/remove_attendees must be given"
+                "location/description/add_attendees/remove_attendees must be given"
             ),
         )
 
