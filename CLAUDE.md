@@ -8,7 +8,22 @@ the audit trail. Background and decisions: `README.md` (the "Decided" list) and 
 Request/response format: `docs/PROTOCOL.md`. How to run, deploy, verify and kill it:
 `docs/RUNBOOK.md`.
 
-## Current state (as of 2026-09-26)
+## Current state (as of 2026-10-06)
+
+**Event description and popup reminder are deployed (2026-10-06): live revision
+`data-gatekeeper-00018-ntd`, built from `main` at merge commit `24ec84d` (PR #10,
+`GIT_SHA=24ec84d`).** Rollback target: `00017-lf4` (`503a25c`). After the deploy: `/health` 200,
+`/docs` 404, env vars as expected, audit chain intact at 151 entries. Live suites run the same day:
+e2e 14/15 (the family-calendar lifecycle test was left out: writing to the shared calendar wasn't
+approved), Sheets 4/4, injection screen 2/2. The new
+`test_e2e_event_description_and_popup_reminder_then_cleared` passed, so Google stores and returns
+`description` and the popup `reminders` exactly as sent. The 2026-09-25 all-day/past-window test
+passed live for the first time. The one failure,
+`test_e2e_freeform_list_calendars_and_last_week_through_the_reader_llm`, was the reader LLM picking
+`capabilities` for "Which calendars can you write to?" (5/5 times against real Haiku). Fixed in the
+stage-1 prompt (one sentence telling the two verbs apart; 25/25 correct across five phrasings
+locally) on `fix/reader-list-calendars-vs-capabilities`; live once deployed.
+Merging into `main` needs the owner's admin bypass (`main: owner-only` ruleset blocks all updates).
 
 **The calendar extensions are deployed (2026-09-26): live revision `data-gatekeeper-00017-lf4`,
 built from `feat/calendar-extensions-2026-09` at `503a25c` (`GIT_SHA=503a25c`,
@@ -296,10 +311,9 @@ passing (up from 468). Details for the requester: `docs/PROTOCOL.md` (standing r
   `query` param stays as built, including that it lets Instinct test whether an event's
   description/attendees contain a string even though they're never returned.
 
-## Event description and popup reminder (2026-10-05, not deployed)
+## Event description and popup reminder (2026-10-05; deployed 2026-10-06 as `00018-ntd`)
 
-Instinct asked for both. Uncommitted working-tree change on `main`, not deployed; 684 tests passing
-(up from 637). Details for the requester: `docs/PROTOCOL.md` (standing rule point 15).
+Instinct asked for both. PR #10; 684 tests passing (up from 637). Details for the requester: `docs/PROTOCOL.md` (standing rule point 15).
 - **`description`** on `calendar.create_event`/`update_event`: ≤2000 chars
   (`EVENT_DESCRIPTION_MAX_CHARS`), multi-line, stored exactly as sent (no strip, never cut: over
   the cap is `invalid_params`). It can travel on the payload rail (`PAYLOAD_PARAMS`). Update:
@@ -317,8 +331,8 @@ Instinct asked for both. Uncommitted working-tree change on `main`, not deployed
 - **`reminder_minutes`** (create only, 1–1440): sends `reminders.useDefault=false` with one popup
   override; omitted, no `reminders` key is sent (calendar defaults, as before). The reply shows
   `popup reminder N min before`. On update it's an unknown param (`ignored_params`).
-- **Unverified live:** that Google returns `description` and `reminders` in the insert/patch
-  response the way the fake does (only affects the reply's echo, not the write).
+- **Verified live 2026-10-06:** Google returns `description` and `reminders` in the insert/patch
+  responses as the fake does; a 5-line description with a tab and a URL round-tripped exactly.
 
 ## Write access design (2026-09-15, tightened 2026-09-22)
 
