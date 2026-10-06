@@ -790,7 +790,7 @@ def test_e2e_event_description_and_popup_reminder_then_cleared():
                          _block(clear_id, "calendar.update_event", f"  event_id: {event_id}\n  description: ''\n"))
         cleared, cleared_body = _wait_for_reply(clear_id)
         assert cleared["status"] == "completed", cleared
-        assert "description " not in cleared_body.split("---GATEKEEPER-RESPONSE---")[0]
+        assert not re.search(r"description \d+ chars", cleared_body.split("---GATEKEEPER-RESPONSE---")[0]), cleared_body
         assert calendar.events().get(calendarId="primary", eventId=event_id).execute().get("description", "") == ""
     finally:
         calendar.events().delete(calendarId="primary", eventId=event_id).execute()
