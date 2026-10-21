@@ -46,7 +46,7 @@ reader LLM ever touch it:
 the text before looking for a request block, so nothing inside a payload
 can ever be parsed as (or shadow) a request. A param whose value is exactly
 `---PAYLOAD-<name>---` is replaced with that payload's text -- and only
-`body` (gmail.create_draft), `content` (drive.create_file) and
+`body` (gmail.create_draft), `content` (the three drive file verbs) and
 `description` (calendar.create_event/update_event, added 2026-10-05) may
 reference one. Everything else about a payload -- a missing reference target, a
 duplicate name, an unreferenced payload, a reference from any other field
@@ -101,6 +101,8 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 PAYLOAD_PARAMS: dict[str, frozenset[str]] = {
     "gmail.create_draft": frozenset({"body"}),
     "drive.create_file": frozenset({"content"}),
+    "drive.update_file": frozenset({"content"}),
+    "drive.append_file": frozenset({"content"}),
     "calendar.create_event": frozenset({"description"}),
     "calendar.update_event": frozenset({"description"}),
 }
@@ -452,7 +454,7 @@ def _parse_via_llm(email_text: str, fallback_request_id: str, reader_llm: Reader
     for name in (
         "query", "max_results", "newer_than_days", "day_offset", "days", "to", "subject", "body", "thread_id",
         "title", "start_time", "duration_minutes", "attendees", "add_attendees", "remove_attendees", "event_id",
-        "name", "content", "location",
+        "name", "content", "location", "file_id",
     ):
         value = getattr(extraction, name, None)
         if value is not None:

@@ -55,6 +55,8 @@ class Verb(str, Enum):
     CALENDAR_DELETE_EVENT = "calendar.delete_event"
     DRIVE_SEARCH = "drive.search"
     DRIVE_CREATE_FILE = "drive.create_file"
+    DRIVE_UPDATE_FILE = "drive.update_file"
+    DRIVE_APPEND_FILE = "drive.append_file"
     CONTACTS_SEARCH = "contacts.search"
     CAPABILITIES = "capabilities"
     UNSUPPORTED = "unsupported"
@@ -173,6 +175,14 @@ _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 # there is no `folder` field here for a request to redirect into.
 DRIVE_NAME_MAX_CHARS = 200
 DRIVE_CONTENT_MAX_CHARS = 100000  # raised from 20,000 with the payload rail (2026-09-22)
+# drive.update_file / drive.append_file (added 2026-10-21, Instinct's
+# request): the file is named by the file_id from an earlier create/update
+# reply, or by its exact name inside the gatekeeper's own Drive folder. The
+# drive.file scope means only files this app created are reachable at all --
+# a foreign file id 404s in Drive (app/drive_executor.py adds the explicit
+# folder check on top, so the refusal is a clear error rather than a 404).
+DRIVE_FILE_ID_MAX_CHARS = 128
+_DRIVE_FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 @dataclass(frozen=True)
@@ -264,6 +274,28 @@ class DriveCreateFileParams:
 
 
 @dataclass(frozen=True)
+class DriveUpdateFileParams:
+    """Exactly one of file_id / name is set (policy enforces it): the id
+    from an earlier reply, or a name to resolve in the gatekeeper's folder.
+    content replaces the file's whole content."""
+
+    file_id: str | None
+    name: str | None
+    content: str
+
+
+@dataclass(frozen=True)
+class DriveAppendFileParams:
+    """Same identification as DriveUpdateFileParams; content is appended to
+    the file's current content (a newline is inserted first when the file
+    doesn't end with one)."""
+
+    file_id: str | None
+    name: str | None
+    content: str
+
+
+@dataclass(frozen=True)
 class CapabilitiesParams:
     """No fields: capabilities takes no input, it only reports on this
     service itself. A dataclass anyway, for the same reason every other
@@ -290,6 +322,8 @@ class PolicyDecision:
         | CalendarUpdateEventParams
         | CalendarDeleteEventParams
         | DriveCreateFileParams
+        | DriveUpdateFileParams
+        | DriveAppendFileParams
         | CapabilitiesParams
         | None
     ) = None
@@ -466,6 +500,33 @@ VERB_SPECS: dict[Verb, VerbSpec] = {
         param_bounds=(
             f"name: string, required, max {DRIVE_NAME_MAX_CHARS} chars",
             f"content: string, required, max {DRIVE_CONTENT_MAX_CHARS} chars (use the payload rail for long content)",
+        ),
+    ),
+    Verb.DRIVE_UPDATE_FILE: VerbSpec(
+        verb=Verb.DRIVE_UPDATE_FILE,
+        param_names=frozenset({"file_id", "name", "content"}),
+        is_write=True,
+        param_bounds=(
+            f"file_id: string, optional, max {DRIVE_FILE_ID_MAX_CHARS} chars; the file id from an earlier "
+            "drive.create_file / update reply (the reply's link ends with it) -- give exactly one of file_id or name",
+            f"name: string, optional, max {DRIVE_NAME_MAX_CHARS} chars, one line; the exact name of a file in the "
+            "gatekeeper's own Drive folder (fails when no file, or several files, match)",
+            f"content: string, required, max {DRIVE_CONTENT_MAX_CHARS} chars (use the payload rail for long content); "
+            "REPLACES the file's whole content",
+        ),
+    ),
+    Verb.DRIVE_APPEND_FILE: VerbSpec(
+        verb=Verb.DRIVE_APPEND_FILE,
+        param_names=frozenset({"file_id", "name", "content"}),
+        is_write=True,
+        param_bounds=(
+            f"file_id: string, optional, max {DRIVE_FILE_ID_MAX_CHARS} chars; the file id from an earlier "
+            "drive.create_file / update reply -- give exactly one of file_id or name",
+            f"name: string, optional, max {DRIVE_NAME_MAX_CHARS} chars, one line; the exact name of a file in the "
+            "gatekeeper's own Drive folder (fails when no file, or several files, match)",
+            f"content: string, required, non-empty, max {DRIVE_CONTENT_MAX_CHARS} chars (use the payload rail for "
+            "long content); appended to the file's current content (one newline is inserted first when the file "
+            "doesn't end with one)",
         ),
     ),
     Verb.CAPABILITIES: VerbSpec(
@@ -667,6 +728,12 @@ def _evaluate_known_params(verb: Verb, params: dict[str, Any]) -> PolicyDecision
 
     if verb == Verb.DRIVE_CREATE_FILE:
         return _evaluate_drive_create_file(params)
+
+    if verb == Verb.DRIVE_UPDATE_FILE:
+        return _evaluate_drive_file_write(verb, params)
+
+    if verb == Verb.DRIVE_APPEND_FILE:
+        return _evaluate_drive_file_write(verb, params)
 
     if verb == Verb.CAPABILITIES:
         return PolicyDecision(status="allowed", verb=verb, params=CapabilitiesParams())
@@ -1276,3 +1343,71 @@ def _evaluate_drive_create_file(params: dict[str, Any]) -> PolicyDecision:
         return _deny(verb, "'content' may not contain control characters other than tab and newline")
 
     return PolicyDecision(status="allowed", verb=verb, params=DriveCreateFileParams(name=name.strip(), content=content))
+
+
+def _evaluate_drive_file_write(verb: Verb, params: dict[str, Any]) -> PolicyDecision:
+    """Shared policy for drive.update_file / drive.append_file: exactly one
+    of file_id / name identifies the file, content passes the same bounds as
+    drive.create_file's."""
+    file_id = params.get("file_id")
+    name = params.get("name")
+    if (file_id is None) == (name is None):
+        return PolicyDecision(
+            status="denied", verb=verb, error_code="invalid_params",
+            reason="give exactly one of 'file_id' or 'name'",
+        )
+
+    clean_file_id: str | None = None
+    if file_id is not None:
+        if (
+            not isinstance(file_id, str)
+            or len(file_id) > DRIVE_FILE_ID_MAX_CHARS
+            or not _DRIVE_FILE_ID_RE.match(file_id)
+        ):
+            return PolicyDecision(
+                status="denied", verb=verb, error_code="invalid_params",
+                reason="'file_id' must be a Drive file id from an earlier reply",
+            )
+        clean_file_id = file_id
+
+    clean_name: str | None = None
+    if name is not None:
+        if not isinstance(name, str) or not name.strip():
+            return PolicyDecision(
+                status="denied", verb=verb, error_code="invalid_params",
+                reason="'name' must be a non-empty string",
+            )
+        if len(name) > DRIVE_NAME_MAX_CHARS:
+            return PolicyDecision(
+                status="denied", verb=verb, error_code="invalid_params",
+                reason=f"'name' exceeds {DRIVE_NAME_MAX_CHARS} characters",
+            )
+        if not _is_single_line(name):
+            return _deny(verb, "'name' must be a single line with no control characters")
+        clean_name = name.strip()
+
+    content = params.get("content")
+    if not isinstance(content, str):
+        return PolicyDecision(
+            status="denied", verb=verb, error_code="invalid_params",
+            reason="'content' is required and must be a string",
+        )
+    if len(content) > DRIVE_CONTENT_MAX_CHARS:
+        return PolicyDecision(
+            status="denied", verb=verb, error_code="invalid_params",
+            reason=f"'content' exceeds {DRIVE_CONTENT_MAX_CHARS} characters",
+        )
+    if not _is_clean_multi_line(content):
+        return _deny(verb, "'content' may not contain control characters other than tab and newline")
+    if verb == Verb.DRIVE_APPEND_FILE and content == "":
+        return _deny(verb, "'content' must be non-empty for drive.append_file")
+
+    if verb == Verb.DRIVE_UPDATE_FILE:
+        return PolicyDecision(
+            status="allowed", verb=verb,
+            params=DriveUpdateFileParams(file_id=clean_file_id, name=clean_name, content=content),
+        )
+    return PolicyDecision(
+        status="allowed", verb=verb,
+        params=DriveAppendFileParams(file_id=clean_file_id, name=clean_name, content=content),
+    )

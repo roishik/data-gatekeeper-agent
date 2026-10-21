@@ -227,15 +227,37 @@ class FakeCalendarClient:
 
 
 class FakeDriveClient:
-    """Records every create_file() call and returns a deterministic
-    DriveFileResult -- mirrors the other fakes' style."""
+    """Records every call and returns deterministic DriveFileResults --
+    mirrors the other fakes' style. resolve_file_id maps one canned name
+    ("known.txt") to an id and raises GatekeeperDenied for anything else,
+    so pipeline tests can cover both identification paths."""
 
     def __init__(self):
         self.calls: list[dict] = []
 
     def create_file(self, name: str, content: str) -> DriveFileResult:
-        self.calls.append({"name": name, "content": content})
-        return DriveFileResult(file_id="file_1", name=name)
+        self.calls.append({"op": "create_file", "name": name, "content": content})
+        return DriveFileResult(
+            file_id="file_1", name=name, web_view_link="https://drive.google.com/file/d/file_1/view"
+        )
+
+    def resolve_file_id(self, name: str) -> str:
+        self.calls.append({"op": "resolve_file_id", "name": name})
+        if name == "known.txt":
+            return "file_known"
+        raise GatekeeperDenied("not_found", f"no file named '{name}' in the gatekeeper's Drive folder")
+
+    def update_file(self, file_id: str, content: str) -> DriveFileResult:
+        self.calls.append({"op": "update_file", "file_id": file_id, "content": content})
+        return DriveFileResult(
+            file_id=file_id, name="known.txt", web_view_link=f"https://drive.google.com/file/d/{file_id}/view"
+        )
+
+    def append_file(self, file_id: str, content: str) -> DriveFileResult:
+        self.calls.append({"op": "append_file", "file_id": file_id, "content": content})
+        return DriveFileResult(
+            file_id=file_id, name="known.txt", web_view_link=f"https://drive.google.com/file/d/{file_id}/view"
+        )
 
 
 class FakeAgentMailClient:

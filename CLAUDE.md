@@ -8,7 +8,24 @@ the audit trail. Background and decisions: `README.md` (the "Decided" list) and 
 Request/response format: `docs/PROTOCOL.md`. How to run, deploy, verify and kill it:
 `docs/RUNBOOK.md`.
 
-## Current state (as of 2026-10-06)
+## Current state (as of 2026-10-21)
+
+**Drive edit verbs on a branch, NOT deployed (2026-10-21):** branch
+`feat/drive-edit-and-link-2026-10` adds `drive.update_file` (replace a file's whole
+content) and `drive.append_file` (append; one newline inserted first when the file
+doesn't end with one), identified by exactly one of `file_id` or `name` (exact-name
+lookup inside the gatekeeper's own folder; no match `not_found`, several
+`ambiguous_file`). `drive.create_file` replies now include the new file's
+webViewLink, and so do the two new verbs -- by Instinct's request, so it can hand
+the owner a link and reuse the id. The same boundaries as everywhere else: the
+drive.file scope means a foreign id 404s, the executor also refuses a reachable
+file outside the app folder (`not_gatekeeper_file`) and anything not plain text;
+content rides the payload rail; the reader LLM knows both verbs. Not yet run
+against real Google: `tests/test_e2e_live.py`'s
+`test_e2e_drive_update_and_append_roundtrip` covers create -> update by id ->
+append by name and needs a deploy first.
+
+## Previous state (as of 2026-10-06)
 
 **Event description and popup reminder are deployed (2026-10-06): live revision
 `data-gatekeeper-00018-ntd`, built from `main` at merge commit `24ec84d` (PR #10,

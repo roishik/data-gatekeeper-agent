@@ -85,6 +85,18 @@ def test_empty_payload_is_allowed_for_drive_content():
     assert parsed.parse_error is None and parsed.params["content"] == ""
 
 
+def test_payload_carries_update_and_append_content_verbatim():
+    for verb in ("drive.update_file", "drive.append_file"):
+        text = (
+            f"---GATEKEEPER-REQUEST---\nrequest_id: req-{verb.split('.')[1]}\nverb: {verb}\n"
+            "params:\n  file_id: abc123\n  content: ---PAYLOAD-f---\n---END---\n"
+            "---GATEKEEPER-PAYLOAD-f---\nline 1\nline 2\n---END-PAYLOAD-f---\n"
+        )
+        parsed = parse_request(text, "msg_1", FakeReaderLLM())
+        assert parsed.parse_error is None, verb
+        assert parsed.params == {"file_id": "abc123", "content": "line 1\nline 2"}, verb
+
+
 def test_a_request_block_hidden_inside_a_payload_is_never_parsed():
     smuggled = (
         "---GATEKEEPER-PAYLOAD-1---\n"
