@@ -11,7 +11,9 @@ from app.policy import (
     CalendarDeleteEventParams,
     CalendarListEventsParams,
     CalendarUpdateEventParams,
+    DriveAppendFileParams,
     DriveCreateFileParams,
+    DriveUpdateFileParams,
     GmailCreateDraftParams,
     GmailSearchParams,
     Verb,
@@ -580,6 +582,97 @@ def test_drive_create_file_empty_content_is_allowed():
     assert decision.status == "allowed"
 
 
+# ── drive.update_file / drive.append_file ────────────────────────────────
+
+
+@pytest.mark.parametrize("verb", ["drive.update_file", "drive.append_file"])
+def test_drive_file_write_by_file_id_allowed(verb):
+    decision = evaluate_policy(verb, {"file_id": "abc123_XyZ-", "content": "hello"})
+    assert decision.status == "allowed"
+    assert decision.params.file_id == "abc123_XyZ-"
+    assert decision.params.name is None
+
+
+@pytest.mark.parametrize("verb", ["drive.update_file", "drive.append_file"])
+def test_drive_file_write_by_name_allowed(verb):
+    decision = evaluate_policy(verb, {"name": "notes.txt", "content": "hello"})
+    assert decision.status == "allowed"
+    assert decision.params.name == "notes.txt"
+    assert decision.params.file_id is None
+
+
+@pytest.mark.parametrize("verb", ["drive.update_file", "drive.append_file"])
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"content": "x"},  # neither
+        {"file_id": "abc", "name": "notes.txt", "content": "x"},  # both
+    ],
+)
+def test_drive_file_write_needs_exactly_one_identifier(verb, params):
+    decision = evaluate_policy(verb, params)
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
+@pytest.mark.parametrize("verb", ["drive.update_file", "drive.append_file"])
+@pytest.mark.parametrize("bad_id", ["has space", "quote'id", "semi;colon", "x" * 129, "", 123])
+def test_drive_file_write_bad_file_id_denied(verb, bad_id):
+    decision = evaluate_policy(verb, {"file_id": bad_id, "content": "x"})
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
+@pytest.mark.parametrize("verb", ["drive.update_file", "drive.append_file"])
+def test_drive_file_write_name_bounds(verb):
+    assert evaluate_policy(verb, {"name": "x" * 201, "content": "x"}).status == "denied"
+    assert evaluate_policy(verb, {"name": "multi\nline.txt", "content": "x"}).status == "denied"
+    assert evaluate_policy(verb, {"name": 123, "content": "x"}).status == "denied"
+
+
+@pytest.mark.parametrize("verb", ["drive.update_file", "drive.append_file"])
+def test_drive_file_write_content_bounds(verb):
+    from app.policy import DRIVE_CONTENT_MAX_CHARS
+
+    assert evaluate_policy(verb, {"file_id": "abc", "content": "y" * DRIVE_CONTENT_MAX_CHARS}).status == "allowed"
+    assert evaluate_policy(verb, {"file_id": "abc", "content": "y" * (DRIVE_CONTENT_MAX_CHARS + 1)}).status == "denied"
+    assert evaluate_policy(verb, {"file_id": "abc"}).status == "denied"  # content missing
+    assert evaluate_policy(verb, {"file_id": "abc", "content": 5}).status == "denied"
+
+
+def test_drive_update_file_empty_content_is_allowed():
+    """Replacing a file's content with '' clears it -- legitimate."""
+    decision = evaluate_policy("drive.update_file", {"file_id": "abc", "content": ""})
+    assert decision.status == "allowed"
+    assert decision.params == DriveUpdateFileParams(file_id="abc", name=None, content="")
+
+
+def test_drive_append_file_empty_content_is_denied():
+    decision = evaluate_policy("drive.append_file", {"file_id": "abc", "content": ""})
+    assert decision.status == "denied"
+    assert decision.error_code == "invalid_params"
+
+
+def test_drive_append_file_params_shape():
+    decision = evaluate_policy("drive.append_file", {"name": "log.txt", "content": "more"})
+    assert decision.params == DriveAppendFileParams(file_id=None, name="log.txt", content="more")
+
+
+@pytest.mark.parametrize("verb", ["drive.update_file", "drive.append_file"])
+def test_drive_file_write_extra_params_ignored_not_applied(verb):
+    decision = evaluate_policy(verb, {"file_id": "abc", "content": "x", "folder": "evil", "fileId": "evil"})
+    assert decision.status == "allowed"
+    assert set(decision.ignored_params) == {"folder", "fileId"}
+    assert decision.params.file_id == "abc"
+
+
+def test_drive_file_write_verbs_are_writes():
+    from app.policy import WRITE_VERBS
+
+    assert Verb.DRIVE_UPDATE_FILE in WRITE_VERBS
+    assert Verb.DRIVE_APPEND_FILE in WRITE_VERBS
+
+
 # ── capabilities ──────────────────────────────────────────────────────────
 
 
@@ -607,7 +700,7 @@ def test_verb_specs_cover_every_implemented_verb_exactly():
     assert set(VERB_SPECS.keys()) == {
         Verb.GMAIL_SEARCH, Verb.GMAIL_CREATE_DRAFT, Verb.CALENDAR_LIST_CALENDARS, Verb.CALENDAR_LIST_EVENTS,
         Verb.CALENDAR_CREATE_EVENT, Verb.CALENDAR_UPDATE_EVENT, Verb.CALENDAR_DELETE_EVENT,
-        Verb.DRIVE_CREATE_FILE, Verb.CAPABILITIES,
+        Verb.DRIVE_CREATE_FILE, Verb.DRIVE_UPDATE_FILE, Verb.DRIVE_APPEND_FILE, Verb.CAPABILITIES,
     }
 
 
@@ -622,6 +715,8 @@ def test_verb_specs_cover_every_implemented_verb_exactly():
         "calendar.update_event",
         "calendar.delete_event",
         "drive.create_file",
+        "drive.update_file",
+        "drive.append_file",
     ],
 )
 def test_write_verbs_are_recognized_as_implemented(verb):
@@ -643,6 +738,8 @@ def test_every_implemented_verb_ignores_unknown_parameters():
         "calendar.update_event": {"event_id": "e1", "title": "Moved"},
         "calendar.delete_event": {"event_id": "e1"},
         "drive.create_file": {"name": "notes.txt", "content": "hello"},
+        "drive.update_file": {"file_id": "abc", "content": "hello"},
+        "drive.append_file": {"name": "notes.txt", "content": "hello"},
         "capabilities": {},
     }
     for verb, params in valid.items():

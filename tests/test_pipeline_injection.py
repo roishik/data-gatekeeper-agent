@@ -644,8 +644,8 @@ def test_drive_create_file_end_to_end(configured_env, audit_log):
     )
 
     assert outcome.http_status == 200
-    assert fake_drive.calls == [{"name": "notes.txt", "content": "hello world"}]
-    assert "Created Drive file 'notes.txt'." in agentmail.calls[0]["text"]
+    assert fake_drive.calls == [{"op": "create_file", "name": "notes.txt", "content": "hello world"}]
+    assert "Created Drive file 'notes.txt': https://drive.google.com/file/d/file_1/view." in agentmail.calls[0]["text"]
 
 
 def test_write_verb_audit_log_records_ids_and_recipient_but_not_content(configured_env, audit_log):

@@ -1,6 +1,6 @@
 """
 drive_executor.py — Layer 4: the only module that touches Drive for
-drive.create_file.
+drive.create_file / drive.update_file / drive.append_file.
 
 Writes a single plain-text file into ONE fixed, app-owned folder
 (GOOGLE_DRIVE_FOLDER_ID, created on first use if unset -- same
@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from app.config import GOOGLE_DRIVE_FOLDER_ID
+from app.failures import GatekeeperDenied
 from app.google_auth_helper import build_google_service
 
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
@@ -41,10 +42,29 @@ logger = logging.getLogger("gatekeeper.drive_executor")
 class DriveFileResult:
     file_id: str
     name: str
+    # The file's webViewLink (its browser URL), requested on every
+    # create/update so the reply can hand the owner a link to the file.
+    # "" only if Google ever omits the field.
+    web_view_link: str = ""
 
 
 class DriveClient(Protocol):
     def create_file(self, name: str, content: str) -> DriveFileResult: ...
+
+    def resolve_file_id(self, name: str) -> str:
+        """Exact-name lookup inside the one app-owned folder: returns the
+        single matching file's id, raises GatekeeperDenied on zero
+        (not_found) or several (ambiguous_file) matches."""
+        ...
+
+    def update_file(self, file_id: str, content: str) -> DriveFileResult:
+        """Replace a plain-text file's whole content."""
+        ...
+
+    def append_file(self, file_id: str, content: str) -> DriveFileResult:
+        """Append to a plain-text file's content (one newline inserted
+        first when the current content doesn't end with one)."""
+        ...
 
 
 class GoogleDriveClient:
@@ -82,7 +102,90 @@ class GoogleDriveClient:
         media = MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain")
         created = (
             service.files()
-            .create(body={"name": name, "parents": [folder_id]}, media_body=media, fields="id, name")
+            .create(body={"name": name, "parents": [folder_id]}, media_body=media, fields="id, name, webViewLink")
             .execute()
         )
-        return DriveFileResult(file_id=created.get("id", ""), name=created.get("name", name))
+        return DriveFileResult(
+            file_id=created.get("id", ""), name=created.get("name", name),
+            web_view_link=created.get("webViewLink", ""),
+        )
+
+    @staticmethod
+    def _media(content: str):
+        from googleapiclient.http import MediaInMemoryUpload  # lazy: keep this module importable without the package
+
+        return MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain")
+
+    def resolve_file_id(self, name: str) -> str:
+        service = self._service()
+        folder_id = self._resolve_folder_id(service)
+        # The one special character in a Drive query string literal.
+        escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+        found = (
+            service.files()
+            .list(
+                q=f"'{folder_id}' in parents and name = '{escaped}' and trashed = false",
+                fields="files(id, name)",
+                pageSize=10,
+            )
+            .execute()
+            .get("files", [])
+        )
+        if not found:
+            raise GatekeeperDenied("not_found", f"no file named '{name}' in the gatekeeper's Drive folder")
+        if len(found) > 1:
+            raise GatekeeperDenied(
+                "ambiguous_file",
+                f"{len(found)} files named '{name}' in the gatekeeper's Drive folder -- use file_id instead",
+            )
+        return found[0]["id"]
+
+    def _gatekeeper_text_file(self, service, file_id: str) -> dict:
+        """Fetch and vet the file an update/append is aimed at. With the
+        drive.file scope, Drive itself 404s any file this app didn't create
+        (that surfaces as reply error `not_found`); the folder check below
+        is the explicit version of the same boundary, so a file that is
+        somehow reachable but outside the one app-owned folder is refused
+        as clearly not ours. Only plain-text files are editable -- the same
+        kind drive.create_file makes."""
+        meta = service.files().get(fileId=file_id, fields="id, name, mimeType, parents").execute()
+        if self._folder_id and self._folder_id not in (meta.get("parents") or []):
+            raise GatekeeperDenied("not_gatekeeper_file", "the file is not in the gatekeeper's Drive folder")
+        if meta.get("mimeType") != "text/plain":
+            raise GatekeeperDenied("invalid_params", "only plain-text files can be edited")
+        return meta
+
+    def update_file(self, file_id: str, content: str) -> DriveFileResult:
+        service = self._service()
+        self._gatekeeper_text_file(service, file_id)
+        updated = (
+            service.files()
+            .update(fileId=file_id, media_body=self._media(content), fields="id, name, webViewLink")
+            .execute()
+        )
+        return DriveFileResult(
+            file_id=updated.get("id", file_id), name=updated.get("name", ""),
+            web_view_link=updated.get("webViewLink", ""),
+        )
+
+    def append_file(self, file_id: str, content: str) -> DriveFileResult:
+        service = self._service()
+        self._gatekeeper_text_file(service, file_id)
+        current = service.files().get_media(fileId=file_id).execute()
+        if isinstance(current, bytes):
+            current_text = current.decode("utf-8")
+        else:
+            current_text = str(current)
+        new_text = current_text
+        if new_text and not new_text.endswith("\n"):
+            new_text += "\n"
+        new_text += content
+        updated = (
+            service.files()
+            .update(fileId=file_id, media_body=self._media(new_text), fields="id, name, webViewLink")
+            .execute()
+        )
+        return DriveFileResult(
+            file_id=updated.get("id", file_id), name=updated.get("name", ""),
+            web_view_link=updated.get("webViewLink", ""),
+        )

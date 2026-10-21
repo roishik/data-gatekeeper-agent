@@ -453,8 +453,56 @@ def test_render_reply_drive_create_file_completed():
     result = DriveFileResult(file_id="file_1", name="notes.txt")
     body = render_reply(parsed, "completed", None, drive_file_result=result)
     assert "Created Drive file 'notes.txt'." in body
-    assert "file_1" not in body  # file id not exposed in the reply body
+    assert "file_1" not in body  # no link returned -> the file id stays out of the reply body
     assert "result_count: 1" in body
+
+
+def test_render_reply_drive_create_file_includes_the_link_when_returned():
+    """Since 2026-10-21 (owner's request) the reply hands back the file's
+    webViewLink so the owner can open what was created; the id rides inside
+    it. URLs deliberately pass the reply guard (module docstring point 2)."""
+    parsed = ParsedRequest(request_id="req_df", verb="drive.create_file", params={}, source="block")
+    result = DriveFileResult(
+        file_id="file_1", name="notes.txt", web_view_link="https://drive.google.com/file/d/file_1/view"
+    )
+    body = render_reply(parsed, "completed", None, drive_file_result=result)
+    assert "Created Drive file 'notes.txt': https://drive.google.com/file/d/file_1/view." in body
+
+
+def test_render_reply_drive_update_file_completed():
+    parsed = ParsedRequest(request_id="req_du", verb="drive.update_file", params={}, source="block")
+    result = DriveFileResult(
+        file_id="file_1", name="notes.txt", web_view_link="https://drive.google.com/file/d/file_1/view"
+    )
+    body = render_reply(parsed, "completed", None, drive_file_result=result)
+    assert "Updated Drive file 'notes.txt': https://drive.google.com/file/d/file_1/view." in body
+    assert "result_count: 1" in body
+
+
+def test_render_reply_drive_append_file_completed():
+    parsed = ParsedRequest(request_id="req_da", verb="drive.append_file", params={}, source="block")
+    result = DriveFileResult(
+        file_id="file_1", name="log.txt", web_view_link="https://drive.google.com/file/d/file_1/view"
+    )
+    body = render_reply(parsed, "completed", None, drive_file_result=result)
+    assert "Appended to Drive file 'log.txt': https://drive.google.com/file/d/file_1/view." in body
+    assert "result_count: 1" in body
+
+
+def test_render_reply_drive_update_file_name_withheld_keeps_the_link():
+    """A withheld name hides only the name -- the link is an opaque id."""
+    from app.output_screen import DRIVE_FILE_KEY, ItemVerdict, OutputScreenResult
+
+    parsed = ParsedRequest(request_id="req_du", verb="drive.update_file", params={}, source="block")
+    result = DriveFileResult(
+        file_id="file_1", name="notes.txt", web_view_link="https://drive.google.com/file/d/file_1/view"
+    )
+    output = OutputScreenResult(
+        status="ok",
+        verdicts={DRIVE_FILE_KEY: ItemVerdict(sensitive=0.9, targets_reader=0.0, category="other", withheld=True, screened=True)},
+    )
+    body = render_reply(parsed, "completed", None, drive_file_result=result, output=output)
+    assert "Updated Drive file [withheld: flagged as sensitive]: https://drive.google.com/file/d/file_1/view." in body
 
 
 def test_send_reply_ignores_any_address_found_in_content():

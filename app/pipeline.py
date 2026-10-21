@@ -93,7 +93,9 @@ from app.policy import (
     CalendarListEventsParams,
     CalendarUpdateEventParams,
     CapabilitiesParams,
+    DriveAppendFileParams,
     DriveCreateFileParams,
+    DriveUpdateFileParams,
     GmailCreateDraftParams,
     GmailSearchParams,
     PolicyDecision,
@@ -632,6 +634,16 @@ def _execute(
         results.deleted_event_id = params.event_id
     elif isinstance(params, DriveCreateFileParams):
         results.drive_file_result = drive_client_factory().create_file(name=params.name, content=params.content)
+    elif isinstance(params, (DriveUpdateFileParams, DriveAppendFileParams)):
+        client = drive_client_factory()
+        # Policy guarantees exactly one of file_id / name; a name resolves
+        # inside the gatekeeper's own Drive folder (or the request is
+        # denied not_found / ambiguous_file).
+        file_id = params.file_id if params.file_id is not None else client.resolve_file_id(params.name or "")
+        if isinstance(params, DriveUpdateFileParams):
+            results.drive_file_result = client.update_file(file_id=file_id, content=params.content)
+        else:
+            results.drive_file_result = client.append_file(file_id=file_id, content=params.content)
     elif isinstance(params, CapabilitiesParams):
         # No Google API call, no credentials, nothing owner-derived --
         # see app/capabilities.py's module docstring.

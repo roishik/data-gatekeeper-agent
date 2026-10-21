@@ -246,6 +246,16 @@ class _ProseResult:
     item_lines_total: int | None
 
 
+def _drive_file_link(result: DriveFileResult) -> str:
+    """The file's webViewLink (browser URL). A fixed-shape URL derived from
+    the file id -- an opaque id rather than display text, so sanitize_output
+    like other ids, no secrecy redaction (URLs deliberately pass through,
+    see module docstring point 2)."""
+    if not result.web_view_link:
+        return ""
+    return f": {sanitize_output(result.web_view_link)}"
+
+
 def _build_prose(
     parsed_request: ParsedRequest,
     status: str,
@@ -380,7 +390,13 @@ def _build_prose(
         )
     elif status == "completed" and parsed_request.verb == "drive.create_file" and drive_file_result:
         name = WITHHELD_TEXT if withheld(DRIVE_FILE_KEY) else f"'{safe_display(drive_file_result.name)}'"
-        prose_lines.append(f"Created Drive file {name}.")
+        prose_lines.append(f"Created Drive file {name}{_drive_file_link(drive_file_result)}.")
+    elif status == "completed" and parsed_request.verb == "drive.update_file" and drive_file_result:
+        name = WITHHELD_TEXT if withheld(DRIVE_FILE_KEY) else f"'{safe_display(drive_file_result.name)}'"
+        prose_lines.append(f"Updated Drive file {name}{_drive_file_link(drive_file_result)}.")
+    elif status == "completed" and parsed_request.verb == "drive.append_file" and drive_file_result:
+        name = WITHHELD_TEXT if withheld(DRIVE_FILE_KEY) else f"'{safe_display(drive_file_result.name)}'"
+        prose_lines.append(f"Appended to Drive file {name}{_drive_file_link(drive_file_result)}.")
     elif status == "completed" and parsed_request.verb == "capabilities" and capabilities is not None:
         # Nothing here originates from Google or the requester, so none of
         # it needs safe_display/redaction -- see app/capabilities.py.
