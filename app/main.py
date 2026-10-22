@@ -58,6 +58,7 @@ from app.config import (
 )
 from app.drive_executor import GoogleDriveClient
 from app.gmail_executor import GoogleGmailClient
+from app.drive_edit_screen import DriveEditScreen, NoOpDriveEditScreen, TypeSafeDriveEditScreen
 from app.injection_screen import InjectionScreen, NoOpInjectionScreen, TypeSafeInjectionScreen
 from app.output_screen import NoOpOutputScreen, OutputScreen, TypeSafeOutputScreen
 from app.pipeline import handle_webhook
@@ -103,6 +104,14 @@ def _build_output_screen() -> OutputScreen:
     return NoOpOutputScreen()
 
 
+def _build_drive_edit_screen() -> DriveEditScreen:
+    # Same no-key fallback again. With the key set (always, in prod) an
+    # edit Jev can't screen is refused -- see app/drive_edit_screen.py.
+    if have_typesafe_key():
+        return TypeSafeDriveEditScreen()
+    return NoOpDriveEditScreen()
+
+
 # Built once at import time -- see module docstring for why this pair is
 # the exception to "construct credentialed things lazily".
 _state_store = _build_state_store()
@@ -120,6 +129,7 @@ def _handle_locked(body: bytes, svix_id: str, svix_timestamp: str, svix_signatur
             reader_llm=AnthropicReaderLLM(),
             injection_screen=_build_injection_screen(),
             output_screen=_build_output_screen(),
+            drive_edit_screen=_build_drive_edit_screen(),
             gmail_client_factory=GoogleGmailClient,
             calendar_client_factory=GoogleCalendarClient,
             drive_client_factory=GoogleDriveClient,

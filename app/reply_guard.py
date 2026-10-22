@@ -470,6 +470,11 @@ def _build_prose(
                 "This request was not authorized: the gatekeeper only changes or deletes calendar "
                 "events that it created itself."
             )
+        elif error_code == "edit_refused":
+            prose_lines.append(
+                "This request was refused: the edit was flagged as possibly malicious or unreasonable "
+                "for this file (or could not be checked), so the file was not changed."
+            )
         elif error_code == "not_gatekeeper_file":
             prose_lines.append(
                 "This request was not authorized: the gatekeeper only edits files in its own "
