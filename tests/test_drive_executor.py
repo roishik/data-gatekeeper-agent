@@ -181,6 +181,34 @@ def test_resolve_file_id_several_matches_denied_ambiguous():
     assert exc.value.error_code == "ambiguous_file"
 
 
+def test_resolve_file_id_without_a_folder_is_not_found_and_creates_no_folder(monkeypatch):
+    monkeypatch.setattr("app.drive_executor.GOOGLE_DRIVE_FOLDER_ID", None)
+    service = _Service()
+    client = _client(service, folder_id=None)
+
+    with pytest.raises(GatekeeperDenied) as exc:
+        client.resolve_file_id("notes.txt")
+    assert exc.value.error_code == "not_found"
+    assert service._files.create_calls == []  # no fresh folder made just to search it
+    assert service._files.list_calls == []
+
+
+@pytest.mark.parametrize("op", ["update_file", "append_file"])
+def test_edit_without_a_folder_is_refused_before_touching_the_file(monkeypatch, op):
+    # Fail closed: with no folder to check against, the drive.file scope
+    # alone is not treated as enough.
+    monkeypatch.setattr("app.drive_executor.GOOGLE_DRIVE_FOLDER_ID", None)
+    service = _Service()
+    _store_file(service, "file_7", "notes.txt", content=b"old")
+    client = _client(service, folder_id=None)
+
+    with pytest.raises(GatekeeperDenied) as exc:
+        getattr(client, op)(file_id="file_7", content="x")
+    assert exc.value.error_code == "not_gatekeeper_file"
+    assert service._files.update_calls == []
+    assert service._files.store["file_7"]["content"] == b"old"
+
+
 def test_update_file_replaces_the_content_and_returns_the_link():
     service = _Service()
     _store_file(service, "file_7", "notes.txt", content=b"old")

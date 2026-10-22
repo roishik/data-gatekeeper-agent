@@ -117,8 +117,14 @@ class GoogleDriveClient:
         return MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain")
 
     def resolve_file_id(self, name: str) -> str:
+        # Never _resolve_folder_id here: with no folder configured that
+        # would create a fresh, empty one just to search it. No folder
+        # means nothing the gatekeeper wrote can be found.
+        if not self._folder_id:
+            logger.warning("drive name lookup refused: GOOGLE_DRIVE_FOLDER_ID is not set")
+            raise GatekeeperDenied("not_found", "the gatekeeper has no Drive folder configured")
         service = self._service()
-        folder_id = self._resolve_folder_id(service)
+        folder_id = self._folder_id
         # The one special character in a Drive query string literal.
         escaped = name.replace("\\", "\\\\").replace("'", "\\'")
         found = (
@@ -146,10 +152,15 @@ class GoogleDriveClient:
         (that surfaces as reply error `not_found`); the folder check below
         is the explicit version of the same boundary, so a file that is
         somehow reachable but outside the one app-owned folder is refused
-        as clearly not ours. Only plain-text files are editable -- the same
+        as clearly not ours. With no folder configured there is nothing to
+        check against, so the edit is refused rather than left to the scope
+        alone (fail closed). Only plain-text files are editable -- the same
         kind drive.create_file makes."""
+        if not self._folder_id:
+            logger.warning("drive edit refused: GOOGLE_DRIVE_FOLDER_ID is not set")
+            raise GatekeeperDenied("not_gatekeeper_file", "the gatekeeper has no Drive folder configured")
         meta = service.files().get(fileId=file_id, fields="id, name, mimeType, parents").execute()
-        if self._folder_id and self._folder_id not in (meta.get("parents") or []):
+        if self._folder_id not in (meta.get("parents") or []):
             raise GatekeeperDenied("not_gatekeeper_file", "the file is not in the gatekeeper's Drive folder")
         if meta.get("mimeType") != "text/plain":
             raise GatekeeperDenied("invalid_params", "only plain-text files can be edited")
