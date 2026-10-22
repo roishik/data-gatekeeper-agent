@@ -9,6 +9,11 @@ app/audit_log.py / app/state_store.py). There is no `folder` field
 anywhere upstream (see app/policy.py's DriveCreateFileParams) for a
 request to redirect a write elsewhere in Drive.
 
+update_file / append_file (added 2026-10-21) only edit plain-text files in
+that folder, and pass the proposed edit -- with the file's current content
+-- to an edit guard before writing anything: Jev refuses malicious or
+unreasonable edits (app/drive_edit_screen.py, owner's decision 2026-10-22).
+
 Scope: drive.file only -- the same scope already granted for the
 Sheets-backed audit log and state store (research/07 section 4), so this
 verb needs no new OAuth consent beyond what's already requested. Per
@@ -27,13 +32,19 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 from app.config import GOOGLE_DRIVE_FOLDER_ID
+from app.drive_edit_screen import DriveEdit
 from app.failures import GatekeeperDenied
 from app.google_auth_helper import build_google_service
 
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+
+# Called with the proposed edit after the file is vetted and its current
+# content read, before anything is written; raises GatekeeperDenied to
+# refuse (app/pipeline.py's drive edit guard, app/drive_edit_screen.py).
+EditGuard = Callable[[DriveEdit], None]
 
 logger = logging.getLogger("gatekeeper.drive_executor")
 
@@ -57,13 +68,15 @@ class DriveClient(Protocol):
         (not_found) or several (ambiguous_file) matches."""
         ...
 
-    def update_file(self, file_id: str, content: str) -> DriveFileResult:
-        """Replace a plain-text file's whole content."""
+    def update_file(self, file_id: str, content: str, edit_guard: EditGuard) -> DriveFileResult:
+        """Replace a plain-text file's whole content. `edit_guard` sees the
+        proposed edit before anything is written and raises to refuse it."""
         ...
 
-    def append_file(self, file_id: str, content: str) -> DriveFileResult:
+    def append_file(self, file_id: str, content: str, edit_guard: EditGuard) -> DriveFileResult:
         """Append to a plain-text file's content (one newline inserted
-        first when the current content doesn't end with one)."""
+        first when the current content doesn't end with one). Same
+        `edit_guard` contract as update_file."""
         ...
 
 
@@ -166,9 +179,15 @@ class GoogleDriveClient:
             raise GatekeeperDenied("invalid_params", "only plain-text files can be edited")
         return meta
 
-    def update_file(self, file_id: str, content: str) -> DriveFileResult:
+    @staticmethod
+    def _current_text(service, file_id: str) -> str:
+        current = service.files().get_media(fileId=file_id).execute()
+        return current.decode("utf-8") if isinstance(current, bytes) else str(current)
+
+    def update_file(self, file_id: str, content: str, edit_guard: EditGuard) -> DriveFileResult:
         service = self._service()
-        self._gatekeeper_text_file(service, file_id)
+        meta = self._gatekeeper_text_file(service, file_id)
+        edit_guard(DriveEdit("replace", meta.get("name", ""), self._current_text(service, file_id), content))
         updated = (
             service.files()
             .update(fileId=file_id, media_body=self._media(content), fields="id, name, webViewLink")
@@ -179,14 +198,11 @@ class GoogleDriveClient:
             web_view_link=updated.get("webViewLink", ""),
         )
 
-    def append_file(self, file_id: str, content: str) -> DriveFileResult:
+    def append_file(self, file_id: str, content: str, edit_guard: EditGuard) -> DriveFileResult:
         service = self._service()
-        self._gatekeeper_text_file(service, file_id)
-        current = service.files().get_media(fileId=file_id).execute()
-        if isinstance(current, bytes):
-            current_text = current.decode("utf-8")
-        else:
-            current_text = str(current)
+        meta = self._gatekeeper_text_file(service, file_id)
+        current_text = self._current_text(service, file_id)
+        edit_guard(DriveEdit("append", meta.get("name", ""), current_text, content))
         new_text = current_text
         if new_text and not new_text.endswith("\n"):
             new_text += "\n"

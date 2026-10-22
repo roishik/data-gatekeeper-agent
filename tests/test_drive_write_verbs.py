@@ -82,7 +82,7 @@ class _AmbiguousDrive(FakeDriveClient):
 
 
 class _ForeignFileDrive(FakeDriveClient):
-    def update_file(self, file_id: str, content: str):
+    def update_file(self, file_id: str, content: str, edit_guard):
         self.calls.append({"op": "update_file", "file_id": file_id, "content": content})
         raise GatekeeperDenied("not_gatekeeper_file", "the file is not in the gatekeeper's Drive folder")
 

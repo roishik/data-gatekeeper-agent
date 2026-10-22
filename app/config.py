@@ -178,6 +178,14 @@ OUTPUT_SCREEN_FAIL_MODE = _env_str("OUTPUT_SCREEN_FAIL_MODE", "closed")
 if OUTPUT_SCREEN_FAIL_MODE not in {"closed", "open"}:
     raise RuntimeError("OUTPUT_SCREEN_FAIL_MODE must be 'closed' or 'open'")
 
+# Drive edit guard (app/drive_edit_screen.py, added 2026-10-22): a
+# drive.update_file / append_file is refused when Jev scores the edit
+# at/above this on either question (malicious, unreasonable). 0.7 is
+# TypeSafe's suggested starting point for a Noul "yes"; not yet calibrated
+# on real edits. An edit that can't be screened is refused, whatever
+# OUTPUT_SCREEN_FAIL_MODE says -- the guard is the owner's gate on edits.
+DRIVE_EDIT_DENY_THRESHOLD = _env_float("DRIVE_EDIT_DENY_THRESHOLD", 0.7)
+
 # ── Policy (Layer 3) ─────────────────────────────────────────────────────
 # Query terms that make a gmail.search request refuse to run, regardless
 # of who's asking or how politely. Configurable, not hardcoded, per the

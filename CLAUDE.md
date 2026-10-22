@@ -8,7 +8,7 @@ the audit trail. Background and decisions: `README.md` (the "Decided" list) and 
 Request/response format: `docs/PROTOCOL.md`. How to run, deploy, verify and kill it:
 `docs/RUNBOOK.md`.
 
-## Current state (as of 2026-10-21)
+## Current state (as of 2026-10-22)
 
 **Drive edit verbs on a branch, NOT deployed (2026-10-21):** branch
 `feat/drive-edit-and-link-2026-10` adds `drive.update_file` (replace a file's whole
@@ -24,6 +24,24 @@ content rides the payload rail; the reader LLM knows both verbs. Not yet run
 against real Google: `tests/test_e2e_live.py`'s
 `test_e2e_drive_update_and_append_roundtrip` covers create -> update by id ->
 append by name and needs a deploy first.
+
+**Owner's decision (2026-10-22): Instinct may overwrite and append, with Jev as the
+gatekeeper for malicious or unreasonable edits.** `app/drive_edit_screen.py`: after the
+file is vetted and its current content read, but before writing, Jev answers two Nouls
+on the edit -- `malicious` (the new text targets a later reader: instructions to an AI
+or person, phishing, scams; personal/financial info doesn't count) on every chunk, and
+`unreasonable` (gutting the file, junk, an edit the owner likely wouldn't want) once,
+with an excerpt of the current content and both sizes. Either score at/above
+`DRIVE_EDIT_DENY_THRESHOLD` (0.7, TypeSafe's suggested starting point), or an edit Jev
+can't screen, is refused `edit_refused` and nothing is written (fails closed whatever
+`OUTPUT_SCREEN_FAIL_MODE` says; no key = NoOp, as with the other screens). Both paths,
+block and plain text, and every batch item. Scores go to the audit record
+(`drive_edit_malicious`, `drive_edit_unreasonable`, `drive_edit_screen_status`).
+`drive.create_file` is not screened (a new file can't destroy anything). Checked against
+real Jev on synthetic files (`tests/test_drive_edit_screen_live.py`, 8/8): ordinary
+appends/rewrites 0.01-0.04 on both; planted AI instructions malicious 0.99; wiping or
+junking meeting notes unreasonable 0.94/0.98; **clearing a one-line scratch note scored
+unreasonable 0.57**, the closest call -- watch it when calibrating.
 
 ## Previous state (as of 2026-10-06)
 
@@ -371,8 +389,10 @@ decisions, all mine, all deliberate:
   - bounded params: title length, day_offset/duration caps, ≤10 attendees, email shape.
 
   There's no push-approval channel (ntfy/Pushover).
-- **Drive: `drive.create_file` only**, scope `drive.file`, always into one app-owned folder
-  (`GOOGLE_DRIVE_FOLDER_ID`). It never touches anything the app didn't create.
+- **Drive: create, and (2026-10-22) overwrite/append**, scope `drive.file`, always in one
+  app-owned folder (`GOOGLE_DRIVE_FOLDER_ID`). It never touches anything the app didn't
+  create. Edits (`drive.update_file`/`append_file`) are autonomous, gated by Jev's edit
+  guard (`edit_refused`, see "Current state"); with no folder configured they're refused.
 - **Audit log widened for writes.** Unlike reads (ids and counts only), `AuditRecord` stores
   `draft_id`, `draft_to`, `created_event_id`, `updated_event_id`, `deleted_event_id` and
   `drive_file_id`. Literal subject/body/title text is never logged; the AgentMail thread is
@@ -385,7 +405,8 @@ decisions, all mine, all deliberate:
    Drive folder pin, the audit chain, and all three live suites (Sheets, e2e, injection screen).
    Still to do:
    - **calibrate the Jev thresholds** (`OUTPUT_SENSITIVE_THRESHOLD` 0.5,
-     `OUTPUT_INJECTION_THRESHOLD` 0.7, `INJECTION_DENY_THRESHOLD` 0.85) from real scores in the
+     `OUTPUT_INJECTION_THRESHOLD` 0.7, `INJECTION_DENY_THRESHOLD` 0.85, and since 2026-10-22
+     `DRIVE_EDIT_DENY_THRESHOLD` 0.7) from real scores in the
      audit log before trusting them. The e2e run gave the first data points: ordinary requests
      scored 0.05–0.31, and the deliberate injection 0.99.
 2. **Send Instinct the updated standing rule** (docs/PROTOCOL.md, last section, now 15 points):

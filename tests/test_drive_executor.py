@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.drive_edit_screen import DriveEdit
 from app.drive_executor import GoogleDriveClient
 from app.failures import GatekeeperDenied
 
@@ -75,6 +76,10 @@ class _Service:
 
     def files(self):
         return self._files
+
+
+def _allow(edit):
+    """An edit guard that lets every edit through."""
 
 
 def _client(service, folder_id=None):
@@ -203,7 +208,7 @@ def test_edit_without_a_folder_is_refused_before_touching_the_file(monkeypatch, 
     client = _client(service, folder_id=None)
 
     with pytest.raises(GatekeeperDenied) as exc:
-        getattr(client, op)(file_id="file_7", content="x")
+        getattr(client, op)(file_id="file_7", content="x", edit_guard=_allow)
     assert exc.value.error_code == "not_gatekeeper_file"
     assert service._files.update_calls == []
     assert service._files.store["file_7"]["content"] == b"old"
@@ -214,7 +219,7 @@ def test_update_file_replaces_the_content_and_returns_the_link():
     _store_file(service, "file_7", "notes.txt", content=b"old")
     client = _client(service, folder_id="folder_pinned")
 
-    result = client.update_file(file_id="file_7", content="new text")
+    result = client.update_file(file_id="file_7", content="new text", edit_guard=_allow)
 
     assert service._files.store["file_7"]["content"] == b"new text"
     assert result.name == "notes.txt"
@@ -227,7 +232,7 @@ def test_update_file_refuses_a_file_outside_the_gatekeeper_folder():
     client = _client(service, folder_id="folder_pinned")
 
     with pytest.raises(GatekeeperDenied) as exc:
-        client.update_file(file_id="file_8", content="x")
+        client.update_file(file_id="file_8", content="x", edit_guard=_allow)
     assert exc.value.error_code == "not_gatekeeper_file"
     assert service._files.update_calls == []
 
@@ -238,7 +243,7 @@ def test_update_file_refuses_a_non_text_file():
     client = _client(service, folder_id="folder_pinned")
 
     with pytest.raises(GatekeeperDenied) as exc:
-        client.update_file(file_id="file_8", content="x")
+        client.update_file(file_id="file_8", content="x", edit_guard=_allow)
     assert exc.value.error_code == "invalid_params"
     assert service._files.update_calls == []
 
@@ -248,7 +253,7 @@ def test_append_file_adds_a_newline_when_the_file_does_not_end_with_one():
     _store_file(service, "file_7", "log.txt", content=b"first line")
     client = _client(service, folder_id="folder_pinned")
 
-    client.append_file(file_id="file_7", content="second line")
+    client.append_file(file_id="file_7", content="second line", edit_guard=_allow)
 
     assert service._files.store["file_7"]["content"] == b"first line\nsecond line"
 
@@ -258,7 +263,7 @@ def test_append_file_to_a_file_ending_in_newline_adds_none():
     _store_file(service, "file_7", "log.txt", content=b"first line\n")
     client = _client(service, folder_id="folder_pinned")
 
-    client.append_file(file_id="file_7", content="second line")
+    client.append_file(file_id="file_7", content="second line", edit_guard=_allow)
 
     assert service._files.store["file_7"]["content"] == b"first line\nsecond line"
 
@@ -268,7 +273,7 @@ def test_append_file_to_an_empty_file_adds_no_leading_newline():
     _store_file(service, "file_7", "log.txt", content=b"")
     client = _client(service, folder_id="folder_pinned")
 
-    result = client.append_file(file_id="file_7", content="first line")
+    result = client.append_file(file_id="file_7", content="first line", edit_guard=_allow)
 
     assert service._files.store["file_7"]["content"] == b"first line"
     assert result.web_view_link == "https://drive.google.com/file/d/file_7/view"
@@ -282,6 +287,37 @@ def test_update_and_append_take_no_folder_or_name_params():
 
     from app.drive_executor import DriveClient
 
-    assert set(inspect.signature(DriveClient.update_file).parameters) == {"self", "file_id", "content"}
-    assert set(inspect.signature(DriveClient.append_file).parameters) == {"self", "file_id", "content"}
+    assert set(inspect.signature(DriveClient.update_file).parameters) == {"self", "file_id", "content", "edit_guard"}
+    assert set(inspect.signature(DriveClient.append_file).parameters) == {"self", "file_id", "content", "edit_guard"}
     assert set(inspect.signature(DriveClient.resolve_file_id).parameters) == {"self", "name"}
+
+
+@pytest.mark.parametrize(
+    "op, new_text, expected_operation",
+    [("update_file", "replacement", "replace"), ("append_file", "more", "append")],
+)
+def test_the_edit_guard_sees_the_current_content_and_the_new_text(op, new_text, expected_operation):
+    service = _Service()
+    _store_file(service, "file_7", "log.txt", content=b"what is there now")
+    client = _client(service, folder_id="folder_pinned")
+    seen = []
+
+    getattr(client, op)(file_id="file_7", content=new_text, edit_guard=seen.append)
+
+    assert seen == [DriveEdit(expected_operation, "log.txt", "what is there now", new_text)]
+
+
+@pytest.mark.parametrize("op", ["update_file", "append_file"])
+def test_a_refusing_edit_guard_means_nothing_is_written(op):
+    service = _Service()
+    _store_file(service, "file_7", "log.txt", content=b"keep me")
+    client = _client(service, folder_id="folder_pinned")
+
+    def refuse(edit):
+        raise GatekeeperDenied("edit_refused", "flagged")
+
+    with pytest.raises(GatekeeperDenied) as exc:
+        getattr(client, op)(file_id="file_7", content="x", edit_guard=refuse)
+    assert exc.value.error_code == "edit_refused"
+    assert service._files.update_calls == []
+    assert service._files.store["file_7"]["content"] == b"keep me"
