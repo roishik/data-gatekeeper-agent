@@ -587,7 +587,8 @@ def _calendar_api():
 
 def _listed_calendars(body: str) -> list[tuple[str, str, str]]:
     """(name, access role, calendar_id) for every line of a list_calendars reply."""
-    return re.findall(r"^- (.*?) — access: (\w+) \(calendar_id: (\S+?)\)$", body, re.M)
+    # Gmail hands the body back with CRLF line endings.
+    return re.findall(r"^- (.*?) — access: (\w+) \(calendar_id: (\S+?)\)\r?$", body, re.M)
 
 
 def _event_id_and_calendar(body: str) -> tuple[str, str]:

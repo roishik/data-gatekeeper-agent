@@ -10,19 +10,23 @@ Request/response format: `docs/PROTOCOL.md`. How to run, deploy, verify and kill
 
 ## Current state (as of 2026-10-06)
 
-**Event description and popup reminder are deployed (2026-10-06): live revision
-`data-gatekeeper-00018-ntd`, built from `main` at merge commit `24ec84d` (PR #10,
-`GIT_SHA=24ec84d`).** Rollback target: `00017-lf4` (`503a25c`). After the deploy: `/health` 200,
-`/docs` 404, env vars as expected, audit chain intact at 151 entries. Live suites run the same day:
-e2e 14/15 (the family-calendar lifecycle test was left out: writing to the shared calendar wasn't
-approved), Sheets 4/4, injection screen 2/2. The new
-`test_e2e_event_description_and_popup_reminder_then_cleared` passed, so Google stores and returns
-`description` and the popup `reminders` exactly as sent. The 2026-09-25 all-day/past-window test
-passed live for the first time. The one failure,
-`test_e2e_freeform_list_calendars_and_last_week_through_the_reader_llm`, was the reader LLM picking
-`capabilities` for "Which calendars can you write to?" (5/5 times against real Haiku). Fixed in the
-stage-1 prompt (one sentence telling the two verbs apart; 25/25 correct across five phrasings
-locally) on `fix/reader-list-calendars-vs-capabilities`; live once deployed.
+**Live revision `data-gatekeeper-00019-47r`, built from `main` at merge commit `07e6d8c` (PR #16,
+`GIT_SHA=07e6d8c`, 2026-10-06).** It adds one prompt fix on top of `00018-ntd` (`24ec84d`, PR #10:
+event description and popup reminder, deployed the same day). Rollback targets: `00018-ntd`, then
+`00017-lf4` (`503a25c`). After the deploy: `/health` 200, `/docs` 404, env vars as expected, audit
+chain intact at 182 entries.
+Live suites, 2026-10-06: e2e 15 of 16 run, all passing; the family-calendar lifecycle test was not
+run (writing to the shared calendar wasn't approved), so the `gatekeeper` tag on a shared
+calendar's copy is still unverified. Sheets 4/4, injection screen 2/2.
+- `test_e2e_event_description_and_popup_reminder_then_cleared` passed on both revisions: Google
+  stores and returns `description` and the popup `reminders` exactly as sent.
+- The 2026-09-25 all-day/past-window test passed live for the first time.
+- `test_e2e_freeform_list_calendars_and_last_week_through_the_reader_llm` first failed on
+  `00018-ntd`: real Haiku picked `capabilities` for "Which calendars can you write to?" (5/5).
+  PR #16 added one sentence to the stage-1 prompt telling the two verbs apart (25/25 correct
+  across five phrasings). On `00019-47r` the verb was right, and the test then needed a CRLF fix in
+  its own reply parsing; after that it passed, "last week" included. So the reader LLM's new verb
+  and "last week" prompt are now verified against the real model.
 Merging into `main` needs the owner's admin bypass (`main: owner-only` ruleset blocks all updates).
 
 **The calendar extensions are deployed (2026-09-26): live revision `data-gatekeeper-00017-lf4`,
@@ -482,7 +486,7 @@ Health: `GET /health` (Cloud Run reserves `/healthz`).
 | Thing | Value |
 |---|---|
 | GCP project / region | `data-gatekeeper-roishik` / `europe-west1` (billing linked) |
-| Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 120s. Live revision `data-gatekeeper-00017-lf4` (commit label `503a25c`, from branch `feat/calendar-extensions-2026-09`); rollback target `00016-crq` (`64e8f6f`) |
+| Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 120s. Live revision `data-gatekeeper-00019-47r` (commit label `07e6d8c`, from `main`); rollback targets `00018-ntd` (`24ec84d`), then `00017-lf4` (`503a25c`) |
 | Runtime service account | `gatekeeper-run@data-gatekeeper-roishik.iam.gserviceaccount.com` (secretAccessor per secret only) |
 | Secret Manager | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `ANTHROPIC_API_KEY`, `AGENTMAIL_API_KEY`, `AGENTMAIL_WEBHOOK_SECRET`, `TYPESAFE_API_KEY` |
 | Env vars (non-secret) | `AGENTMAIL_INBOX_ID`/`GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to`, `ALLOWED_SENDERS=roishikler@mail.instinct.com,roishik10@gmail.com`, `OWNER_EMAIL=roishik10@gmail.com` (no longer used by the service after the refactor; the e2e tests use it), `OWNER_TIMEZONE=Asia/Jerusalem`, `MAX_REQUESTS_PER_DAY=100` (raised from 50 at the 2026-09-23 deploy; the cap wasn't actually enforced before the refactor because of the state-sheet bug), `ANTHROPIC_MODEL=claude-haiku-4-5-20251001`, `AUDIT_LOG_BACKEND=sheets`, `STATE_STORE_BACKEND=sheets`. New tunables all default in code (`.env.example`): `READER_LLM_MAX_INPUT_CHARS`, `OUTPUT_*`, `JEV_*`, `PROCESSING_STALE_AFTER_SECONDS`. `GIT_SHA` (the deployed commit's short sha, set by every deploy command; it's the replies' `protocol_version`, and defaults to `"dev"` if absent) |
