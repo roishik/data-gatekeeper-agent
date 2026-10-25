@@ -67,6 +67,7 @@ from app.calendar_window import format_window_range, resolve_window, window_span
 from app.capabilities import CapabilitiesInfo, build_capabilities_info
 from app.config import AGENTMAIL_INBOX_ID, INJECTION_DENY_THRESHOLD, MAX_REQUESTS_PER_DAY, OUTPUT_SCREEN_FAIL_MODE, OWNER_TIMEZONE
 from app.drive_executor import DriveClient, DriveFileResult
+from app.drive_edit_screen import DriveEdit, DriveEditScreen, DriveEditVerdict, NoOpDriveEditScreen
 from app.failures import GatekeeperDenied, classify_failure
 from app.gmail_executor import DraftResult, GmailClient, GmailResult
 from app.ingress import check_event, parsed_sender_address, verify_signature
@@ -195,6 +196,9 @@ class _RequestState:
     reply_error: str | None = None
     outcome_reason: str = "processed"
     output: OutputScreenResult | None = None
+    # Jev's verdict on a drive.update_file / append_file (app/drive_edit_screen.py),
+    # kept for the audit record whether or not it refused the edit.
+    drive_edit: DriveEditVerdict | None = None
     output_reply_sensitive: float | None = None
     output_reply_injection: float | None = None
     # The sender's daily count as read for the rate-cap check, plus how
@@ -264,6 +268,7 @@ def handle_webhook(
     audit_log: AuditLog,
     payload: dict[str, Any] | None = None,
     output_screen: OutputScreen | None = None,
+    drive_edit_screen: DriveEditScreen | None = None,
 ) -> WebhookOutcome:
     """The single entry point every caller (app/main.py and every test)
     uses. `payload` lets tests pass a pre-parsed dict instead of
@@ -320,13 +325,14 @@ def handle_webhook(
 
     # ── From here on: exactly one reply + one audit record (guarantee 4) ─
     output_screen = output_screen or NoOpOutputScreen()
+    drive_edit_screen = drive_edit_screen or NoOpDriveEditScreen()
     state = _RequestState(message_id=message_id, sender=sender_address, parsed=_unresolved_request(message_id))
     stage = "layer1"
     try:
         stage = _run_request(
             state, fields,
             state_store=state_store, reader_llm=reader_llm, injection_screen=injection_screen,
-            output_screen=output_screen,
+            output_screen=output_screen, drive_edit_screen=drive_edit_screen,
             gmail_client_factory=gmail_client_factory, calendar_client_factory=calendar_client_factory,
             drive_client_factory=drive_client_factory,
         )
@@ -394,6 +400,7 @@ def _run_request(
     reader_llm: ReaderLLM,
     injection_screen: InjectionScreen,
     output_screen: OutputScreen,
+    drive_edit_screen: DriveEditScreen,
     gmail_client_factory: Callable[[], GmailClient],
     calendar_client_factory: Callable[[], CalendarClient],
     drive_client_factory: Callable[[], DriveClient],
@@ -459,7 +466,7 @@ def _run_request(
             state.batch_items, state.output = _run_batch(
                 state, state_store=state_store, gmail_client_factory=gmail_client_factory,
                 calendar_client_factory=calendar_client_factory, drive_client_factory=drive_client_factory,
-                output_screen=output_screen,
+                output_screen=output_screen, drive_edit_screen=drive_edit_screen,
             )
             state.reply_status, state.error_code, state.retryable = "completed", None, False
             return stage
@@ -481,6 +488,7 @@ def _run_request(
         state.results = _execute(
             state.decision, state.parsed, gmail_client_factory, calendar_client_factory, drive_client_factory,
             invite_guard=_make_invite_guard(output_screen),
+            drive_edit_guard=_make_drive_edit_guard(drive_edit_screen, state),
         )
         if state.results.wrote:
             stage = "layer1"
@@ -543,6 +551,29 @@ def _make_invite_guard(output_screen: OutputScreen) -> Callable[[str, str, str],
     return guard
 
 
+def _make_drive_edit_guard(screen: DriveEditScreen, state: _RequestState) -> Callable[[DriveEdit], None]:
+    """drive.update_file / append_file change an existing file with no human
+    review, so Jev judges every edit first (owner's decision, 2026-10-22):
+    a malicious or unreasonable one -- or, failing closed, one that can't be
+    screened -- is refused before anything is written. The verdict lands on
+    `state` for the audit record either way. See app/drive_edit_screen.py."""
+
+    def guard(edit: DriveEdit) -> None:
+        try:
+            verdict = screen.screen_edit(edit)
+        except Exception:
+            logger.exception("drive edit screen failed")
+            verdict = DriveEditVerdict(None, None, refused=True, status="degraded")
+        state.drive_edit = verdict
+        if verdict.refused:
+            raise GatekeeperDenied(
+                "edit_refused",
+                "the edit was flagged as malicious or unreasonable (or could not be screened)",
+            )
+
+    return guard
+
+
 def _output_items(results: ExecutionResults) -> dict[str, dict[str, str]]:
     items: dict[str, dict[str, str]] = {}
     for i, r in enumerate(results.gmail_results or []):
@@ -581,6 +612,7 @@ def _execute(
     drive_client_factory: Callable[[], DriveClient],
     *,
     invite_guard: Callable[[str, str, str], None],
+    drive_edit_guard: Callable[[DriveEdit], None],
 ) -> ExecutionResults:
     """Layer 4: only for an allowed verb -- exactly one verb, read or
     write, runs per request."""
@@ -641,9 +673,13 @@ def _execute(
         # denied not_found / ambiguous_file).
         file_id = params.file_id if params.file_id is not None else client.resolve_file_id(params.name or "")
         if isinstance(params, DriveUpdateFileParams):
-            results.drive_file_result = client.update_file(file_id=file_id, content=params.content)
+            results.drive_file_result = client.update_file(
+                file_id=file_id, content=params.content, edit_guard=drive_edit_guard,
+            )
         else:
-            results.drive_file_result = client.append_file(file_id=file_id, content=params.content)
+            results.drive_file_result = client.append_file(
+                file_id=file_id, content=params.content, edit_guard=drive_edit_guard,
+            )
     elif isinstance(params, CapabilitiesParams):
         # No Google API call, no credentials, nothing owner-derived --
         # see app/capabilities.py's module docstring.
@@ -666,6 +702,7 @@ def _run_batch_item(
     calendar_client_factory: Callable[[], CalendarClient],
     drive_client_factory: Callable[[], DriveClient],
     output_screen: OutputScreen,
+    drive_edit_screen: DriveEditScreen,
 ) -> None:
     """One batch item's Layers 3-4, mirroring _run_request's single-request
     flow exactly (policy, execute, EFFECT_DONE) -- Layer 1 (cap, dedupe,
@@ -691,6 +728,7 @@ def _run_batch_item(
         item_state.results = _execute(
             item_state.decision, parsed, gmail_client_factory, calendar_client_factory, drive_client_factory,
             invite_guard=_make_invite_guard(output_screen),
+            drive_edit_guard=_make_drive_edit_guard(drive_edit_screen, item_state),
         )
         if item_state.results.wrote:
             # Per item, straight after its own side effect -- not batched
@@ -746,6 +784,7 @@ def _run_batch(
     calendar_client_factory: Callable[[], CalendarClient],
     drive_client_factory: Callable[[], DriveClient],
     output_screen: OutputScreen,
+    drive_edit_screen: DriveEditScreen,
 ) -> tuple[list[_RequestState], OutputScreenResult | None]:
     """Runs every item in state.parsed.batch_items independently, each
     through the same per-request pipeline a standalone request uses -- own
@@ -807,6 +846,7 @@ def _run_batch(
             item_state, state_store=state_store, injection_score=state.injection_score,
             gmail_client_factory=gmail_client_factory, calendar_client_factory=calendar_client_factory,
             drive_client_factory=drive_client_factory, output_screen=output_screen,
+            drive_edit_screen=drive_edit_screen,
         )
 
     combined_output = _screen_batch_output(output_screen, item_states)
@@ -990,6 +1030,9 @@ def _audit_record(state: _RequestState, *, batch_id: str | None = None) -> Audit
         output_max_injection=state.output.max_targets_reader if state.output else None,
         output_reply_sensitive=state.output_reply_sensitive,
         output_reply_injection=state.output_reply_injection,
+        drive_edit_malicious=state.drive_edit.malicious if state.drive_edit else None,
+        drive_edit_unreasonable=state.drive_edit.unreasonable if state.drive_edit else None,
+        drive_edit_screen_status=state.drive_edit.status if state.drive_edit else None,
         failure_code=state.failure_code,
         failure_stage=state.failure_stage,
         failure_type=state.failure_type,

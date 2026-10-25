@@ -470,6 +470,16 @@ def _build_prose(
                 "This request was not authorized: the gatekeeper only changes or deletes calendar "
                 "events that it created itself."
             )
+        elif error_code == "edit_refused":
+            prose_lines.append(
+                "This request was refused: the edit was flagged as possibly malicious or unreasonable "
+                "for this file (or could not be checked), so the file was not changed."
+            )
+        elif error_code == "not_gatekeeper_file":
+            prose_lines.append(
+                "This request was not authorized: the gatekeeper only edits files in its own "
+                "Drive folder."
+            )
         else:
             prose_lines.append("This request was not authorized.")
     else:  # "unsupported" or any other/unknown status
@@ -669,6 +679,11 @@ _EXPLAINED_DENIALS = {
         "This request is too long to handle as plain text. Resend it as a GATEKEEPER-REQUEST block, "
         "with the long text in a GATEKEEPER-PAYLOAD section."
     ),
+    # drive.update_file / append_file by name. The HttpError 404 for an
+    # unknown file_id is reply status `error`, not `denied`, so it never
+    # lands here.
+    "not_found": "No file matched.",
+    "ambiguous_file": "More than one file matched; resend with file_id instead of name.",
 }
 
 _ERROR_PROSE = {

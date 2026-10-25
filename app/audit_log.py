@@ -93,6 +93,10 @@ _FIELD_ORDER = [
     # id, like the event ids. Entries written before this existed simply lack
     # the key; verify_chain hashes each entry's stored dict, so they still verify.
     "calendar_id",
+    # Drive edit guard (added 2026-10-22, app/drive_edit_screen.py): Jev's
+    # two scores on a drive.update_file / append_file and the screen status,
+    # numbers only -- never the file's text. Older entries lack the keys.
+    "drive_edit_malicious", "drive_edit_unreasonable", "drive_edit_screen_status",
 ]
 
 
@@ -151,6 +155,9 @@ class AuditRecord:
     deleted_event_id: str | None = None
     drive_file_id: str | None = None
     calendar_id: str | None = None
+    drive_edit_malicious: float | None = None
+    drive_edit_unreasonable: float | None = None
+    drive_edit_screen_status: str | None = None
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
