@@ -8,10 +8,22 @@ the audit trail. Background and decisions: `README.md` (the "Decided" list) and 
 Request/response format: `docs/PROTOCOL.md`. How to run, deploy, verify and kill it:
 `docs/RUNBOOK.md`.
 
-## Current state (as of 2026-10-22)
+## Current state (as of 2026-10-25)
 
-**Drive edit verbs on a branch, NOT deployed (2026-10-21):** branch
-`feat/drive-edit-and-link-2026-10` adds `drive.update_file` (replace a file's whole
+**Live revision `data-gatekeeper-00020-pkl`, built from `main` at merge commit `259c169`
+(`GIT_SHA=259c169`, deployed 2026-10-25).** It adds the Drive edit verbs (PR #18, merged as
+`74ea642`) and the Jev edit guard plus the fail-closed folder check (PR #19). #18 was merged at
+its first commit, 11 minutes before those two follow-ups were pushed to its branch, so they went
+in separately. Rollback target: `00019-47r` (`07e6d8c`); rolling back removes update/append
+altogether. After the deploy: `/health` 200, `/docs` and `/openapi.json` 404, env vars as
+expected (`GOOGLE_DRIVE_FOLDER_ID` pinned), audit chain intact at 234 entries.
+`test_e2e_drive_update_and_append_roundtrip` passed live on `00020-pkl` (create, update by
+`file_id`, append by name, each checked against the real Drive file). In the audit log the
+update scored malicious 0.02 / unreasonable 0.24 and the append 0.02 / 0.10, screen `ok`, so the
+guard runs in prod. The three test threads were archived. Instinct hasn't been told about the
+new verbs yet (Open item 2).
+
+**Drive edit verbs (2026-10-21, deployed 2026-10-25):** `drive.update_file` (replace a file's whole
 content) and `drive.append_file` (append; one newline inserted first when the file
 doesn't end with one), identified by exactly one of `file_id` or `name` (exact-name
 lookup inside the gatekeeper's own folder; no match `not_found`, several
@@ -20,10 +32,8 @@ webViewLink, and so do the two new verbs -- by Instinct's request, so it can han
 the owner a link and reuse the id. The same boundaries as everywhere else: the
 drive.file scope means a foreign id 404s, the executor also refuses a reachable
 file outside the app folder (`not_gatekeeper_file`) and anything not plain text;
-content rides the payload rail; the reader LLM knows both verbs. Not yet run
-against real Google: `tests/test_e2e_live.py`'s
-`test_e2e_drive_update_and_append_roundtrip` covers create -> update by id ->
-append by name and needs a deploy first.
+content rides the payload rail; the reader LLM knows both verbs. Verified live on
+2026-10-25 (above).
 
 **Owner's decision (2026-10-22): Instinct may overwrite and append, with Jev as the
 gatekeeper for malicious or unreasonable edits.** `app/drive_edit_screen.py`: after the
@@ -520,7 +530,7 @@ Health: `GET /health` (Cloud Run reserves `/healthz`).
 | Thing | Value |
 |---|---|
 | GCP project / region | `data-gatekeeper-roishik` / `europe-west1` (billing linked) |
-| Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 120s. Live revision `data-gatekeeper-00017-lf4` (commit label `503a25c`, from branch `feat/calendar-extensions-2026-09`); rollback target `00016-crq` (`64e8f6f`) |
+| Cloud Run service | `data-gatekeeper`, https://data-gatekeeper-805588567346.europe-west1.run.app, max 1 instance, public (signature-gated). Request timeout 120s. Live revision `data-gatekeeper-00020-pkl` (commit label `259c169`, from `main`); rollback targets `00019-47r` (`07e6d8c`), then `00018-ntd` (`24ec84d`) |
 | Runtime service account | `gatekeeper-run@data-gatekeeper-roishik.iam.gserviceaccount.com` (secretAccessor per secret only) |
 | Secret Manager | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `ANTHROPIC_API_KEY`, `AGENTMAIL_API_KEY`, `AGENTMAIL_WEBHOOK_SECRET`, `TYPESAFE_API_KEY` |
 | Env vars (non-secret) | `AGENTMAIL_INBOX_ID`/`GATEKEEPER_INBOX_ADDRESS=roi.shikler@agentmail.to`, `ALLOWED_SENDERS=roishikler@mail.instinct.com,roishik10@gmail.com`, `OWNER_EMAIL=roishik10@gmail.com` (no longer used by the service after the refactor; the e2e tests use it), `OWNER_TIMEZONE=Asia/Jerusalem`, `MAX_REQUESTS_PER_DAY=100` (raised from 50 at the 2026-09-23 deploy; the cap wasn't actually enforced before the refactor because of the state-sheet bug), `ANTHROPIC_MODEL=claude-haiku-4-5-20251001`, `AUDIT_LOG_BACKEND=sheets`, `STATE_STORE_BACKEND=sheets`. New tunables all default in code (`.env.example`): `READER_LLM_MAX_INPUT_CHARS`, `OUTPUT_*`, `JEV_*`, `PROCESSING_STALE_AFTER_SECONDS`. `GIT_SHA` (the deployed commit's short sha, set by every deploy command; it's the replies' `protocol_version`, and defaults to `"dev"` if absent) |
