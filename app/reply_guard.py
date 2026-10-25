@@ -246,6 +246,16 @@ class _ProseResult:
     item_lines_total: int | None
 
 
+def _drive_file_link(result: DriveFileResult) -> str:
+    """The file's webViewLink (browser URL). A fixed-shape URL derived from
+    the file id -- an opaque id rather than display text, so sanitize_output
+    like other ids, no secrecy redaction (URLs deliberately pass through,
+    see module docstring point 2)."""
+    if not result.web_view_link:
+        return ""
+    return f": {sanitize_output(result.web_view_link)}"
+
+
 def _build_prose(
     parsed_request: ParsedRequest,
     status: str,
@@ -380,7 +390,13 @@ def _build_prose(
         )
     elif status == "completed" and parsed_request.verb == "drive.create_file" and drive_file_result:
         name = WITHHELD_TEXT if withheld(DRIVE_FILE_KEY) else f"'{safe_display(drive_file_result.name)}'"
-        prose_lines.append(f"Created Drive file {name}.")
+        prose_lines.append(f"Created Drive file {name}{_drive_file_link(drive_file_result)}.")
+    elif status == "completed" and parsed_request.verb == "drive.update_file" and drive_file_result:
+        name = WITHHELD_TEXT if withheld(DRIVE_FILE_KEY) else f"'{safe_display(drive_file_result.name)}'"
+        prose_lines.append(f"Updated Drive file {name}{_drive_file_link(drive_file_result)}.")
+    elif status == "completed" and parsed_request.verb == "drive.append_file" and drive_file_result:
+        name = WITHHELD_TEXT if withheld(DRIVE_FILE_KEY) else f"'{safe_display(drive_file_result.name)}'"
+        prose_lines.append(f"Appended to Drive file {name}{_drive_file_link(drive_file_result)}.")
     elif status == "completed" and parsed_request.verb == "capabilities" and capabilities is not None:
         # Nothing here originates from Google or the requester, so none of
         # it needs safe_display/redaction -- see app/capabilities.py.
@@ -453,6 +469,16 @@ def _build_prose(
             prose_lines.append(
                 "This request was not authorized: the gatekeeper only changes or deletes calendar "
                 "events that it created itself."
+            )
+        elif error_code == "edit_refused":
+            prose_lines.append(
+                "This request was refused: the edit was flagged as possibly malicious or unreasonable "
+                "for this file (or could not be checked), so the file was not changed."
+            )
+        elif error_code == "not_gatekeeper_file":
+            prose_lines.append(
+                "This request was not authorized: the gatekeeper only edits files in its own "
+                "Drive folder."
             )
         else:
             prose_lines.append("This request was not authorized.")
@@ -653,6 +679,11 @@ _EXPLAINED_DENIALS = {
         "This request is too long to handle as plain text. Resend it as a GATEKEEPER-REQUEST block, "
         "with the long text in a GATEKEEPER-PAYLOAD section."
     ),
+    # drive.update_file / append_file by name. The HttpError 404 for an
+    # unknown file_id is reply status `error`, not `denied`, so it never
+    # lands here.
+    "not_found": "No file matched.",
+    "ambiguous_file": "More than one file matched; resend with file_id instead of name.",
 }
 
 _ERROR_PROSE = {

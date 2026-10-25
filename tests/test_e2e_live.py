@@ -479,6 +479,48 @@ def test_e2e_drive_file_from_a_payload_arrives_byte_for_byte():
     assert _normalize(content) == _normalize(LONG_TEXT)
 
 
+def test_e2e_drive_update_and_append_roundtrip():
+    """Live drive.update_file / drive.append_file (added 2026-10-21):
+    create a file, replace its content by file_id, append to it by name,
+    and check every step against the real Drive file. Also pins that the
+    create reply carries the webViewLink."""
+    _require_config()
+    from googleapiclient.discovery import build
+
+    from app.google_auth_helper import build_google_credentials
+
+    create_id = _new_request_id("driveup")
+    name = f"[gatekeeper-e2e] {create_id}.txt"
+    body = _block(create_id, "drive.create_file", f"  name: '{name}'\n  content: first line\n")
+    _send_from_owner(f"gatekeeper e2e drive {create_id}", body)
+    block, text = _wait_for_reply(create_id)
+    assert block["status"] == "completed", block
+    assert "https://" in text  # the webViewLink
+
+    drive = build("drive", "v3", credentials=build_google_credentials([_DRIVE_FILE_SCOPE]), cache_discovery=False)
+    files = drive.files().list(q=f"name = '{name}' and trashed = false", fields="files(id)").execute().get("files", [])
+    assert files, "the Drive file was not found"
+    file_id = files[0]["id"]
+
+    update_id = _new_request_id("driveup")
+    body = _block(update_id, "drive.update_file", f"  file_id: {file_id}\n  content: replaced\n")
+    _send_from_owner(f"gatekeeper e2e drive {update_id}", body)
+    block, _ = _wait_for_reply(update_id)
+    assert block["status"] == "completed", block
+    content = drive.files().get_media(fileId=file_id).execute().decode("utf-8")
+    assert content == "replaced"
+
+    append_id = _new_request_id("driveup")
+    body = _block(append_id, "drive.append_file", f"  name: '{name}'\n  content: appended\n")
+    _send_from_owner(f"gatekeeper e2e drive {append_id}", body)
+    block, _ = _wait_for_reply(append_id)
+    assert block["status"] == "completed", block
+    content = drive.files().get_media(fileId=file_id).execute().decode("utf-8")
+    assert content == "replaced\nappended"  # the newline rule
+
+    drive.files().delete(fileId=file_id).execute()
+
+
 def test_e2e_injected_block_write_is_denied():
     """An obvious injection in the subject line gates a WRITE on the block
     path (reads stay log-only). Relies on Jev scoring it high, which

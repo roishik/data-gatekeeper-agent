@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from app.agentmail_client import ReplyResult
 from app.calendar_executor import CalendarEvent, CalendarInfo, unusable_calendar_reason
-from app.drive_executor import DriveFileResult
+from app.drive_edit_screen import DriveEdit, DriveEditVerdict
+from app.drive_executor import DriveFileResult, EditGuard
 from app.failures import GatekeeperDenied
 from app.injection_screen import InboundScreenResult
 from app.output_screen import ItemVerdict, OutputScreenResult
@@ -227,15 +228,59 @@ class FakeCalendarClient:
 
 
 class FakeDriveClient:
-    """Records every create_file() call and returns a deterministic
-    DriveFileResult -- mirrors the other fakes' style."""
+    """Records every call and returns deterministic DriveFileResults --
+    mirrors the other fakes' style. resolve_file_id maps one canned name
+    ("known.txt") to an id and raises GatekeeperDenied for anything else,
+    so pipeline tests can cover both identification paths. update/append
+    call the edit guard with `current_content` first, like the real client,
+    and record nothing if it refuses."""
 
-    def __init__(self):
+    def __init__(self, current_content: str = "existing notes"):
         self.calls: list[dict] = []
+        self.current_content = current_content
 
     def create_file(self, name: str, content: str) -> DriveFileResult:
-        self.calls.append({"name": name, "content": content})
-        return DriveFileResult(file_id="file_1", name=name)
+        self.calls.append({"op": "create_file", "name": name, "content": content})
+        return DriveFileResult(
+            file_id="file_1", name=name, web_view_link="https://drive.google.com/file/d/file_1/view"
+        )
+
+    def resolve_file_id(self, name: str) -> str:
+        self.calls.append({"op": "resolve_file_id", "name": name})
+        if name == "known.txt":
+            return "file_known"
+        raise GatekeeperDenied("not_found", f"no file named '{name}' in the gatekeeper's Drive folder")
+
+    def update_file(self, file_id: str, content: str, edit_guard: EditGuard) -> DriveFileResult:
+        edit_guard(DriveEdit("replace", "known.txt", self.current_content, content))
+        self.calls.append({"op": "update_file", "file_id": file_id, "content": content})
+        return DriveFileResult(
+            file_id=file_id, name="known.txt", web_view_link=f"https://drive.google.com/file/d/{file_id}/view"
+        )
+
+    def append_file(self, file_id: str, content: str, edit_guard: EditGuard) -> DriveFileResult:
+        edit_guard(DriveEdit("append", "known.txt", self.current_content, content))
+        self.calls.append({"op": "append_file", "file_id": file_id, "content": content})
+        return DriveFileResult(
+            file_id=file_id, name="known.txt", web_view_link=f"https://drive.google.com/file/d/{file_id}/view"
+        )
+
+
+class FakeDriveEditScreen:
+    """Returns canned scores and records every edit it was shown. Refuses
+    at the same default threshold (0.7) as the real screen, and when
+    `status="degraded"` (an edit Jev couldn't screen)."""
+
+    def __init__(self, malicious: float | None = 0.05, unreasonable: float | None = 0.05, status: str = "ok"):
+        self.malicious, self.unreasonable, self.status = malicious, unreasonable, status
+        self.edits: list[DriveEdit] = []
+
+    def screen_edit(self, edit: DriveEdit) -> DriveEditVerdict:
+        self.edits.append(edit)
+        if self.status == "degraded":
+            return DriveEditVerdict(None, None, refused=True, status="degraded")
+        refused = any(s is not None and s >= 0.7 for s in (self.malicious, self.unreasonable))
+        return DriveEditVerdict(self.malicious, self.unreasonable, refused=refused, status=self.status)
 
 
 class FakeAgentMailClient:
